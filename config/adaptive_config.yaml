@@ -1,0 +1,147 @@
+# IDS ML Analyzer — Adaptive Learning Configuration
+# Конфігурація адаптивної системи навчання
+
+system:
+  name: "IDS ML Analyzer Adaptive System"
+  version: "2.0.0"
+  language: "uk"
+
+# Налаштування інкрементального навчання
+incremental_learning:
+  enabled: true
+  
+  # EWC (Elastic Weight Consolidation)
+  ewc:
+    enabled: true
+    lambda: 5000
+    fisher_samples: 1000
+    mode: "online"
+  
+  # Experience Replay
+  replay:
+    enabled: true
+    buffer_size: 10000
+    sample_strategy: "balanced"  # balanced, uniform, priority
+    alpha: 0.6  # For priority sampling
+  
+  # Feedback Loop
+  feedback:
+    enabled: true
+    auto_retrain: false
+    approval_required: true
+    min_feedback_samples: 10
+
+# Налаштування Knowledge Base
+knowledge_base:
+  enabled: true
+  path: "knowledge_base.db"
+  
+  # MITRE ATT&CK Integration
+  mitre_attack:
+    enabled: true
+    auto_enrich: true
+    tactics_mapping: true
+  
+  # Recommendations
+  recommendations:
+    auto_generate: true
+    severity_based: true
+
+# Налаштування звітності
+reporting:
+  enabled: true
+  formats:
+    - pdf
+    - html
+    - json
+    - csv
+  
+  sections:
+    executive_summary: true
+    threat_overview: true
+    timeline: true
+    attack_distribution: true
+    severity_breakdown: true
+    source_target_analysis: true
+    recommendations: true
+    business_impact: true
+
+# Налаштування діагностики
+diagnostics:
+  enabled: true
+  auto_run: true
+  
+  checks:
+    feature_gaps: true
+    domain_shift: true
+    class_imbalance: true
+    data_quality: true
+    model_weaknesses: true
+  
+  thresholds:
+    feature_gap_warning: 0.2
+    domain_shift_warning: 0.3
+    class_imbalance_warning: 10.0
+    data_quality_warning: 0.7
+
+# PCAP Parser налаштування
+pcap_parser:
+  max_packets: 100000
+  flow_timeout: 300.0  # Збільшено для slow-атак
+  min_flow_packets: 2
+  
+  # Додаткові ознаки
+  features:
+    tls_analysis: true
+    dns_analysis: true
+    http_analysis: false
+    ja3_fingerprinting: true
+    sni_analysis: true
+
+# Модельні налаштування
+model:
+  primary_algorithm: "Random Forest"
+  fallback_algorithm: "XGBoost"
+  
+  # Ensemble
+  ensemble:
+    enabled: false
+    methods: ["voting", "stacking"]
+  
+  # Threshold
+  detection:
+    binary_threshold: 0.5
+    multiclass_threshold: 0.3
+    uncertainty_threshold: 0.2
+
+# Налаштування моніторингу
+monitoring:
+  enabled: true
+  metrics:
+    - prediction_count
+    - anomaly_rate
+    - false_positive_rate
+    - model_drift
+    - latency
+  
+  alerts:
+    enabled: true
+    anomaly_rate_threshold: 0.1
+    drift_detection_window: 1000
+
+# Performance налаштування
+performance:
+  batch_size: 256
+  n_jobs: -1
+  cache_predictions: true
+  cache_ttl: 3600
+
+# Logging
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/ids_system.log"
+  
+  diagnostics:
+    enabled: true
+    level: "DEBUG"

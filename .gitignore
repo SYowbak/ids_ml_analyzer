@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Datasets (too large for git)
+datasets/
+
+# Trained models (binary, large)
+models/*.joblib
+models/*.pkl
+
+# Database
+*.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Streamlit
+.streamlit/
+
+# Qoder / agent state
+.qoder/
+
+# Skills (agent-generated)
+skills/
+
+# Temporary
+*.tmp
+*.bak
+
+# Tuned params (local state)
+tuned_params.txt
+user_settings.json
