@@ -120,6 +120,11 @@ class DataLoader:
         
         # 2b. Align (Enforce Master Schema structure - Adds missing cols with defaults)
         # CRITICAL: Must be done BEFORE normalization so that missing columns (e.g. packets_fwd) exist
+        # 2a. UNSW-NB15 attack_cat merge (MUST run before Aligner drops non-schema cols)
+        # The 'label' column in UNSW is binary 0/1; real attack names are in 'attack_cat'.
+        if multiclass and "attack_cat" in df.columns:
+            df = self.label_norm._merge_attack_cat(df)
+
         df = self.aligner.align(df, self.schema_features)
         
         # DIAGNOSTIC: After alignment - count of filled zeros

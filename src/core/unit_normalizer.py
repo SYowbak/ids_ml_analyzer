@@ -73,7 +73,7 @@ class UnitNormalizer:
                             # Avoid div by zero
                             dur = duration.replace(0, 1e-6)
                             # Log1p transform for stability
-                            df[name] = np.log1p(total / dur)
+                            df[name] = np.log1p(np.maximum(total / dur, 0))
                             
                     elif name == "byte_rate":
                         if "bytes_fwd" in df and "bytes_bwd" in df and "duration" in df:
@@ -83,14 +83,14 @@ class UnitNormalizer:
                             total = bytes_fwd + bytes_bwd
                             dur = duration.replace(0, 1e-6)
                             # Log1p transform for stability
-                            df[name] = np.log1p(total / dur)
+                            df[name] = np.log1p(np.maximum(total / dur, 0))
                             
                     elif name == "fwd_bwd_ratio":
                          if "packets_fwd" in df and "packets_bwd" in df:
                              packets_fwd = self._to_numeric(df["packets_fwd"])
                              packets_bwd = self._to_numeric(df["packets_bwd"])
                              denom = packets_bwd.replace(0, 1.0)
-                             df[name] = np.log1p(packets_fwd / denom) # Handle 150k ratio outliers
+                             df[name] = np.log1p(np.maximum(packets_fwd / denom, 0))
 
                     elif name == "avg_packet_size":
                         if "bytes_fwd" in df and "bytes_bwd" in df and "packets_fwd" in df and "packets_bwd" in df:
