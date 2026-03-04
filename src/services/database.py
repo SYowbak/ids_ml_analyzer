@@ -315,7 +315,7 @@ class DatabaseService:
                 else:
                     new_model = TrainedModel(
                         name=model_name,
-                        algorithm="Unknown",
+                        model_type="Unknown",
                         accuracy=0.0
                     )
                     db.add(new_model)

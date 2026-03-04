@@ -80,16 +80,30 @@ class GeminiService:
             logger.error(f"Gemini configure error: {e}")
             return
 
-        self._available_model_names = self._list_generate_content_models()
+        self._initialized = False
+        self._api_key = api_key
 
-        for candidate in self._candidate_model_sequence():
-            if self._bind_model(candidate):
-                self.available = True
-                logger.info(f"Gemini model selected: {candidate}")
-                break
+    def _ensure_initialized(self):
+        """Lazy initialization to prevent startup hangs."""
+        if self._initialized or not self._api_key:
+            return
 
-        if not self.available:
-            logger.error("Failed to initialize any Gemini model candidate.")
+        try:
+            genai.configure(api_key=self._api_key)
+            self._available_model_names = self._list_generate_content_models()
+
+            for candidate in self._candidate_model_sequence():
+                if self._bind_model(candidate):
+                    self.available = True
+                    logger.info(f"Gemini model selected: {candidate}")
+                    break
+            
+            if not self.available:
+                logger.error("Failed to initialize any Gemini model candidate.")
+        except Exception as e:
+            logger.error(f"Gemini lazy init error: {e}")
+        
+        self._initialized = True
 
     def _list_generate_content_models(self) -> list[str]:
         """Best-effort discovery of models that support generateContent."""
@@ -204,6 +218,7 @@ class GeminiService:
 
     def analyze_threat(self, threat_type: str, features: dict) -> str:
         """Коротке пояснення для однієї загрози."""
+        self._ensure_initialized()
         if not self.available:
             return "Gemini API недоступний. Додайте API ключ у налаштуваннях."
 
@@ -239,6 +254,7 @@ class GeminiService:
 
     def analyze_threat_detailed(self, threat_type: str, features: dict, similar_count: int = 0) -> ThreatAnalysis:
         """Детальний структурований аналіз загрози."""
+        self._ensure_initialized()
         severity = self._determine_severity(threat_type)
 
         if not self.available:
@@ -345,6 +361,7 @@ class GeminiService:
 
     def generate_executive_summary(self, scan_summary: dict, top_threats: list[dict]) -> str:
         """Коротке пояснення для керівництва."""
+        self._ensure_initialized()
         if not self.available:
             return self._generate_fallback_summary(scan_summary, top_threats)
 
@@ -490,6 +507,7 @@ class GeminiService:
 
     def generate_security_report(self, summary: dict) -> str:
         """Повний технічний звіт для документації."""
+        self._ensure_initialized()
         if not self.available:
             return "Технічний звіт недоступний без Gemini API."
 
@@ -533,6 +551,7 @@ class GeminiService:
 
     def generate_comprehensive_analysis(self, scan_summary: dict, all_threats: dict, sample_data: dict | None = None) -> str:
         """Детальний комплексний SOC-аналіз усіх виявлених загроз."""
+        self._ensure_initialized()
         if not self.available:
             return "Gemini API недоступний для детального аналізу."
 

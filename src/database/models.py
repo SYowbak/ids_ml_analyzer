@@ -26,7 +26,7 @@ class AnalysisSession(Base):
     id = Column(Integer, primary_key=True, index=True)
     filename = Column(String(255), nullable=False)
     file_type = Column(String(50), nullable=False)  # .csv, .pcap, .pcapng
-    upload_path = Column(String(500), nullable=False)
+    upload_path = Column(String(500), nullable=True)
     file_size = Column(Integer, nullable=True)  # Розмір файлу в байтах
     
     # Стан
@@ -34,10 +34,16 @@ class AnalysisSession(Base):
     
     # Метрики
     total_flows = Column(Integer, default=0)
+    total_records = Column(Integer, default=0)  # Alias used by save_scan
     anomalies_found = Column(Integer, default=0)
+    risk_score = Column(Float, nullable=True)  # Anomaly percentage
     processing_time = Column(Float, nullable=True)  # Час обробки в секундах
     
+    # Model reference
+    model_id = Column(Integer, ForeignKey('trained_models.id'), nullable=True)
+    
     # Timestamps
+    timestamp = Column(DateTime, default=datetime.utcnow)  # Used by get_history ordering
     created_at = Column(DateTime, default=datetime.utcnow)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)

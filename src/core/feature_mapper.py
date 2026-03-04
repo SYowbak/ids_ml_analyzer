@@ -81,9 +81,8 @@ class FeatureMapper:
 
         dataset_key = dataset_type if dataset_type in self.DATASET_PRIORITY_MAPPINGS else "CIC-IDS"
         registry_map = FeatureRegistry.get_synonyms()
-        canonical_targets = set(registry_map.keys()) | set(self.DATASET_PRIORITY_MAPPINGS.get(dataset_key, {}).keys())
 
-        # normalized_name -> original_name (перший збіг, щоб не ламати дублікати)
+        # normalized_name -> original_name (first hit so we don't break dupes)
         existing_norm: Dict[str, str] = {}
         for col in df.columns:
             norm = self._normalize_col(col)
@@ -91,28 +90,58 @@ class FeatureMapper:
 
         rename_map: Dict[str, str] = {}
         mapped_canonicals: set[str] = set()
+        reserved_originals: set[str] = set()   # originals already claimed
         existing_columns = set(df.columns)
 
-        for canonical in canonical_targets:
-            # Якщо канонічна колонка вже є у df, додатковий remap не потрібен.
+        # ── PASS 1: Dataset-priority mappings (expert-curated, highest priority) ──
+        dataset_map = self.DATASET_PRIORITY_MAPPINGS.get(dataset_key, {})
+        for canonical, aliases in dataset_map.items():
             if canonical in existing_columns:
                 mapped_canonicals.add(canonical)
+                reserved_originals.add(canonical)
                 continue
+
+            for alias in aliases:
+                original_name = existing_norm.get(self._normalize_col(alias))
+                if not original_name:
+                    continue
+                if original_name in reserved_originals:
+                    continue
+                if original_name == canonical:
+                    mapped_canonicals.add(canonical)
+                    reserved_originals.add(original_name)
+                    break
+
+                rename_map[original_name] = canonical
+                mapped_canonicals.add(canonical)
+                reserved_originals.add(original_name)
+                break
+
+        # ── PASS 2: Global synonyms (fallback for remaining unmapped canonicals) ──
+        all_canonicals = set(registry_map.keys()) | set(dataset_map.keys())
+        for canonical in all_canonicals:
             if canonical in mapped_canonicals:
+                continue
+            if canonical in existing_columns:
+                mapped_canonicals.add(canonical)
                 continue
 
             for alias in self._collect_aliases(canonical, dataset_key):
                 original_name = existing_norm.get(self._normalize_col(alias))
                 if not original_name:
                     continue
+                if original_name in reserved_originals:
+                    continue
                 if original_name in rename_map:
                     continue
                 if original_name == canonical:
                     mapped_canonicals.add(canonical)
+                    reserved_originals.add(original_name)
                     break
 
                 rename_map[original_name] = canonical
                 mapped_canonicals.add(canonical)
+                reserved_originals.add(original_name)
                 break
 
         if not rename_map:
