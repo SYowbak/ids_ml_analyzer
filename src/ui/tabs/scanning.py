@@ -1,4 +1,4 @@
-﻿import streamlit as st
+import streamlit as st
 import pandas as pd
 import numpy as np
 import time
@@ -826,13 +826,19 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                     if scan_cap_msg:
                         st.warning(scan_cap_msg)
 
-                    df = loader.load_file(
+                    load_result = loader.load_file(
                         str(dataset_path),
                         max_rows=scan_row_cap,
                         multiclass=True,
                         align_to_schema=align_to_schema,
                         preserve_context=True
                     )
+                    # P0.1: load_file returns (df, df_context) when preserve_context=True
+                    if isinstance(load_result, tuple):
+                        df, df_context = load_result
+                    else:
+                        df = load_result
+                        df_context = None
                     original_df = df
 
                     # Add family hint if the model was trained on multiple families.
@@ -936,87 +942,94 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                     # PREDICTION - use appropriate method based on model type
                     aux_ood_mask = None
                     ood_from_benign_mask = None
-                    if is_two_stage:
-                        predictions = model.predict(X, threshold=selected_two_stage_threshold)
-                        st.caption(
-                            "Використано Two-Stage Detection "
-                            f"(Профіль: {selected_two_stage_profile_label}, "
-                            f"Threshold: {selected_two_stage_threshold:.2f}, "
-                            f"еквівалент чутливості: {sensitivity_level}/99)"
-                        )
-                        # Анти-колапс у "все benign":
-                        # якщо модель на цьому файлі дала майже 0 атак, знижуємо threshold
-                        # через квантиль ймовірностей Stage-1 (контрольований recall boost).
-                        try:
-                            benign_code = getattr(model, 'benign_code_', 0)
-                            base_attack_rate = float(np.mean(np.asarray(predictions) != benign_code))
-                            if file_ext in TABULAR_EXTENSIONS and base_attack_rate < 0.001:
-                                attack_idx = getattr(model, 'attack_idx_', 1)
-                                binary_probas = model.binary_model.predict_proba(X)
-                                if binary_probas.shape[1] > int(attack_idx):
-                                    attack_probs = binary_probas[:, int(attack_idx)]
-                                    diag_preview_rate = 0.0
-                                    try:
-                                        diag_preview_rate = float((checks or {}).get('preview_anomaly_rate', 0.0))
-                                    except Exception:
+                    try:
+                        if is_two_stage:
+                            predictions = model.predict(X, threshold=selected_two_stage_threshold)
+                            st.caption(
+                                "Використано Two-Stage Detection "
+                                f"(Профіль: {selected_two_stage_profile_label}, "
+                                f"Threshold: {selected_two_stage_threshold:.2f}, "
+                                f"еквівалент чутливості: {sensitivity_level}/99)"
+                            )
+                            # Анти-колапс у "все benign":
+                            try:
+                                benign_code = getattr(model, 'benign_code_', 0)
+                                base_attack_rate = float(np.mean(np.asarray(predictions) != benign_code))
+                                if file_ext in TABULAR_EXTENSIONS and base_attack_rate < 0.001:
+                                    attack_idx = getattr(model, 'attack_idx_', 1)
+                                    binary_probas = model.binary_model.predict_proba(X)
+                                    if binary_probas.shape[1] > int(attack_idx):
+                                        attack_probs = binary_probas[:, int(attack_idx)]
                                         diag_preview_rate = 0.0
-                                    target_rate = float(np.clip(max(diag_preview_rate, 0.01), 0.01, 0.08))
-                                    adaptive_threshold = _clamp_two_stage_threshold(
-                                        float(np.quantile(attack_probs, 1.0 - target_rate))
-                                    )
-                                    adaptive_threshold = max(0.08, adaptive_threshold)
-                                    if adaptive_threshold + 1e-6 < float(selected_two_stage_threshold):
-                                        alt_predictions = model.predict(X, threshold=adaptive_threshold)
-                                        alt_attack_rate = float(np.mean(np.asarray(alt_predictions) != benign_code))
-                                        if 0.001 <= alt_attack_rate <= 0.35:
-                                            predictions = alt_predictions
-                                            st.warning(
-                                                "Динамічно знижено поріг Two-Stage для цього файлу, "
-                                                "щоб уникнути пропуску аномалій при колапсі в повний benign."
-                                            )
-                                            print(
-                                                "[LOG] Two-Stage threshold auto-adjust: "
-                                                f"base={selected_two_stage_threshold:.4f}, "
-                                                f"adaptive={adaptive_threshold:.4f}, "
-                                                f"base_rate={base_attack_rate:.6f}, "
-                                                f"new_rate={alt_attack_rate:.6f}"
-                                            )
-                                            selected_two_stage_threshold = adaptive_threshold
-                                            selected_two_stage_profile_label = (
-                                                f"{selected_two_stage_profile_label} + авто-корекція"
-                                            )
-                        except Exception as auto_thr_exc:
-                            print(f"[WARN] Two-Stage threshold auto-adjust skipped: {auto_thr_exc}")
-                    elif is_isolation_forest:
-                        # Use engine.predict() which handles IF correctly with threshold
-                        predictions = engine.predict(X)
+                                        try:
+                                            diag_preview_rate = float((checks or {}).get('preview_anomaly_rate', 0.0))
+                                        except Exception:
+                                            diag_preview_rate = 0.0
+                                        target_rate = float(np.clip(max(diag_preview_rate, 0.01), 0.01, 0.08))
+                                        adaptive_threshold = _clamp_two_stage_threshold(
+                                            float(np.quantile(attack_probs, 1.0 - target_rate))
+                                        )
+                                        adaptive_threshold = max(0.08, adaptive_threshold)
+                                        if adaptive_threshold + 1e-6 < float(selected_two_stage_threshold):
+                                            alt_predictions = model.predict(X, threshold=adaptive_threshold)
+                                            alt_attack_rate = float(np.mean(np.asarray(alt_predictions) != benign_code))
+                                            if 0.001 <= alt_attack_rate <= 0.35:
+                                                predictions = alt_predictions
+                                                st.warning(
+                                                    "Динамічно знижено поріг Two-Stage для цього файлу, "
+                                                    "щоб уникнути пропуску аномалій при колапсі в повний benign."
+                                                )
+                                                print(
+                                                    "[LOG] Two-Stage threshold auto-adjust: "
+                                                    f"base={selected_two_stage_threshold:.4f}, "
+                                                    f"adaptive={adaptive_threshold:.4f}, "
+                                                    f"base_rate={base_attack_rate:.6f}, "
+                                                    f"new_rate={alt_attack_rate:.6f}"
+                                                )
+                                                selected_two_stage_threshold = adaptive_threshold
+                                                selected_two_stage_profile_label = (
+                                                    f"{selected_two_stage_profile_label} + авто-корекція"
+                                                )
+                            except Exception as auto_thr_exc:
+                                print(f"[WARN] Two-Stage threshold auto-adjust skipped: {auto_thr_exc}")
+                        elif is_isolation_forest:
+                            # Use engine.predict() which handles IF correctly with threshold
+                            predictions = engine.predict(X)
 
-                        # Get anomaly scores for visualization
-                        scores = model.decision_function(X)
-                        if len(scores) <= 300000:
-                            st.session_state['anomaly_scores'] = scores.tolist()
+                            # Get anomaly scores for visualization
+                            scores = model.decision_function(X)
+                            if len(scores) <= 300000:
+                                st.session_state['anomaly_scores'] = scores.tolist()
+                            else:
+                                st.session_state['anomaly_scores'] = None
+                                st.caption(
+                                    "Для великого файлу детальні score-дані IF не збережено, "
+                                    "щоб не перевищувати ліміт памʼяті."
+                                )
+
+                            # Show IF statistics
+                            if hasattr(engine, 'if_threshold_') and engine.if_threshold_ is not None:
+                                threshold_mode = getattr(engine, 'if_threshold_mode_', 'decision_zero')
+                                st.caption(
+                                    "Використано Anomaly Detection "
+                                    f"(IF threshold: {engine.if_threshold_:.4f}, mode: {threshold_mode})"
+                                )
+                            else:
+                                st.caption("Використано Anomaly Detection (Isolation Forest)")
+
+                            print(f"[LOG] IF scores: min={scores.min():.4f}, max={scores.max():.4f}, mean={scores.mean():.4f}")
                         else:
-                            st.session_state['anomaly_scores'] = None
-                            st.caption(
-                                "Для великого файлу детальні score-дані IF не збережено, "
-                                "щоб не перевищувати ліміт памʼяті."
-                            )
-
-                        # Show IF statistics
-                        if hasattr(engine, 'if_threshold_') and engine.if_threshold_ is not None:
-                            threshold_mode = getattr(engine, 'if_threshold_mode_', 'decision_zero')
-                            st.caption(
-                                "Використано Anomaly Detection "
-                                f"(IF threshold: {engine.if_threshold_:.4f}, mode: {threshold_mode})"
-                            )
-                        else:
-                            st.caption("Використано Anomaly Detection (Isolation Forest)")
-
-                        print(f"[LOG] IF scores: min={scores.min():.4f}, max={scores.max():.4f}, mean={scores.mean():.4f}")
-                    else:
-                        # Standard classification model
-                        predictions = engine.predict(X)
-
+                            # Standard classification model
+                            predictions = engine.predict(X)
+                    except RuntimeError as pred_err:
+                        st.error(
+                            f"❌ Помилка прогнозування: {pred_err}\n\n"
+                            "Перейдіть у вкладку **Навчання** та навчіть модель перед скануванням."
+                        )
+                        st.stop()
+                    except Exception as pred_err:
+                        st.error(f"❌ Непередбачена помилка при класифікації: {pred_err}")
+                        st.stop()
                     predictions = np.asarray(predictions)
 
                     if is_isolation_forest:

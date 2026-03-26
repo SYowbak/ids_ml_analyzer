@@ -600,11 +600,15 @@ class ModelEngine:
         y_fit = self._to_label_series(y)
         self._assert_supervised_label_quality(y_fit, config.algorithm)
         self.last_label_reindex_ = {}
+        self.xgboost_label_inverse_ = None
         if config.algorithm == 'XGBoost':
             y_fit, remap = self._reindex_xgboost_labels(y_fit)
+            # Store inverse mapping: new_idx -> original_label for predict() decode
+            self.xgboost_label_inverse_ = {new: old for old, new in remap.items()}
             self.last_label_reindex_ = {
                 'applied': True,
                 'mapping': remap,
+                'inverse': self.xgboost_label_inverse_,
                 'changed': any(old != new for old, new in remap.items()),
             }
             if self.last_label_reindex_['changed']:
@@ -776,7 +780,14 @@ class ModelEngine:
             logger.warning("[ModelEngine] IF predict fallback used (model has no decision_function)")
             return predictions
         
-        return self.model.predict(X)
+        y_pred = self.model.predict(X)
+
+        # P0.2 FIX: Reverse XGBoost label reindex so predictions contain original codes.
+        inverse = getattr(self, 'xgboost_label_inverse_', None)
+        if inverse:
+            y_pred = np.array([inverse.get(int(p), p) for p in y_pred])
+
+        return y_pred
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
         """
@@ -829,7 +840,16 @@ class ModelEngine:
             if hasattr(self, 'if_score_stats_'):
                 bundle['if_score_stats'] = self.if_score_stats_
         
-        path = self.models_dir / filename
+        # P0.2: Save XGBoost label inverse for predict decode after reload
+        if getattr(self, 'xgboost_label_inverse_', None):
+            bundle['xgboost_label_inverse'] = self.xgboost_label_inverse_
+
+        # P2.7: Add uuid suffix to prevent filename collisions
+        stem = Path(filename).stem
+        suffix = Path(filename).suffix or '.joblib'
+        import uuid as _uuid
+        unique_filename = f"{stem}_{_uuid.uuid4().hex[:8]}{suffix}"
+        path = self.models_dir / unique_filename
         joblib.dump(bundle, path)
         
         logger.info(f"Модель збережено: {path}")
@@ -893,6 +913,10 @@ class ModelEngine:
                     logger.warning("[ModelEngine] IF model loaded without threshold, using default 0.0")
                 if 'if_score_stats' in loaded:
                     self.if_score_stats_ = loaded['if_score_stats']
+
+            # P0.2: Restore XGBoost label inverse mapping
+            if 'xgboost_label_inverse' in loaded:
+                self.xgboost_label_inverse_ = loaded['xgboost_label_inverse']
         else:
             # Старий формат — тільки модель
             self.model = loaded

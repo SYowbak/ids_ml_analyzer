@@ -1,4 +1,4 @@
-﻿
+
 """
 IDS ML Analyzer — Універсальний Завантажувач (Unified Pipeline)
 
@@ -76,7 +76,7 @@ class DataLoader:
         multiclass: bool = False,
         align_to_schema: bool = True,
         preserve_context: bool = False
-    ) -> pd.DataFrame:
+    ):
         """
         Loads file and runs the Unified Pipeline.
         """
@@ -95,7 +95,28 @@ class DataLoader:
             
         print(f"[LOG] Loading file: {file_path}")
         df = loader(file_path, max_rows)
-        
+
+        # P0.1: Capture IP/port/timestamp context BEFORE any pipeline steps.
+        df_context = None
+        if preserve_context:
+            context_column_candidates = [
+                "src_ip", "source_ip", "src ip", "src-ip", "srcaddr", "src_addr", "src",
+                "dst_ip", "destination_ip", "dst ip", "dst-ip", "dstaddr", "dst_addr", "dst",
+                "src_port", "sport", "source_port",
+                "src port", "source port",
+                "dst_port", "dport", "destination_port", "dest_port", "port",
+                "dst port", "destination port",
+                "protocol", "proto",
+                "timestamp", "time", "datetime", "date", "flow_start_time", "flow start time"
+            ]
+            present_context_cols = [c for c in context_column_candidates if c in df.columns]
+            if present_context_cols:
+                df_context = df[present_context_cols].copy()
+                print(f"[LOG] Preserved context columns: {present_context_cols}")
+            else:
+                df_context = pd.DataFrame(index=df.index)
+                print("[LOG] No context columns found to preserve")
+
         # --- PIPELINE START ---
         print("[LOG] Starting Unified Pipeline...")
 
@@ -166,21 +187,9 @@ class DataLoader:
         
         # 5b. Label Normalization (Strings -> 0/1 or Clean Strings)
         df = self.label_norm.normalize(df, multiclass=multiclass)
-        
-        # 6. Leakage Filter (Drop bad columns)
-        preserve_columns = []
-        if preserve_context:
-            preserve_columns = [
-                "src_ip", "source_ip", "src ip", "src-ip", "srcaddr", "src_addr", "src",
-                "dst_ip", "destination_ip", "dst ip", "dst-ip", "dstaddr", "dst_addr", "dst",
-                "src_port", "sport", "source_port",
-                "src port", "source port",
-                "dst_port", "dport", "destination_port", "dest_port", "port",
-                "dst port", "destination port",
-                "protocol", "proto",
-                "timestamp", "time", "datetime", "date", "flow_start_time", "flow start time"
-            ]
-        df = self.leakage.filter(df, preserve_columns=preserve_columns)
+
+        # Leakage Filter (Drop bad columns) — context was already saved above.
+        df = self.leakage.filter(df)
         
         # 7. Category Encoding (Strings -> Ints)
         # Now safe strictly because Aligner has added any missing categorical columns
@@ -244,7 +253,9 @@ class DataLoader:
 
         print(f"[LOG] Pipeline Complete. Output shape: {df.shape}")
         logger.info(f"Pipeline complete for {file_path}. Type: {dataset_type}")
-        
+
+        if preserve_context:
+            return df, df_context
         return df
 
     def _load_csv(self, file_path: str, max_rows: Optional[int] = None) -> pd.DataFrame:
@@ -410,6 +421,7 @@ class DataLoader:
                             'fwd_pkts': 0, 'bwd_pkts': 0,
                             'fwd_bytes': 0, 'bwd_bytes': 0,
                             'protocol': proto, 'dst_port': dport,
+                            'src_ip': src, 'dst_ip': dst, 'src_port': sport,
                             # TCP Flags
                             'flags': {'FIN': 0, 'SYN': 0, 'RST': 0, 'PSH': 0, 'ACK': 0, 'URG': 0, 'CWR': 0, 'ECE': 0},
                             # Packet length tracking
@@ -509,6 +521,10 @@ class DataLoader:
                 flow_bytes_s = total_bytes / duration if duration > 0 else 0
                 
                 row = {
+                    # Network context (for report IP attribution)
+                    'src_ip': f.get('src_ip', ''),
+                    'dst_ip': f.get('dst_ip', ''),
+                    'src_port': f.get('src_port', 0),
                     # Core flow info
                     'flow duration': duration_us,
                     'total fwd packets': f['fwd_pkts'],

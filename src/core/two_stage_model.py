@@ -1,4 +1,4 @@
-﻿"""
+"""
 IDS ML Analyzer - Two-Stage Model
 
 Реалізація дворівневої системи виявлення атак:
@@ -32,18 +32,22 @@ class TwoStageModel(BaseEstimator, ClassifierMixin):
         binary_model=None,
         multiclass_model=None,
         binary_threshold=0.3,
-        binary_target_attack_rate=0.20,
+        binary_target_attack_rate=0.35,
         binary_downsample=True,
         stage2_balance=True,
-        stage2_balance_min_samples=800,
-        stage2_balance_max_multiplier=3.0,
+        stage2_balance_min_samples=2000,
+        stage2_balance_max_multiplier=6.0,
         random_state=42
     ):
         # NOTE: Do not use truthiness for sklearn estimators.
         # Unfitted estimators may define __len__ and raise AttributeError.
         # Stability-first defaults: n_jobs=1 avoids process storms / RAM spikes in Streamlit runtime.
-        self.binary_model = binary_model if binary_model is not None else RandomForestClassifier(n_jobs=1, random_state=42)
-        self.multiclass_model = multiclass_model if multiclass_model is not None else RandomForestClassifier(n_jobs=1, random_state=42)
+        self.binary_model = binary_model if binary_model is not None else RandomForestClassifier(
+            n_jobs=1, random_state=42, class_weight='balanced'
+        )
+        self.multiclass_model = multiclass_model if multiclass_model is not None else RandomForestClassifier(
+            n_jobs=1, random_state=42, class_weight='balanced'
+        )
         self.binary_threshold = binary_threshold
         self.binary_target_attack_rate = binary_target_attack_rate
         self.binary_downsample = binary_downsample
@@ -158,15 +162,16 @@ class TwoStageModel(BaseEstimator, ClassifierMixin):
                         f"Benign label '{benign_label}' not found in y. Available: {np.unique(y)}"
                     )
         else:
-            # Numeric labels: only safe implicit rule is class 0 as BENIGN.
-            # Otherwise require explicit benign_code to avoid silent mislabeling.
+            # Numeric labels: try class 0 first, fallback to most frequent class.
             unique_vals = np.unique(y)
             if 0 in set(unique_vals.tolist()):
                 benign_code = 0
             else:
-                raise ValueError(
-                    "Cannot infer BENIGN class for numeric labels without class 0. "
-                    "Pass benign_code explicitly from label mapping."
+                # P1.5 FIX: auto-detect benign as the most frequent class
+                benign_code = int(pd.Series(y).value_counts().idxmax())
+                logger.warning(
+                    f"[TwoStageModel] No class 0 found. Auto-detected benign_code={benign_code} "
+                    f"(most frequent class). Available: {unique_vals}"
                 )
         
         logger.info(f"[TwoStageModel] Benign code set to: '{benign_code}'")
@@ -178,41 +183,18 @@ class TwoStageModel(BaseEstimator, ClassifierMixin):
         X_stage1 = X
         y_stage1 = y_binary
         self.binary_sampling_info_ = {
-            'enabled': bool(self.binary_downsample),
+            'enabled': False,
             'attack_rate_raw': float(np.mean(y_binary)) if len(y_binary) else 0.0,
-            'target_rate': float(np.clip(self.binary_target_attack_rate, 0.05, 0.50)),
-            'used_attack_samples': int(np.sum(y_binary == 1)) if len(y_binary) else 0,
-            'used_benign_samples': int(np.sum(y_binary == 0)) if len(y_binary) else 0,
+            'downsampled': False,
+            'note': 'class_weight=balanced handles imbalance without data destruction',
         }
 
-        # Optional downsampling of dominant attack class to reduce base-rate bias.
-        if self.binary_downsample and len(y_binary) > 0:
-            attack_idx = np.flatnonzero(y_binary == 1)
-            benign_idx = np.flatnonzero(y_binary == 0)
-            if len(attack_idx) > 0 and len(benign_idx) > 0:
-                attack_rate = float(len(attack_idx) / len(y_binary))
-                target_rate = self.binary_sampling_info_['target_rate']
-                if attack_rate > (target_rate + 0.02):
-                    desired_attack = int(round(len(benign_idx) * target_rate / max(1e-9, (1.0 - target_rate))))
-                    desired_attack = max(1, min(desired_attack, len(attack_idx)))
-                    rng = np.random.default_rng(self.random_state)
-                    attack_sample = rng.choice(attack_idx, size=desired_attack, replace=False)
-                    keep_idx = np.concatenate([benign_idx, attack_sample])
-                    rng.shuffle(keep_idx)
-                    X_stage1 = X.iloc[keep_idx]
-                    y_stage1 = y_binary.iloc[keep_idx]
-                    self.binary_sampling_info_.update({
-                        'attack_rate_raw': float(attack_rate),
-                        'used_attack_samples': int(desired_attack),
-                        'used_benign_samples': int(len(benign_idx)),
-                        'downsampled': True
-                    })
-                else:
-                    self.binary_sampling_info_.update({'downsampled': False})
-            else:
-                self.binary_sampling_info_.update({'downsampled': False})
-        else:
-            self.binary_sampling_info_.update({'downsampled': False})
+        # class_weight='balanced' is set in __init__ and enforced here.
+        if hasattr(self.binary_model, 'set_params'):
+            try:
+                self.binary_model.set_params(class_weight='balanced')
+            except Exception:
+                pass
 
         self.binary_model.fit(X_stage1, y_stage1)
         self.binary_classes_ = self.binary_model.classes_
@@ -311,6 +293,14 @@ class TwoStageModel(BaseEstimator, ClassifierMixin):
                         f"{self.stage2_sampling_info_['samples_raw']} -> {self.stage2_sampling_info_['samples_after']} samples, "
                         f"oversampled_classes={oversampled_classes}/{len(class_counts)}"
                     )
+
+            # Ensure class_weight='balanced' for multiclass stage.
+            # This is the most impactful fix for rare-class washout.
+            if hasattr(self.multiclass_model, 'set_params'):
+                try:
+                    self.multiclass_model.set_params(class_weight='balanced')
+                except Exception:
+                    pass
 
             self.multiclass_model.fit(X_stage2, y_stage2)
             self.singleton_attack_label_ = None
