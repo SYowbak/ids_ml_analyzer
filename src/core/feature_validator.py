@@ -24,8 +24,12 @@ class FeatureValidator:
         for raw_entry in schema_features:
             feat = self._normalize_schema_entry(raw_entry)
             name = str(feat.get("name", "")).strip()
-            if not name or name == "label" or name not in safe_df.columns:
+            if not name or name == "label":
                 continue
+
+            if name not in safe_df.columns:
+                default_value = feat.get("default", 0)
+                safe_df[name] = default_value
 
             series = pd.to_numeric(safe_df[name], errors="coerce")
             declared_type = str(feat.get("type", "")).strip().lower()

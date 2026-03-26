@@ -1,4 +1,4 @@
-
+﻿
 """
 IDS ML Analyzer — Універсальний Завантажувач (Unified Pipeline)
 
@@ -56,8 +56,11 @@ class DataLoader:
         
         # Load Schema
         try:
-            # Assuming relative path from project root
-            full_path = Path(os.getcwd()) / schema_path
+            # Абсолютний шлях відносно цього файлу (src/core/) — незалежно від CWD
+            full_path = Path(__file__).parent / "schema_definition.json"
+            if not full_path.exists():
+                # Запасний варіант: відносно кореня проекту
+                full_path = Path(__file__).parent.parent.parent / schema_path
             with open(full_path, 'r') as f:
                 self.schema = json.load(f)
                 self.schema_features = self.schema["features"]
@@ -70,7 +73,9 @@ class DataLoader:
         self, 
         file_path: str, 
         max_rows: Optional[int] = None,
-        multiclass: bool = False
+        multiclass: bool = False,
+        align_to_schema: bool = True,
+        preserve_context: bool = False
     ) -> pd.DataFrame:
         """
         Loads file and runs the Unified Pipeline.
@@ -103,6 +108,12 @@ class DataLoader:
         # 1. Detect Type
         dataset_type = self.detector.detect(df)
         print(f"[LOG] Detected Dataset Type: {dataset_type}")
+
+        # Force family-specific mode for NSL-KDD/UNSW to preserve rich features.
+        # Unified CIC schema drops most NSL/UNSW columns and hurts detection quality.
+        if align_to_schema and dataset_type in {"NSL-KDD", "UNSW-NB15"}:
+            print(f"[LOG] Family mode forced for {dataset_type}: preserving native feature space.")
+            align_to_schema = False
         
         if self.verbose_diagnostics:
             print(f"[DIAGNOSTIC] Schema required features: {len(self.schema_features)}")
@@ -125,20 +136,23 @@ class DataLoader:
         if multiclass and "attack_cat" in df.columns:
             df = self.label_norm._merge_attack_cat(df)
 
-        df = self.aligner.align(df, self.schema_features)
-        
-        # DIAGNOSTIC: After alignment - count of filled zeros
-        aligned_features = set(df.columns)
-        
-        # Get feature names from schema (list of dicts -> set of names)
-        schema_feature_names = {f.get('name') if isinstance(f, dict) else f for f in self.schema_features}
-        schema_feature_names.discard(None)  # Remove any None values
-        
-        missing_from_alignment = schema_feature_names - aligned_features
-        if missing_from_alignment:
-            print(f"[DIAGNOSTIC] WARNING: {len(missing_from_alignment)} features still missing after alignment")
+        if align_to_schema:
+            df = self.aligner.align(df, self.schema_features)
+            
+            # DIAGNOSTIC: After alignment - count of filled zeros
+            aligned_features = set(df.columns)
+            
+            # Get feature names from schema (list of dicts -> set of names)
+            schema_feature_names = {f.get('name') if isinstance(f, dict) else f for f in self.schema_features}
+            schema_feature_names.discard(None)  # Remove any None values
+            
+            missing_from_alignment = schema_feature_names - aligned_features
+            if missing_from_alignment:
+                print(f"[DIAGNOSTIC] WARNING: {len(missing_from_alignment)} features still missing after alignment")
+            elif self.verbose_diagnostics:
+                print(f"[DIAGNOSTIC] All schema features present after alignment")
         elif self.verbose_diagnostics:
-            print(f"[DIAGNOSTIC] All schema features present after alignment")
+            print("[DIAGNOSTIC] Schema alignment skipped (family-specific mode)")
         
         # 3. Normalize Protocol (if present)
         if "protocol" in df.columns:
@@ -154,57 +168,79 @@ class DataLoader:
         df = self.label_norm.normalize(df, multiclass=multiclass)
         
         # 6. Leakage Filter (Drop bad columns)
-        df = self.leakage.filter(df)
+        preserve_columns = []
+        if preserve_context:
+            preserve_columns = [
+                "src_ip", "source_ip", "src ip", "src-ip", "srcaddr", "src_addr", "src",
+                "dst_ip", "destination_ip", "dst ip", "dst-ip", "dstaddr", "dst_addr", "dst",
+                "src_port", "sport", "source_port",
+                "src port", "source port",
+                "dst_port", "dport", "destination_port", "dest_port", "port",
+                "dst port", "destination port",
+                "protocol", "proto",
+                "timestamp", "time", "datetime", "date", "flow_start_time", "flow start time"
+            ]
+        df = self.leakage.filter(df, preserve_columns=preserve_columns)
         
         # 7. Category Encoding (Strings -> Ints)
         # Now safe strictly because Aligner has added any missing categorical columns
         df = self.cat_encoder.encode(df, self.schema_features)
         
         # 9. Validate (Fix NaNs, Inf, Min/Max)
-        df = self.validator.validate(df, self.schema_features)
+        # In family-specific mode we validate only existing schema columns (don't add missing ones).
+        if align_to_schema:
+            schema_for_validation = self.schema_features
+        else:
+            schema_for_validation = [
+                feat for feat in self.schema_features
+                if (isinstance(feat, dict) and feat.get("name") in df.columns)
+                or (isinstance(feat, str) and feat in df.columns)
+            ]
+        df = self.validator.validate(df, schema_for_validation)
 
         # Post-pipeline coverage diagnostics on schema features (more reliable than pre-derived checks).
-        schema_feature_names = [f.get('name') if isinstance(f, dict) else f for f in self.schema_features]
-        schema_feature_names = [str(name) for name in schema_feature_names if name]
-        numeric_schema_cols = [
-            col for col in schema_feature_names
-            if col in df.columns and pd.api.types.is_numeric_dtype(df[col])
-        ]
-        zero_schema_cols = []
-        for col in numeric_schema_cols:
-            series = pd.to_numeric(df[col], errors='coerce').fillna(0)
-            if float(series.abs().sum()) == 0.0:
-                zero_schema_cols.append(col)
+        if align_to_schema:
+            schema_feature_names = [f.get('name') if isinstance(f, dict) else f for f in self.schema_features]
+            schema_feature_names = [str(name) for name in schema_feature_names if name]
+            numeric_schema_cols = [
+                col for col in schema_feature_names
+                if col in df.columns and pd.api.types.is_numeric_dtype(df[col])
+            ]
+            zero_schema_cols = []
+            for col in numeric_schema_cols:
+                series = pd.to_numeric(df[col], errors='coerce').fillna(0)
+                if float(series.abs().sum()) == 0.0:
+                    zero_schema_cols.append(col)
 
-        # Dataset-aware thresholds: CIC should keep richer coverage than NSL/UNSW.
-        expected_min_coverage = {
-            "CIC-IDS": 0.60,
-            "NSL-KDD": 0.10,
-            "UNSW-NB15": 0.18,
-            "Generic": 0.20,
-        }.get(dataset_type, 0.20)
+            # Dataset-aware thresholds: CIC should keep richer coverage than NSL/UNSW.
+            expected_min_coverage = {
+                "CIC-IDS": 0.60,
+                "NSL-KDD": 0.10,
+                "UNSW-NB15": 0.18,
+                "Generic": 0.20,
+            }.get(dataset_type, 0.20)
 
-        coverage = 1.0
-        if numeric_schema_cols:
-            coverage = 1.0 - (len(zero_schema_cols) / len(numeric_schema_cols))
+            coverage = 1.0
+            if numeric_schema_cols:
+                coverage = 1.0 - (len(zero_schema_cols) / len(numeric_schema_cols))
 
-        print(
-            f"[LOG] Feature coverage ({dataset_type}): "
-            f"{coverage * 100:.1f}% non-zero schema features"
-        )
-
-        if coverage < expected_min_coverage:
             print(
-                f"[DIAGNOSTIC] WARNING: low feature coverage for {dataset_type} "
-                f"({coverage * 100:.1f}% < {expected_min_coverage * 100:.1f}%)."
+                f"[LOG] Feature coverage ({dataset_type}): "
+                f"{coverage * 100:.1f}% non-zero schema features"
             )
-            if self.verbose_diagnostics and zero_schema_cols:
-                print(f"[DIAGNOSTIC] Zero schema columns (sample): {zero_schema_cols[:12]}...")
-        elif self.verbose_diagnostics and zero_schema_cols:
-            print(
-                f"[DIAGNOSTIC] Zero schema columns (expected for cross-family mapping): "
-                f"{len(zero_schema_cols)}"
-            )
+
+            if coverage < expected_min_coverage:
+                print(
+                    f"[DIAGNOSTIC] WARNING: low feature coverage for {dataset_type} "
+                    f"({coverage * 100:.1f}% < {expected_min_coverage * 100:.1f}%)."
+                )
+                if self.verbose_diagnostics and zero_schema_cols:
+                    print(f"[DIAGNOSTIC] Zero schema columns (sample): {zero_schema_cols[:12]}...")
+            elif self.verbose_diagnostics and zero_schema_cols:
+                print(
+                    f"[DIAGNOSTIC] Zero schema columns (expected for cross-family mapping): "
+                    f"{len(zero_schema_cols)}"
+                )
 
         print(f"[LOG] Pipeline Complete. Output shape: {df.shape}")
         logger.info(f"Pipeline complete for {file_path}. Type: {dataset_type}")
@@ -233,38 +269,65 @@ class DataLoader:
                     preview_unique = df[label_col].astype(str).str.strip().nunique(dropna=True)
 
                     if preview_unique <= 1:
-                        full_df = pd.read_csv(file_path, low_memory=False, skipinitialspace=True)
-                        full_df.columns = full_df.columns.astype(str).str.strip()
-                        if len(full_df.columns) > 0:
-                            first_col_full = full_df.columns[0]
-                            full_df = full_df[full_df[first_col_full] != first_col_full].copy()
+                        # PERFORMANCE: у більшості "атака/норма" файлів класи і так однорідні.
+                        # Не читаємо весь CSV одразу (це спричиняло великі витрати RAM/часу).
+                        # Спершу швидко перевіряємо ще кілька чанків.
+                        discovered = set(df[label_col].astype(str).str.strip().tolist())
+                        mixed_detected = False
+                        try:
+                            scan_budget = int(min(max(max_rows * 4, 40000), 200000))
+                            scanned = 0
+                            for chunk in pd.read_csv(
+                                file_path,
+                                usecols=[label_col],
+                                chunksize=20000,
+                                low_memory=False,
+                                skipinitialspace=True
+                            ):
+                                col = chunk[label_col].astype(str).str.strip()
+                                discovered.update(col.unique().tolist())
+                                scanned += len(chunk)
+                                if len(discovered) > 1:
+                                    mixed_detected = True
+                                    break
+                                if scanned >= scan_budget:
+                                    break
+                        except Exception:
+                            mixed_detected = False
 
-                        if len(full_df) > max_rows and label_col in full_df.columns:
-                            full_labels = full_df[label_col].astype(str).str.strip()
-                            full_unique = full_labels.nunique(dropna=True)
+                        if mixed_detected:
+                            full_df = pd.read_csv(file_path, low_memory=False, skipinitialspace=True)
+                            full_df.columns = full_df.columns.astype(str).str.strip()
+                            if len(full_df.columns) > 0:
+                                first_col_full = full_df.columns[0]
+                                full_df = full_df[full_df[first_col_full] != first_col_full].copy()
 
-                            if full_unique > 1:
-                                # Стратифікована вибірка для збереження часток класів.
-                                sampled_parts = []
-                                grouped = full_df.groupby(full_labels, sort=False, group_keys=False)
-                                for _, group in grouped:
-                                    frac = len(group) / max(len(full_df), 1)
-                                    n_take = max(1, int(round(frac * max_rows)))
-                                    sampled_parts.append(group.sample(n=min(n_take, len(group)), random_state=42))
+                            if len(full_df) > max_rows and label_col in full_df.columns:
+                                full_labels = full_df[label_col].astype(str).str.strip()
+                                full_unique = full_labels.nunique(dropna=True)
 
-                                sampled_df = pd.concat(sampled_parts, ignore_index=True)
-                                if len(sampled_df) > max_rows:
-                                    sampled_df = sampled_df.sample(n=max_rows, random_state=42)
-                                elif len(sampled_df) < max_rows:
-                                    missing = max_rows - len(sampled_df)
-                                    extra_pool = full_df.drop(index=sampled_df.index, errors='ignore')
-                                    if len(extra_pool) > 0:
-                                        extra = extra_pool.sample(n=min(missing, len(extra_pool)), random_state=42)
-                                        sampled_df = pd.concat([sampled_df, extra], ignore_index=True)
+                                if full_unique > 1:
+                                    # Стратифікована вибірка для збереження часток класів.
+                                    sampled_parts = []
+                                    grouped = full_df.groupby(full_labels, sort=False, group_keys=False)
+                                    for _, group in grouped:
+                                        frac = len(group) / max(len(full_df), 1)
+                                        n_take = max(1, int(round(frac * max_rows)))
+                                        sampled_parts.append(group.sample(n=min(n_take, len(group)), random_state=42))
 
-                                df = sampled_df.reset_index(drop=True)
-                            else:
-                                df = full_df.sample(n=max_rows, random_state=42).reset_index(drop=True)
+                                    sampled_df = pd.concat(sampled_parts, ignore_index=True)
+                                    if len(sampled_df) > max_rows:
+                                        sampled_df = sampled_df.sample(n=max_rows, random_state=42)
+                                    elif len(sampled_df) < max_rows:
+                                        missing = max_rows - len(sampled_df)
+                                        extra_pool = full_df.drop(index=sampled_df.index, errors='ignore')
+                                        if len(extra_pool) > 0:
+                                            extra = extra_pool.sample(n=min(missing, len(extra_pool)), random_state=42)
+                                            sampled_df = pd.concat([sampled_df, extra], ignore_index=True)
+
+                                    df = sampled_df.reset_index(drop=True)
+                                else:
+                                    df = full_df.sample(n=max_rows, random_state=42).reset_index(drop=True)
 
             return df
         except Exception as e:
@@ -517,3 +580,6 @@ class DataLoader:
             raise ValueError(f"PCAP processing failed: {e}")
 
     # No need for detect_dataset_type here as it's extracted to DatasetDetector
+
+
+

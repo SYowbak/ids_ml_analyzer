@@ -7,6 +7,10 @@ import streamlit as st
 
 from src.services.gemini_service import GeminiService
 from src.services.visualizer import Visualizer
+from src.services.threat_catalog import (
+    get_threat_info, get_severity, get_severity_label,
+    get_severity_color, get_severity_icon, SEVERITY_LEVELS
+)
 
 PLOTLY_CONFIG_LIGHT = {
     "displayModeBar": False,
@@ -16,6 +20,26 @@ PLOTLY_CONFIG_LIGHT = {
     "staticPlot": True,
 }
 
+
+def _style_dataframe(df: pd.DataFrame):
+    """Примусово задає світлий стиль для таблиць (щоб текст завжди читався)."""
+    if df is None or len(df) == 0:
+        return df
+    try:
+        return df.style.set_properties(**{
+            'background-color': '#ffffff',
+            'color': '#111111',
+            'border-color': '#e0e0e0'
+        })
+    except Exception:
+        return df
+
+
+def _style_dataframe(df: pd.DataFrame):
+    if df is None or len(df) == 0: return df
+    try:
+        return df.style.set_properties(**{'background-color': '#ffffff', 'color': '#111111', 'border-color': '#e0e0e0'})
+    except Exception: return df
 
 def _first_existing_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
     if df is None or len(df.columns) == 0:
@@ -48,7 +72,7 @@ def _resolve_time_column(df: pd.DataFrame) -> str | None:
     return None
 
 
-def _sample_for_visualization(df: pd.DataFrame, max_rows: int = 80000) -> pd.DataFrame:
+def _sample_for_visualization(df: pd.DataFrame, max_rows: int = 35000) -> pd.DataFrame:
     if df is None or len(df) <= max_rows:
         return df
     return df.sample(max_rows, random_state=42)
@@ -163,23 +187,72 @@ def _risk_label(score: float) -> str:
     return "Критичний"
 
 
-def _plain_summary(total: int, anomalies_count: int, risk_score: float) -> str:
+def _plain_summary(
+    total: int,
+    anomalies_count: int,
+    risk_score: float,
+    threat_counts: dict | None = None,
+) -> str:
+    """Generate a plain-language summary answering WHAT / HOW SERIOUS / WHAT TO DO."""
+
+    # --- Build threat description ---
+    threat_desc = ""
+    if threat_counts:
+        # Filter out 'BENIGN'/'NORMAL' labels, take top-3 threat types
+        attack_types = [
+            name for name in threat_counts
+            if str(name).strip().lower() not in {
+                'норма', 'benign', 'normal', '0', '0.0'
+            }
+        ]
+        if attack_types:
+            top3 = attack_types[:3]
+            threat_desc = f" Типи загроз: **{'**, **'.join(top3)}**."
+
+    pct = min(risk_score, 100.0)
+
     if anomalies_count == 0:
-        return "Ознак атак не виявлено. На цьому файлі трафік виглядає нормальним."
+        return (
+            "**Ознак атак не виявлено.**  \n\n"
+            "Трафік виглядає нормальним. "
+            "Можна перевірити загальну статистику трафіку нижчe."
+        )
 
     if risk_score < 5:
         return (
-            f"Виявлено {anomalies_count:,} підозрілих записів із {total:,}. "
-            "Ризик низький, але варто перевірити аномалії з найбільшою частотою."
+            f"ЩО: Виявлено **{anomalies_count:,}** підозрілих записів із {total:,} ({pct:.1f}%).{threat_desc}  \n\n"
+            f"НАСКІЛЬКИ СЕРЙОЗНО: **Рівень ризику — Низький** (менше 5% трафіку).  \n\n"
+            "ЩО РОБИТИ: Перевірте розділ «Мережеві деталі інциденту» нижче для ідентифікації джерел поодиноких аномалій. "
+            "Звичайний моніторинг достатній."
         )
+
     if risk_score < 20:
         return (
-            f"Виявлено {anomalies_count:,} підозрілих записів із {total:,}. "
-            "Є ознаки інциденту середнього пріоритету."
+            f"ЩО: Виявлено **{anomalies_count:,}** підозрілих записів із {total:,} ({pct:.1f}%).{threat_desc}  \n\n"
+            f"НАСКІЛЬКИ СЕРЙОЗНО: **Рівень ризику — Помірний** ({pct:.1f}% трафіку).  \n\n"
+            "ЩО РОБИТИ: 1) Перевірте найактивніші IP-адреси в «Мережеві деталі» нижче. "
+            "2) Оновіть правила брандмауера. "
+            "3) Включіть розширене логування підозрілих джерел."
         )
+
+    if risk_score < 50:
+        return (
+            f"ЩО: Виявлено **{anomalies_count:,}** підозрілих записів із {total:,} ({pct:.1f}%)!{threat_desc}  \n\n"
+            f"НАСКІЛЬКИ СЕРЙОЗНО: **Рівень ризику — Високий** ({pct:.0f}% трафіку підозрілий).  \n\n"
+            "ЩО РОБИТИ: 1) Негайно заблокуйте підозрілі IP-адреси на брандмауері. "
+            "2) Перевірте журнали доступу за останні 24 години. "
+            "3) Залучіть команду безпеки. "
+            "4) Отримайте AI-аналіз через Gemini нижче."
+        )
+
     return (
-        f"Виявлено {anomalies_count:,} підозрілих записів із {total:,}. "
-        "Це суттєва кількість, рекомендована термінова перевірка джерел трафіку."
+        f"ЩО: Виявлено **{anomalies_count:,}** підозрілих записів із {total:,} ({pct:.0f}%)!{threat_desc}  \n\n"
+        f"НАСКІЛЬКИ СЕРЙОЗНО: **Рівень ризику — КРИТИЧНИЙ** ({pct:.0f}% трафіку підозрілий).  \n\n"
+        "ЩО РОБИТИ: 1) НЕГАЙНО: активуйте протокол реагування на інциденти. "
+        "2) Ізолюйте уражені сегменти мережі. "
+        "3) Збережіть форензні докази. "
+        "4) Негайно повідомте керівництво. "
+        "5) Отримайте детальний SOC-аналіз через Gemini нижче."
     )
 
 
@@ -281,7 +354,15 @@ def render_comprehensive_dashboard(
     with kpi4:
         st.metric("Рівень ризику", f"{risk_score:.2f}%", _risk_label(risk_score))
 
-    st.info(_plain_summary(total, anomalies_count, risk_score))
+    # Quick threat count for summary (full computation happens later for charts)
+    _quick_threats: dict = {}
+    if anomalies_count > 0 and "prediction" in anomalies.columns:
+        for lbl, cnt in anomalies["prediction"].value_counts(dropna=False).head(5).items():
+            clean = str(lbl).strip()
+            if clean and clean.lower() not in {"nan", "none"}:
+                _quick_threats[clean] = int(cnt)
+    st.info(_plain_summary(total, anomalies_count, risk_score, threat_counts=_quick_threats))
+
 
     visual_mode_options = ["Авто (рекомендовано)", "Швидкий", "Детальний"]
     if st.session_state.get("scan_visual_mode") not in set(visual_mode_options):
@@ -430,6 +511,76 @@ def render_comprehensive_dashboard(
     else:
         st.info("Розподіл загроз недоступний: атак не виявлено.")
 
+    # ── Деталі виявлених загроз (threat detail cards) ──
+    if threat_counts and anomalies_count > 0:
+        st.markdown("---")
+        st.markdown(
+            """
+            <div class="section-card">
+                <div class="section-title">Деталі виявлених загроз</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # Severity summary bar
+        severity_summary: dict[str, int] = {}
+        if 'severity_label' in anomalies.columns:
+            for sev_label, cnt in anomalies['severity_label'].value_counts().items():
+                sev_str = str(sev_label).strip()
+                if sev_str and sev_str.lower() not in {'безпечно', 'інфо'}:
+                    severity_summary[sev_str] = int(cnt)
+
+        if severity_summary:
+            chips_html = '<div class="threat-summary-bar">'
+            sev_order = {'Критичний': '#DC2626', 'Високий': '#EF4444', 'Помірний': '#F59E0B', 'Низький': '#10B981'}
+            for sev_name, sev_color in sev_order.items():
+                if sev_name in severity_summary:
+                    chips_html += (
+                        f'<span class="threat-summary-chip">'
+                        f'<span class="chip-dot" style="background:{sev_color}"></span>'
+                        f'{sev_name}: {severity_summary[sev_name]:,}'
+                        f'</span>'
+                    )
+            chips_html += '</div>'
+            st.markdown(chips_html, unsafe_allow_html=True)
+
+        # Threat detail cards — top 8 threat types
+        sorted_threats = sorted(threat_counts.items(), key=lambda x: x[1], reverse=True)
+        for threat_name, threat_count in sorted_threats[:8]:
+            info = get_threat_info(threat_name)
+            sev = info.get('severity', 'medium')
+            sev_label = get_severity_label(sev)
+            sev_color = get_severity_color(sev)
+            sev_icon = get_severity_icon(sev)
+            description = info.get('description', '')
+            impact = info.get('impact', '')
+            actions = info.get('actions', [])
+
+            pct_of_threats = (threat_count / anomalies_count * 100) if anomalies_count > 0 else 0
+
+            card_html = f'''
+            <div class="threat-detail-card">
+                <div class="threat-header">
+                    <span class="threat-name">{sev_icon} {threat_name}</span>
+                    <span>
+                        <span class="threat-badge threat-badge-{sev}">{sev_label}</span>
+                        <span class="threat-count">{threat_count:,} ({pct_of_threats:.1f}%)</span>
+                    </span>
+                </div>
+            '''
+            if description:
+                card_html += f'<div class="threat-desc">{description}</div>'
+            if impact:
+                card_html += f'<div class="threat-impact">⚡ Вплив: {impact}</div>'
+            if actions:
+                card_html += '<ul class="threat-actions">'
+                for action in actions[:4]:
+                    card_html += f'<li>✅ {action}</li>'
+                card_html += '</ul>'
+            card_html += '</div>'
+            st.markdown(card_html, unsafe_allow_html=True)
+
     gauge_fig = viz.create_risk_gauge(risk_score, "Рівень ризику системи")
     st.plotly_chart(_ensure_figure_readability(gauge_fig), width="stretch", config=PLOTLY_CONFIG_LIGHT)
 
@@ -493,23 +644,23 @@ def render_comprehensive_dashboard(
         with info_cols[0]:
             if src_ip_col:
                 st.markdown("**Найактивніші IP-джерела (аномалії)**")
-                st.dataframe(_top_value_table(anomalies, src_ip_col), width="stretch", hide_index=True)
+                st.dataframe(_style_dataframe(_top_value_table(anomalies, src_ip_col)), width="stretch", hide_index=True)
             elif dst_ip_col:
                 st.markdown("**Найактивніші IP-призначення (аномалії)**")
-                st.dataframe(_top_value_table(anomalies, dst_ip_col), width="stretch", hide_index=True)
+                st.dataframe(_style_dataframe(_top_value_table(anomalies, dst_ip_col)), width="stretch", hide_index=True)
 
         with info_cols[1]:
             if dst_port_col:
                 st.markdown("**Найчастіші порти призначення (аномалії)**")
-                st.dataframe(_top_value_table(anomalies, dst_port_col), width="stretch", hide_index=True)
+                st.dataframe(_style_dataframe(_top_value_table(anomalies, dst_port_col)), width="stretch", hide_index=True)
             elif src_port_col:
                 st.markdown("**Найчастіші порти джерела (аномалії)**")
-                st.dataframe(_top_value_table(anomalies, src_port_col), width="stretch", hide_index=True)
+                st.dataframe(_style_dataframe(_top_value_table(anomalies, src_port_col)), width="stretch", hide_index=True)
 
         with info_cols[2]:
             if proto_col:
                 st.markdown("**Найчастіші протоколи (аномалії)**")
-                st.dataframe(_top_value_table(anomalies, proto_col), width="stretch", hide_index=True)
+                st.dataframe(_style_dataframe(_top_value_table(anomalies, proto_col)), width="stretch", hide_index=True)
 
         time_col_details = _resolve_time_column(anomalies)
         detail_columns = []
@@ -521,6 +672,8 @@ def render_comprehensive_dashboard(
             dst_port_col,
             proto_col,
             "prediction",
+            "severity_label",
+            "threat_description",
             "duration",
             "packet_rate",
             "byte_rate",
@@ -532,7 +685,7 @@ def render_comprehensive_dashboard(
 
         if detail_columns:
             st.markdown("**Приклади підозрілих подій (для ручної перевірки):**")
-            st.dataframe(anomalies[detail_columns].head(200), width="stretch")
+            st.dataframe(_style_dataframe(anomalies[detail_columns].head(200)), width="stretch", hide_index=True)
         else:
             st.info("У виявлених аномаліях немає колонок з IP/портами/протоколом.")
 
@@ -577,14 +730,92 @@ def render_comprehensive_dashboard(
 
             with tab_anomaly:
                 if len(anomalies) > 0:
-                    st.dataframe(anomalies.head(200), width="stretch")
+                    st.dataframe(_style_dataframe(anomalies.head(200)), width="stretch", hide_index=True)
                 else:
                     st.info("Підозрілих рядків немає.")
 
             with tab_general:
-                st.dataframe(viz_df.head(200), width="stretch")
+                st.dataframe(_style_dataframe(viz_df.head(200)), width="stretch", hide_index=True)
     else:
         st.caption("Детальні графіки вимкнені для швидшої роботи сторінки.")
+
+    # --- EXPORT BUTTONS ---
+    st.markdown("---")
+    st.markdown(
+        """
+        <div class="section-card">
+            <div class="section-title">Експорт звіту</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    try:
+        from src.services.report_generator import ReportGenerator
+        report_gen = ReportGenerator()
+        export_summary = {
+            'filename': metrics.get('filename', 'scan'),
+            'model_name': metrics.get('model_name', ''),
+            'total': total,
+            'anomalies': anomalies_count,
+            'risk_score': risk_score,
+        }
+
+        exp_col1, exp_col2, exp_col3 = st.columns(3)
+
+        with exp_col1:
+            try:
+                csv_bytes = report_gen.export_csv(result_df)
+                st.download_button(
+                    label="⬇ Завантажити CSV",
+                    data=csv_bytes,
+                    file_name=f"scan_results_{metrics.get('filename', 'export')}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="export_csv_btn",
+                )
+            except Exception as _e:
+                st.warning(f"Помилка CSV: {_e}")
+
+        with exp_col2:
+            try:
+                xlsx_bytes = report_gen.export_excel(
+                    result_df,
+                    anomalies_df=anomalies if len(anomalies) > 0 else None,
+                    summary=export_summary,
+                )
+                st.download_button(
+                    label="⬇ Завантажити Excel",
+                    data=xlsx_bytes,
+                    file_name=f"scan_report_{metrics.get('filename', 'export')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key="export_excel_btn",
+                )
+            except Exception as _e:
+                st.warning(f"Помилка Excel: {_e}")
+
+        with exp_col3:
+            try:
+                plain_summary_text = _plain_summary(total, anomalies_count, risk_score)
+                pdf_bytes = report_gen.generate_pdf_report(
+                    summary=export_summary,
+                    details_df=anomalies.head(50) if len(anomalies) > 0 else None,
+                    executive_summary=plain_summary_text,
+                )
+                st.download_button(
+                    label="⬇ Завантажити PDF",
+                    data=pdf_bytes,
+                    file_name=f"scan_report_{metrics.get('filename', 'export')}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    key="export_pdf_btn",
+                )
+            except Exception as _e:
+                st.warning(f"Помилка PDF: {_e}")
+
+    except ImportError:
+        st.caption("Експорт недоступний: встановіть reportlab та openpyxl.")
 
     if gemini_key and anomalies_count > 0:
         gemini = GeminiService(api_key=gemini_key)

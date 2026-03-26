@@ -260,6 +260,9 @@ def compute_scan_readiness_diagnostics(
         report['checks']['file_family_confidence'] = family_confidence
         report['checks']['file_family_ambiguous'] = family_ambiguous
 
+        schema_mode = str(metadata.get('schema_mode', 'unified')).strip().lower() if metadata else 'unified'
+        report['checks']['schema_mode'] = schema_mode
+
         training_files = metadata.get('training_files', []) if metadata else []
         if not isinstance(training_files, list):
             training_files = []
@@ -280,16 +283,43 @@ def compute_scan_readiness_diagnostics(
             )
             quality_score -= 25 if family_confidence >= 0.75 else 15
             report['checks']['ood_family_mismatch'] = True
+            if schema_mode == 'family':
+                report['issues'].append(
+                    "Модель зберігає сімейні ознаки, тож для іншого сімейства вона не підходить. "
+                    "Оберіть модель, натреновану на цьому сімействі."
+                )
+                report['blocking'] = True
+                format_score -= 15
 
         if family_ambiguous:
             report['issues'].append("Сімейство файлу визначено неоднозначно. Автовибір моделі менш надійний.")
             quality_score -= 8
 
+        schema_mode = str(metadata.get('schema_mode', 'unified')).strip().lower() if isinstance(metadata, dict) else 'unified'
+        align_to_schema = schema_mode != 'family'
         loader = DataLoader()
-        df_preview = loader.load_file(file_path, max_rows=3000)
+        df_preview = loader.load_file(file_path, max_rows=3000, align_to_schema=align_to_schema)
         report['checks']['preview_rows'] = int(len(df_preview))
-        if 'label' in df_preview.columns:
-            df_preview = df_preview.drop(columns=['label'])
+        # ── Check if file has attack labels (before dropping) ──
+        file_has_attack_labels = False
+        file_attack_label_count = 0
+        label_col = None
+        for c in df_preview.columns:
+            if c.lower() in ('label', 'attack_cat', 'class'):
+                label_col = c
+                break
+        if label_col is not None:
+            non_benign = df_preview[label_col].astype(str).str.strip().str.lower()
+            benign_variants = {'benign', 'normal', 'none', '', 'nan', '0', '0.0'}
+            attack_mask = ~non_benign.isin(benign_variants)
+            file_attack_label_count = int(attack_mask.sum())
+            file_has_attack_labels = file_attack_label_count > 0
+            report['checks']['file_has_labels'] = True
+            report['checks']['file_attack_label_count'] = file_attack_label_count
+            df_preview = df_preview.drop(columns=[label_col])
+        else:
+            report['checks']['file_has_labels'] = False
+            report['checks']['file_attack_label_count'] = 0
 
         required_features = set(preprocessor.feature_columns)
         available_features = set(df_preview.columns)
@@ -387,6 +417,26 @@ def compute_scan_readiness_diagnostics(
                 report['issues'].append("Надто висока частка аномалій у preview: можливий ризик FP.")
                 quality_score -= 15
 
+            # ── Warning: model detects 0 anomalies on file with attack labels ──
+            if file_ext in TABULAR_EXTENSIONS and anomaly_rate < 0.001:
+                if file_has_attack_labels:
+                    pct = (file_attack_label_count / max(1, len(df_preview))) * 100
+                    report['issues'].append(
+                        f"Файл містить {file_attack_label_count} позначених атак ({pct:.0f}%), "
+                        "але модель не виявила жодної аномалії. "
+                        "Ймовірно, дані мають інший розподіл, ніж тренувальні. "
+                        "Рекомендується перенавчити модель на подібних даних."
+                    )
+                    quality_score -= 55
+                    report['checks']['label_vs_model_mismatch'] = True
+                    report['blocking'] = True
+                else:
+                    report['issues'].append(
+                        "Модель не виявила аномалій у preview-вибірці. "
+                        "Якщо ви очікуєте атаки — перевірте сумісність даних з моделлю."
+                    )
+                    quality_score -= 10
+
             if is_if and metadata:
                 if not bool(metadata.get('if_auto_calibration', False)):
                     report['issues'].append("Для IF вимкнено авто-калібрування порогу.")
@@ -407,6 +457,9 @@ def compute_scan_readiness_diagnostics(
         elif report['score'] >= 60:
             report['status'] = 'caution'
         else:
+            report['status'] = 'risk'
+
+        if report.get('blocking', False):
             report['status'] = 'risk'
 
         return report

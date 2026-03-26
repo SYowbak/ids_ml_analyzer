@@ -62,6 +62,7 @@ class Preprocessor:
         self.feature_names_in_: list[str] = []
         self._is_fitted: bool = False
         self._enable_scaling = enable_scaling
+        self.dropped_constant_columns_ = []
         
         # FeatureAdapter
         if feature_adapter_strategy is not None:
@@ -176,6 +177,18 @@ class Preprocessor:
         
         # Кодування категоріальних
         X = self._encode_categorical(X, fit=True)
+
+        # Видаляємо константні ознаки (0 variance) — вони не несуть інформативності.
+        constant_cols = [col for col in X.columns if X[col].nunique(dropna=False) <= 1]
+        if constant_cols:
+            X = X.drop(columns=constant_cols)
+            self.dropped_constant_columns_ = constant_cols
+            logger.info(
+                f"[Preprocessor] Dropped {len(constant_cols)} constant columns "
+                f"(sample: {constant_cols[:6]})."
+            )
+        else:
+            self.dropped_constant_columns_ = []
         
         # Збереження колонок (для валідації при predict)
         self.feature_columns = X.columns.tolist()

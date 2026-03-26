@@ -15,7 +15,7 @@ streamlit>=1.28.0
 
 # === Visualization ===
 plotly>=5.18.0
-kaleido>=0.2.1  # Для експорту графіків в PDF
+kaleido>=0.2.1,<0.3.0  # Для експорту графіків в PDF
 
 # === Report Generation ===
 reportlab>=4.0.0
@@ -33,4 +33,4 @@ python-dotenv>=1.0.0
 
 # === Database ===
 sqlalchemy>=2.0.0
-loguru==0.7.20
+loguru>=0.7.0,<1.0.0

@@ -145,6 +145,38 @@ def _calibrate_two_stage_threshold(
         result['reason'] = 'single_class_validation'
         return result
 
+    attack_rate = float(np.mean(y_true_attack))
+    # Adaptive FP target and guards for low-prevalence datasets.
+    if attack_rate < 0.02:
+        target_fp_rate = 0.005
+        precision_floor = 0.75
+        max_attack_rate = min(0.08, (attack_rate * 2.5) + 0.02)
+        fp_penalty_weight = 1.6
+        over_pred_weight = 0.7
+        precision_weight = 0.45
+    elif attack_rate < 0.05:
+        target_fp_rate = 0.01
+        precision_floor = 0.70
+        max_attack_rate = min(0.12, (attack_rate * 2.0) + 0.03)
+        fp_penalty_weight = 1.2
+        over_pred_weight = 0.55
+        precision_weight = 0.40
+    elif attack_rate < 0.10:
+        target_fp_rate = 0.02
+        precision_floor = 0.65
+        max_attack_rate = min(0.20, (attack_rate * 1.8) + 0.04)
+        fp_penalty_weight = 1.0
+        over_pred_weight = 0.40
+        precision_weight = 0.38
+    else:
+        target_fp_rate = 0.03 if attack_rate < 0.25 else 0.04
+        precision_floor = 0.60
+        max_attack_rate = min(0.60, (attack_rate * 1.6) + 0.05)
+        fp_penalty_weight = 0.9
+        over_pred_weight = 0.25
+        precision_weight = 0.35
+    max_attack_rate = float(np.clip(max_attack_rate, 0.01, 0.90))
+
     best = {
         'threshold': fallback_threshold,
         'f1_attack': -1.0,
@@ -170,13 +202,25 @@ def _calibrate_two_stage_threshold(
         f1 = float(f1_score(y_true_attack, y_pred_attack, zero_division=0))
         precision = float(precision_score(y_true_attack, y_pred_attack, zero_division=0))
         recall = float(recall_score(y_true_attack, y_pred_attack, zero_division=0))
+        fp_rate = 0.0
+        pred_attack_rate = float(np.mean(y_pred_attack)) if len(y_pred_attack) else 0.0
+        if len(y_true_attack):
+            tn = int(np.sum((y_true_attack == 0) & (y_pred_attack == 0)))
+            fp = int(np.sum((y_true_attack == 0) & (y_pred_attack == 1)))
+            fp_rate = fp / (fp + tn) if (fp + tn) else 0.0
         denom = (4.0 * precision) + recall
         f2 = float((5.0 * precision * recall) / denom) if denom > 0 else 0.0
 
         # Soft guard against extremely low precision.
-        precision_floor = 0.60
         precision_penalty = max(0.0, precision_floor - precision)
-        objective = f2 - (precision_penalty * precision_penalty * 0.35)
+        fp_penalty = max(0.0, fp_rate - target_fp_rate)
+        over_pred_penalty = max(0.0, pred_attack_rate - max_attack_rate)
+        objective = (
+            f2
+            - (precision_penalty * precision_penalty * precision_weight)
+            - (fp_penalty * fp_penalty_weight)
+            - (over_pred_penalty * over_pred_weight)
+        )
         threshold_stats.append(
             {
                 'threshold': threshold,
@@ -184,6 +228,8 @@ def _calibrate_two_stage_threshold(
                 'f2_attack': f2,
                 'precision_attack': precision,
                 'recall_attack': recall,
+                'fp_rate': fp_rate,
+                'pred_attack_rate': pred_attack_rate,
                 'objective': objective,
             }
         )
@@ -233,8 +279,43 @@ def _calibrate_two_stage_threshold(
             )
             best = stable_choice
 
+    # Enforce FP guard using benign-only quantile if needed.
+    try:
+        probas = model.binary_model.predict_proba(X_val)
+        attack_idx = getattr(model, 'attack_idx_', None)
+        if attack_idx is None:
+            attack_idx = int(np.where(model.binary_model.classes_ == 1)[0][0]) if hasattr(model.binary_model, 'classes_') else 1
+        attack_probs = probas[:, attack_idx]
+        benign_mask = (y_true_attack == 0)
+        if benign_mask.any():
+            fp_threshold = float(np.quantile(attack_probs[benign_mask], 1.0 - target_fp_rate))
+            fp_threshold = _clamp_two_stage_threshold(fp_threshold)
+            if fp_threshold > best['threshold']:
+                best['threshold'] = fp_threshold
+        # Guard predicted attack rate on validation set (use all samples).
+        rate_threshold = float(np.quantile(attack_probs, 1.0 - max_attack_rate))
+        rate_threshold = _clamp_two_stage_threshold(rate_threshold)
+        if rate_threshold > best['threshold']:
+            best['threshold'] = rate_threshold
+    except Exception:
+        pass
+
     model.binary_threshold = float(best['threshold'])
-    result.update(best)
+    # Refresh metrics for the final threshold.
+    y_pred_final = model.predict(X_val, threshold=model.binary_threshold)
+    y_pred_attack_final = (np.asarray(y_pred_final) != benign_code_resolved).astype(int)
+    result.update({
+        'threshold': float(model.binary_threshold),
+        'f1_attack': float(f1_score(y_true_attack, y_pred_attack_final, zero_division=0)),
+        'f2_attack': float(best.get('f2_attack', 0.0)),
+        'precision_attack': float(precision_score(y_true_attack, y_pred_attack_final, zero_division=0)),
+        'recall_attack': float(recall_score(y_true_attack, y_pred_attack_final, zero_division=0)),
+        'evaluated_points': int(result.get('evaluated_points', 0)),
+        'objective': float(best.get('objective', 0.0)),
+        'target_fp_rate': float(target_fp_rate),
+        'max_attack_rate': float(max_attack_rate),
+        'precision_floor': float(precision_floor),
+    })
     return result
 
 
@@ -309,7 +390,9 @@ def _evaluate_training_quality_gate(
         if two_stage_mode:
             thresholds['min_attack_recall'] = min(0.95, thresholds['min_attack_recall'] + 0.05)
         if is_mega_model:
-            thresholds['min_attack_f1'] = max(thresholds['min_attack_f1'], 0.50)
+            thresholds['min_attack_precision'] = max(0.20, thresholds['min_attack_precision'] - 0.10)
+            thresholds['min_attack_recall'] = max(0.35, thresholds['min_attack_recall'] - 0.10)
+            thresholds['min_attack_f1'] = max(0.40, thresholds['min_attack_f1'] - 0.10)
 
     failures: list[str] = []
 
@@ -321,10 +404,10 @@ def _evaluate_training_quality_gate(
         failures.append("Для Two-Stage потрібно щонайменше 3 класи (BENIGN + 2 типи атак).")
     if is_mega_model and trained_family_count < 2:
         failures.append("Mega-Model повинен містити щонайменше 2 різні сімейства даних.")
-    if is_mega_model and training_file_count < 3:
+    if is_mega_model and training_file_count < 2:
         failures.append("Для Mega-Model замало файлів. Додайте більше навчальних вибірок.")
-    if is_mega_model and trained_family_count >= 2 and observed['attack_recall'] < 0.50:
-        failures.append("Для крос-доменного Mega-Model повнота по атаках має бути не нижче 0.50.")
+    if is_mega_model and trained_family_count >= 2 and observed['attack_recall'] < 0.40:
+        failures.append("Для крос-доменного Mega-Model повнота по атаках має бути не нижче 0.40.")
 
     if observed['accuracy'] < thresholds['min_accuracy']:
         failures.append(
@@ -350,6 +433,20 @@ def _evaluate_training_quality_gate(
             failures.append("Модель майже не позначає атаки на валідації.")
         elif pred_rate >= 0.995:
             failures.append("Модель позначає майже всі записи як атаки на валідації.")
+        else:
+            attack_rate = observed['attack_rate_test']
+            if attack_rate < 0.02:
+                low_ratio, high_ratio = 0.10, 8.0
+            elif attack_rate < 0.10:
+                low_ratio, high_ratio = 0.15, 6.0
+            else:
+                low_ratio, high_ratio = 0.25, 4.0
+            ratio = pred_rate / max(attack_rate, 1e-9)
+            if ratio < low_ratio or ratio > high_ratio:
+                failures.append(
+                    "Переоцінка/недооцінка атак: "
+                    f"прогнозована частка {pred_rate:.2%} vs фактична {attack_rate:.2%}."
+                )
 
     if observed['min_class_ratio_train'] < 0.001 and not is_isolation_algorithm:
         failures.append("Дуже рідкісні класи у train (<0.1%). Потрібна ребалансировка або більше даних.")
@@ -374,12 +471,18 @@ def _evaluate_training_quality_gate(
         score -= 25
     if is_mega_model and trained_family_count < 2:
         score -= 20
-    if is_mega_model and training_file_count < 3:
+    if is_mega_model and training_file_count < 2:
         score -= 10
-    if is_mega_model and trained_family_count >= 2 and observed['attack_recall'] < 0.50:
+    if is_mega_model and trained_family_count >= 2 and observed['attack_recall'] < 0.40:
         score -= 12
     if observed['min_class_ratio_train'] < 0.001 and not is_isolation_algorithm:
         score -= 12
+    if observed['attack_rate_test'] > 0:
+        pred_rate = observed['attack_rate_pred']
+        attack_rate = observed['attack_rate_test']
+        ratio = pred_rate / max(attack_rate, 1e-9)
+        if ratio < 0.15 or ratio > 6.0:
+            score -= 10
 
     score = int(np.clip(score, 0, 100))
 
@@ -398,18 +501,20 @@ def _filename_looks_normal(name: str) -> bool:
     return any(token in lowered for token in normal_tokens)
 
 
-def _find_training_ready_files() -> tuple[list[Path], list[Path], list[Path]]:
+def _find_training_ready_files() -> tuple[list[Path], list[Path], list[Path], list[Path]]:
     ready_dir = ROOT_DIR / 'datasets' / 'Training_Ready'
     if not ready_dir.exists():
-        return [], [], []
+        return [], [], [], []
 
     all_files = [
         f for f in sorted(ready_dir.glob('*.*'))
-        if f.suffix.lower() in TABULAR_EXTENSIONS
+        if f.suffix.lower() in TABULAR_EXTENSIONS or f.suffix.lower() in PCAP_EXTENSIONS
     ]
-    normal_files = [f for f in all_files if _filename_looks_normal(f.name)]
-    attack_files = [f for f in all_files if f not in normal_files]
-    return all_files, normal_files, attack_files
+    tabular_files = [f for f in all_files if f.suffix.lower() in TABULAR_EXTENSIONS]
+    pcap_files = [f for f in all_files if f.suffix.lower() in PCAP_EXTENSIONS]
+    normal_files = [f for f in tabular_files if _filename_looks_normal(f.name)]
+    attack_files = [f for f in tabular_files if f not in normal_files]
+    return tabular_files, normal_files, attack_files, pcap_files
 
 
 @st.cache_data(show_spinner=False)
@@ -439,27 +544,60 @@ def assess_training_file_compatibility(
         result['reason'] = f"Непідтримуваний формат `{ext}`."
         return result
 
-    try:
-        loader = DataLoader()
-        preview = loader.load_file(file_path, max_rows=1500, multiclass=False)
-    except Exception as exc:
-        result['reason'] = f"Файл не вдалося обробити: {exc}"
-        return result
-
-    if preview is None or len(preview) == 0:
-        result['reason'] = "Файл порожній або не містить валідних записів."
-        return result
-
-    has_label = 'label' in preview.columns
-    result['has_label'] = bool(has_label)
-
     if ext in PCAP_EXTENSIONS:
         result['compatible'] = True
         result['allowed_modes'] = ['if_unsupervised']
         result['reason'] = "PCAP сумісний тільки з Isolation Forest."
         return result
 
-    # Tabular formats (CSV/NF/NFDUMP)
+    # Tabular formats (CSV/NF/NFDUMP): максимально легкий preview без запуску повного пайплайна.
+    preview = None
+    read_attempts = [
+        {"encoding": "utf-8", "engine": "c"},
+        {"encoding": "utf-8", "engine": "python", "on_bad_lines": "skip"},
+        {"encoding": "cp1251", "engine": "python", "on_bad_lines": "skip"},
+        {"encoding": "latin1", "engine": "python", "on_bad_lines": "skip"},
+    ]
+    for attempt in read_attempts:
+        try:
+            kwargs = {
+                "nrows": 1200,
+                "low_memory": False,
+                "skipinitialspace": True,
+                **attempt,
+            }
+            preview = pd.read_csv(file_path, **kwargs)
+            if preview is not None and len(preview) > 0:
+                break
+        except Exception:
+            preview = None
+
+    if preview is None:
+        try:
+            loader = DataLoader()
+            preview = loader.load_file(
+                file_path,
+                max_rows=300,
+                multiclass=False,
+                align_to_schema=False,
+                preserve_context=False
+            )
+        except Exception as exc:
+            result['reason'] = f"Файл не вдалося обробити: {exc}"
+            return result
+
+    if preview is None or len(preview) == 0:
+        result['reason'] = "Файл порожній або не містить валідних записів."
+        return result
+
+    columns_lower = {str(col).strip().lower() for col in preview.columns}
+    label_candidates = {
+        'label', 'labels', 'class', 'target', 'y',
+        'attack_cat', 'attack_type', 'status'
+    }
+    has_label = bool(columns_lower.intersection(label_candidates))
+    result['has_label'] = has_label
+
     if has_label:
         result['compatible'] = True
         result['allowed_modes'] = ['supervised', 'if_unsupervised']

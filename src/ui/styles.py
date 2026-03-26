@@ -590,6 +590,7 @@ def load_css():
         color: var(--text) !important;
     }
 
+    /* ─── DataFrame / Table: light theme fix ─── */
     [data-testid="stDataFrame"], [data-testid="stTable"] {
         border: 1px solid var(--border);
         border-radius: 10px;
@@ -597,8 +598,131 @@ def load_css():
         background: #ffffff !important;
     }
 
+
+
     [data-testid="stMarkdownContainer"] hr {
         border-color: var(--border);
+    }
+
+    /* ─── Threat Severity Badges (кольорові) ─── */
+    .threat-badge {
+        display: inline-block;
+        padding: 0.2rem 0.65rem;
+        border-radius: 20px;
+        font-size: 0.75rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+    }
+
+    .threat-badge-critical {
+        background: #DC2626;
+        color: #ffffff;
+    }
+
+    .threat-badge-high {
+        background: #EF4444;
+        color: #ffffff;
+    }
+
+    .threat-badge-medium {
+        background: #F59E0B;
+        color: #111111;
+    }
+
+    .threat-badge-low {
+        background: #10B981;
+        color: #ffffff;
+    }
+
+    .threat-badge-info {
+        background: #6366F1;
+        color: #ffffff;
+    }
+
+    /* ─── Threat Detail Cards ─── */
+    .threat-detail-card {
+        background: #ffffff;
+        border: 1px solid #e5e5e5;
+        border-radius: 12px;
+        padding: 1rem 1.2rem;
+        margin-bottom: 0.7rem;
+        transition: box-shadow 0.15s ease;
+    }
+
+    .threat-detail-card:hover {
+        box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+    }
+
+    .threat-detail-card .threat-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 0.5rem;
+    }
+
+    .threat-detail-card .threat-name {
+        font-weight: 700;
+        font-size: 0.95rem;
+        color: #111111;
+    }
+
+    .threat-detail-card .threat-count {
+        font-size: 0.85rem;
+        color: #555555;
+        font-weight: 600;
+    }
+
+    .threat-detail-card .threat-desc {
+        font-size: 0.83rem;
+        color: #444444;
+        margin-bottom: 0.5rem;
+        line-height: 1.45;
+    }
+
+    .threat-detail-card .threat-impact {
+        font-size: 0.8rem;
+        color: #666666;
+        font-style: italic;
+        margin-bottom: 0.4rem;
+    }
+
+    .threat-detail-card .threat-actions {
+        font-size: 0.8rem;
+        color: #333333;
+        padding-left: 1rem;
+    }
+
+    .threat-detail-card .threat-actions li {
+        margin-bottom: 0.2rem;
+    }
+
+    /* ─── Threat Summary Bar ─── */
+    .threat-summary-bar {
+        display: flex;
+        gap: 0.6rem;
+        flex-wrap: wrap;
+        margin: 0.8rem 0;
+    }
+
+    .threat-summary-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.3rem;
+        padding: 0.3rem 0.7rem;
+        border-radius: 20px;
+        font-size: 0.8rem;
+        font-weight: 600;
+        background: #f5f5f5;
+        border: 1px solid #e0e0e0;
+        color: #333333;
+    }
+
+    .threat-summary-chip .chip-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        display: inline-block;
     }
 
     /* Compatibility card (scan) */

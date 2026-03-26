@@ -33,6 +33,7 @@ class LabelNormalizer:
     def normalize(self, df: pd.DataFrame, multiclass: bool = False) -> pd.DataFrame:
         if "label" not in df.columns:
             return df
+        df["label"] = df["label"].astype(object)
 
         # ── UNSW-NB15 special path: merge attack_cat into label ──
         if multiclass and "attack_cat" in df.columns:
@@ -64,6 +65,7 @@ class LabelNormalizer:
     def _merge_attack_cat(self, df: pd.DataFrame) -> pd.DataFrame:
         """Replace binary label with attack_cat value for attack rows."""
         df = df.copy()
+        df["label"] = df["label"].astype(object)
         cat = df["attack_cat"].astype(str).str.strip()
         cat_lower = cat.str.lower()
         is_benign_cat = cat_lower.isin(self._BENIGN_ATTACK_CAT)

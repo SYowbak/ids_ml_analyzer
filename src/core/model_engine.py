@@ -153,6 +153,9 @@ class ModelEngine:
     @staticmethod
     def _assert_supervised_label_quality(y: pd.Series, algorithm: str) -> None:
         """Базова валідація міток для supervised алгоритмів."""
+        if algorithm == 'Isolation Forest':
+            return
+            
         unique = np.unique(y)
         if len(unique) < 2:
             raise ValueError(
@@ -257,7 +260,7 @@ class ModelEngine:
                 param_grid,
                 cv=cv, 
                 scoring='f1_weighted',
-                n_jobs=-1, 
+                n_jobs=1,
                 verbose=2  # Більше деталей
             )
         else:
@@ -268,7 +271,7 @@ class ModelEngine:
                 n_iter=n_iter, 
                 cv=cv, 
                 scoring='f1_weighted',
-                n_jobs=-1, 
+                n_jobs=1,
                 verbose=2, 
                 random_state=42
             )
@@ -664,13 +667,13 @@ class ModelEngine:
         defaults = {
             'Random Forest': {
                 'random_state': 42, 
-                'n_jobs': -1,
+                'n_jobs': 1,
                 'class_weight': 'balanced_subsample',
                 'max_features': 'sqrt'
             },
             'XGBoost': {
                 'random_state': 42, 
-                'n_jobs': -1,
+                'n_jobs': 1,
                 'eval_metric': 'mlogloss',
                 'verbosity': 0
             },
@@ -682,7 +685,7 @@ class ModelEngine:
             },
             'Isolation Forest': {
                 'random_state': 42,
-                'n_jobs': -1,
+                'n_jobs': 1,
                 'n_estimators': 100,
                 'contamination': 0.05,
                 'max_features': 1.0

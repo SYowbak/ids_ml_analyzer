@@ -66,14 +66,17 @@ class UnitNormalizer:
                     
                     # Manual implementation of known formulas is safer and faster than parsing strings dynamically
                     if name == "packet_rate":
-                            packets_fwd = self._to_numeric(df["packets_fwd"])
-                            packets_bwd = self._to_numeric(df["packets_bwd"])
-                            duration = self._to_numeric(df["duration"])
-                            total = packets_fwd + packets_bwd
-                            # Avoid div by zero
-                            dur = duration.replace(0, 1e-6)
-                            # Log1p transform for stability
-                            df[name] = np.log1p(np.maximum(total / dur, 0))
+                            if "packets_fwd" in df and "packets_bwd" in df and "duration" in df:
+                                packets_fwd = self._to_numeric(df["packets_fwd"])
+                                packets_bwd = self._to_numeric(df["packets_bwd"])
+                                duration = self._to_numeric(df["duration"])
+                                total = packets_fwd + packets_bwd
+                                # Avoid div by zero
+                                dur = duration.replace(0, 1e-6)
+                                # Log1p transform for stability
+                                df[name] = np.log1p(np.maximum(total / dur, 0))
+                            else:
+                                df[name] = 0.0
                             
                     elif name == "byte_rate":
                         if "bytes_fwd" in df and "bytes_bwd" in df and "duration" in df:
@@ -103,7 +106,7 @@ class UnitNormalizer:
                             df[name] = total_bytes / total_pkts.replace(0, 1.0)
                             
                 except Exception as e:
-                    print(f"Error computing derived feature {name}: {e}")
+                    print(f"[WARN] Error computing derived feature {name}: {e}")
                     df[name] = 0.0 # Default fallback
                     
         return df

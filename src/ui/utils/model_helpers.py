@@ -62,7 +62,7 @@ def _resolve_two_stage_profile_threshold(default_threshold: float, profile: str)
     if profile_key == "balanced":
         return base_threshold
 
-    strict_threshold = max(base_threshold + 0.40, 0.70)
+    strict_threshold = min(0.90, max(base_threshold + 0.20, 0.65))
     return _clamp_two_stage_threshold(strict_threshold)
 
 def _infer_dataset_family_name(path_or_name: str) -> str:
@@ -106,7 +106,8 @@ def load_model_manifest(model_path: str, mtime: float, size: int) -> dict:
         'two_stage_profile_default': DEFAULT_TWO_STAGE_PROFILE,
         'two_stage_threshold_strict': float(np.clip(DEFAULT_SENSITIVITY_THRESHOLD, TWO_STAGE_THRESHOLD_MIN, TWO_STAGE_THRESHOLD_MAX)),
         'trained_families': [],
-        'training_file_count': 0
+        'training_file_count': 0,
+        'schema_mode': 'unified'
     }
 
     try:
@@ -173,7 +174,8 @@ def load_model_manifest(model_path: str, mtime: float, size: int) -> dict:
         'two_stage_profile_default': profile_default,
         'two_stage_threshold_strict': strict_threshold,
         'trained_families': trained_families,
-        'training_file_count': len(training_files)
+        'training_file_count': len(training_files),
+        'schema_mode': str(metadata.get('schema_mode', 'unified')).strip().lower() if isinstance(metadata, dict) else 'unified'
     })
 
     return manifest
@@ -299,7 +301,11 @@ def resolve_auto_model(file_target: str | Path, model_files: list[Path]) -> tupl
     for recency_idx, candidate in enumerate(model_names):
         manifest = get_manifest_for_model(candidate, model_file_map)
         compatible_types = _normalize_compatible_types(manifest.get('compatible_file_types'))
-        if normalized_ext not in compatible_types:
+        pcap_tabular_fallback = (
+            normalized_ext in PCAP_EXTENSIONS
+            and bool(set(compatible_types) & TABULAR_EXTENSIONS)
+        )
+        if normalized_ext not in compatible_types and not pcap_tabular_fallback:
             continue
 
         trained_families = set(manifest.get('trained_families', []))
@@ -318,7 +324,10 @@ def resolve_auto_model(file_target: str | Path, model_files: list[Path]) -> tupl
                 score += 1000.0
                 reason = 'pcap_if'
             else:
-                score -= 500.0
+                # Не блокуємо табличні моделі для PCAP:
+                # знижуємо пріоритет, але дозволяємо fallback-вибір.
+                score -= 80.0
+                reason = 'pcap_tabular_fallback'
         else:
             if is_two_stage:
                 score += 160.0

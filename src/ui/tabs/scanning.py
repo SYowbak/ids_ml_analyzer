@@ -1,4 +1,4 @@
-import streamlit as st
+﻿import streamlit as st
 import pandas as pd
 import numpy as np
 import time
@@ -23,6 +23,10 @@ from src.ui.core_state import (
     TWO_STAGE_PROFILE_ORDER
 )
 from src.ui.scan_renderer import render_comprehensive_dashboard
+from src.services.threat_catalog import (
+    get_threat_info, get_severity, get_severity_label,
+    get_severity_color, classify_if_anomaly_score, enrich_predictions
+)
 
 from src.ui.utils.scan_diagnostics import (
     _pcap_heuristic_anomaly_mask,
@@ -40,6 +44,98 @@ from src.ui.utils.model_helpers import (
     detect_scan_file_family_info
 )
 
+def _normalize_label_token(value: Any) -> str:
+    token = str(value or "").strip().lower()
+    token = token.replace(" ", "").replace("_", "").replace("-", "")
+    return token
+
+
+def _is_benign_prediction(value: Any) -> bool:
+    token = _normalize_label_token(value)
+    if token in {"", "0", "00", "benign", "normal", "ok", "норма", "безпечно"}:
+        return True
+    if "benign" in token or "norm" in token:
+        return True
+    if "норм" in token or "безпеч" in token:
+        return True
+    return False
+
+
+def _resolve_scan_row_cap(file_ext: str, file_size_bytes: int) -> tuple[int | None, str | None]:
+    if file_ext not in TABULAR_EXTENSIONS:
+        return None, None
+
+    if file_size_bytes >= 250 * 1024 * 1024:
+        return 150000, "Файл дуже великий: інтерактивний скан обмежено до 150,000 рядків для стабільності UI."
+    if file_size_bytes >= 120 * 1024 * 1024:
+        return 180000, "Файл великий: інтерактивний скан обмежено до 180,000 рядків для стабільності UI."
+    if file_size_bytes >= 60 * 1024 * 1024:
+        return 220000, "Використано безпечний ліміт 220,000 рядків, щоб уникнути зависань браузера."
+    return None, None
+
+
+def _select_result_columns(source_df: pd.DataFrame, feature_columns: list[str], total_rows: int) -> list[str]:
+    priority_candidates = [
+        "timestamp", "time", "datetime", "date", "flow_start_time",
+        "src_ip", "source_ip", "src", "srcaddr",
+        "dst_ip", "destination_ip", "dst", "dstaddr",
+        "src_port", "source_port", "sport",
+        "dst_port", "destination_port", "dport", "dest_port", "port",
+        "protocol", "proto", "service",
+        "duration", "flow_duration",
+        "packet_rate", "byte_rate", "flow_packets/s", "flow_bytes/s",
+        "packets_fwd", "packets_bwd", "bytes_fwd", "bytes_bwd",
+        "tcp_syn_count", "tcp_ack_count", "tcp_rst_count",
+    ]
+    selected: list[str] = []
+    existing_cols = set(source_df.columns)
+    for col in priority_candidates:
+        if col in existing_cols and col not in selected:
+            selected.append(col)
+
+    numeric_budget = 28
+    if total_rows > 200000:
+        numeric_budget = 16
+    if total_rows > 400000:
+        numeric_budget = 10
+
+    for col in feature_columns:
+        if len(selected) >= (len(priority_candidates) + numeric_budget):
+            break
+        if col in existing_cols and col not in selected and pd.api.types.is_numeric_dtype(source_df[col]):
+            selected.append(col)
+
+    if not selected:
+        return list(source_df.columns[:40])
+    return selected
+
+def _build_ui_result_sample(result_df: pd.DataFrame, anomaly_mask: pd.Series, max_rows: int = 100000) -> tuple[pd.DataFrame, bool]:
+    """
+    Повертає безпечну вибірку для UI, але зберігає пропорцію аномалій.
+    Це зменшує RAM та "фрізи" браузера на великих сканах.
+    """
+    if len(result_df) <= max_rows:
+        return result_df, False
+
+    anomaly_df = result_df[anomaly_mask]
+    normal_df = result_df[~anomaly_mask]
+
+    anomaly_quota = min(len(anomaly_df), max(1000, int(max_rows * 0.40)))
+    normal_quota = max_rows - anomaly_quota
+
+    anomaly_sample = (
+        anomaly_df.sample(n=anomaly_quota, random_state=42)
+        if len(anomaly_df) > anomaly_quota else anomaly_df
+    )
+    normal_sample = (
+        normal_df.sample(n=normal_quota, random_state=42)
+        if len(normal_df) > normal_quota else normal_df
+    )
+
+    sampled = pd.concat([anomaly_sample, normal_sample], axis=0).sample(frac=1.0, random_state=42)
+    return sampled, True
+
+
 def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI: dict, BENIGN_LABEL_TOKENS: list, PCAP_EXTENSIONS: set, TABULAR_EXTENSIONS: set, SUPPORTED_SCAN_EXTENSIONS: set, DEFAULT_SENSITIVITY_THRESHOLD: float, DEFAULT_IF_CONTAMINATION: float, DEFAULT_IF_TARGET_FP_RATE: float, DEFAULT_TWO_STAGE_PROFILE: str) -> None:
 
     model_files = sorted(
@@ -51,6 +147,8 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
         reverse=True
     )
     model_file_map = {f.name: f for f in model_files}
+    if 'scan_in_progress' not in st.session_state:
+        st.session_state['scan_in_progress'] = False
 
     def get_manifest_for_model(model_name: str) -> dict:
         model_path = model_file_map.get(model_name)
@@ -112,7 +210,11 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
         for recency_idx, candidate in enumerate(model_names):
             manifest = get_manifest_for_model(candidate)
             compatible_types = _normalize_compatible_types(manifest.get('compatible_file_types'))
-            if normalized_ext not in compatible_types:
+            pcap_tabular_fallback = (
+                normalized_ext in PCAP_EXTENSIONS
+                and bool(set(compatible_types) & TABULAR_EXTENSIONS)
+            )
+            if normalized_ext not in compatible_types and not pcap_tabular_fallback:
                 continue
 
             trained_families = set(manifest.get('trained_families', []))
@@ -131,7 +233,10 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                     score += 1000.0
                     reason = 'pcap_if'
                 else:
-                    score -= 500.0
+                    # Не блокуємо табличні моделі для PCAP у ручному/авто-режимі:
+                    # даємо значно нижчий пріоритет, але залишаємо можливість запуску.
+                    score -= 80.0
+                    reason = 'pcap_tabular_fallback'
             else:
                 if is_two_stage:
                     score += 160.0
@@ -227,6 +332,9 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
 
         user_dir = ROOT_DIR / 'datasets' / 'User_Uploads'
         scans_dir = ROOT_DIR / 'datasets' / 'Processed_Scans'
+        # Гарантуємо існування директорій (glob() падає якщо директорії немає)
+        user_dir.mkdir(parents=True, exist_ok=True)
+        scans_dir.mkdir(parents=True, exist_ok=True)
         processed_has_files = any(
             f.suffix.lower() in SUPPORTED_SCAN_EXTENSIONS
             for f in scans_dir.glob('*.*')
@@ -366,9 +474,10 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                         )
                     )
                 )
-                default_profile_key = _normalize_two_stage_profile(
-                    preview_manifest.get('two_stage_profile_default', DEFAULT_TWO_STAGE_PROFILE)
-                )
+                # UI-дефолт для запуску завжди "Збалансований":
+                # це безпечніший старт для більшості користувачів.
+                # Рекомендацію "strict" показуємо окремо в самодіагностиці.
+                default_profile_key = _normalize_two_stage_profile(DEFAULT_TWO_STAGE_PROFILE)
                 profile_labels = [TWO_STAGE_PROFILE_RULES[key]['label'] for key in TWO_STAGE_PROFILE_ORDER]
                 profile_label_to_key = {
                     TWO_STAGE_PROFILE_RULES[key]['label']: key for key in TWO_STAGE_PROFILE_ORDER
@@ -404,7 +513,11 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                         max_value=99,
                         value=int(base_sensitivity_level),
                         step=1,
-                        help="Більше значення = вища чутливість (більше виявлень, але потенційно більше FP)."
+                        help=(
+                            "Більше значення = агресивніше виявлення (модель частіше позначає трафік як атаку, "
+                            "зростає Recall і кількість тривог). Менше значення = обережніша детекція "
+                            "з потенційно меншим числом хибних спрацювань."
+                        )
                     )
                     selected_two_stage_threshold = _sensitivity_level_to_threshold(sensitivity_level)
                     selected_two_stage_profile_label = f"{selected_two_stage_profile_label} + ручне"
@@ -415,12 +528,13 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                 if manual_sensitivity_enabled:
                     st.caption(
                         f"Поточний режим: {active_profile_label}. "
-                        f"Ручна чутливість: {sensitivity_level}/99."
+                        f"Ручна чутливість: {sensitivity_level}/99 (чим вище, тим більше трафіку вважається підозрілим)."
                     )
                 else:
                     st.caption(
                         f"Поточний режим: {active_profile_label}. "
-                        "Чутливість автоматично взята з навченої моделі."
+                        "Чутливість автоматично взята з навченої моделі, "
+                        "орієнтованої на баланс між пропусками атак і хибними тривогами."
                     )
                 st.info(
                     f"""
@@ -441,17 +555,38 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
             file_ext_preview = dataset_path.suffix.lower()
             scan_blocked = preview_model_name is None
 
-            # Fast compatibility gate (cheap, no heavy file/model loading).
+            # Fast compatibility gate: auto-reroute to compatible model when possible.
             if preview_model_name:
                 preview_compatible = set(
                     _normalize_compatible_types(preview_manifest.get('compatible_file_types', sorted(TABULAR_EXTENSIONS)))
                 )
                 if file_ext_preview not in preview_compatible:
-                    scan_blocked = True
-                    st.error(
-                        f"Несумісна пара: модель `{preview_model_name}` не призначена для файлів `{file_ext_preview}`. "
-                        "Оберіть іншу модель або увімкніть Автовибір."
+                    allow_preview_pcap_fallback = (
+                        file_ext_preview in PCAP_EXTENSIONS
+                        and not bool(preview_manifest.get('is_isolation_forest'))
                     )
+                    if allow_preview_pcap_fallback:
+                        scan_blocked = False
+                        st.warning(
+                            f"Модель `{preview_model_name}` запускається для `{file_ext_preview}` у fallback-режимі. "
+                            "Рекомендується додатково перевірити результат еталонним IF-сканом."
+                        )
+                    else:
+                        fallback_preview_model, _ = resolve_auto_model(dataset_path)
+                        if fallback_preview_model and fallback_preview_model != preview_model_name:
+                            st.warning(
+                                f"Несумісна пара `{preview_model_name}` + `{file_ext_preview}`. "
+                                f"Автоматично обрано сумісну модель `{fallback_preview_model}`."
+                            )
+                            preview_model_name = fallback_preview_model
+                            preview_manifest = get_manifest_for_model(preview_model_name)
+                            scan_blocked = False
+                        else:
+                            scan_blocked = True
+                            st.error(
+                                f"Для файлу `{file_ext_preview}` не знайдено жодної сумісної моделі. "
+                                "Навчіть модель для цього типу даних у вкладці Тренування."
+                            )
 
             if preview_model_name and dataset_path.exists() and not scan_blocked:
                 preview_model_path = model_file_map.get(preview_model_name)
@@ -532,16 +667,30 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                             st.warning(issue)
 
                     if readiness.get('blocking', False):
-                        scan_blocked = True
-                        st.error(
-                            "Запуск сканування заблоковано самодіагностикою. "
-                            "Оберіть іншу модель/файл або перетренуйте модель."
-                        )
+                        fallback_preview_model, _ = resolve_auto_model(dataset_path)
+                        if fallback_preview_model and fallback_preview_model != preview_model_name:
+                            st.warning(
+                                f"Самодіагностика виявила ризик для `{preview_model_name}`. "
+                                f"Для запуску буде використано `{fallback_preview_model}`."
+                            )
+                            preview_model_name = fallback_preview_model
+                            preview_manifest = get_manifest_for_model(preview_model_name)
+                            scan_blocked = False
+                        else:
+                            st.warning(
+                                "Самодіагностика виявила високий ризик якості детекції. "
+                                "Сканування буде виконано, але результат позначиться як низьконадійний."
+                            )
 
-            if st.button("Розпочати аналіз", type="primary", width="stretch", disabled=scan_blocked):
-
+            if st.button(
+                "Розпочати аналіз",
+                type="primary",
+                width="stretch",
+                disabled=scan_blocked or bool(st.session_state.get('scan_in_progress', False))
+            ):
                 # Очищення пам'яті від попереднього аналізу
                 clear_session_memory()
+                st.session_state['scan_in_progress'] = True
 
                 progress = st.progress(0)
                 status = st.empty()
@@ -551,15 +700,11 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                     progress.progress(15)
 
                     print(f"[LOG] Scanning: Loading file {dataset_path.name}...") 
-                    loader = DataLoader()
-                    # Зберігаємо деталізовані мітки (коли вони є) для точнішої аналітики та звітів.
-                    df = loader.load_file(str(dataset_path), multiclass=True)
-                    original_df = df.copy()
 
                     st.info("Завантаження моделі...")
                     progress.progress(30)
 
-                    # --- АВТОВИБІР МОДЕЛІ ---
+                    # --- АВТОВБІР МОДЕЛІ ---
                     # --- AUTO MODEL RESOLUTION ---
                     if auto_select_model or selected_model is None:
                         file_ext = dataset_path.suffix.lower()
@@ -576,6 +721,12 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
 
                         if auto_reason == 'pcap_if':
                             st.success(f"Автовибір для PCAP: **{selected_model}** (Isolation Forest)")
+                        elif auto_reason == 'pcap_tabular_fallback':
+                            st.warning(
+                                f"Для PCAP не знайдено Isolation Forest. "
+                                f"Обрано fallback-модель: **{selected_model}**. "
+                                "Результат може мати підвищений ризик хибних спрацювань або пропусків."
+                            )
                         elif auto_reason == 'family_match_two_stage':
                             st.success(f"Автовибір за сімейством датасету: **{selected_model}** (Two-Stage)")
                         elif auto_reason == 'family_match':
@@ -619,44 +770,85 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                             "Isolation Forest рекомендовано насамперед для PCAP-аналітики."
                         )
                     if file_ext not in compatible_types:
-                        recommended_text = (
-                            "Для PCAP/PCAPNG/CAP використовуйте модель Isolation Forest."
-                            if file_ext in PCAP_EXTENSIONS
-                            else "Для CSV/NF оберіть сумісну tabular-модель або увімкніть автовибір."
-                        )
-                        st.warning(f"""
-                        ⚠️ **Несумісність моделі та файлу**
-
-                        Вибрана модель **{selected_model}** створена для файлів: {', '.join(compatible_types)}
-                        Але ви намагаєтесь сканувати **{file_ext}** файл.
-
-                        **Рекомендація:** {recommended_text}
-                        """)
-
-                        # Пропонуємо аномалі моделі якщо є
-                        anomaly_models = [f.name for f in model_files if 'anomaly' in f.name.lower() or 'isolation' in f.name.lower()]
-                        if anomaly_models:
-                            st.info(f"Знайдено Anomaly Detection моделі: {', '.join(anomaly_models)}")
-
-                        # Даємо можливість продовжити але з попередженням
-                        col1, col2 = st.columns([1, 2])
-                        with col1:
-                            if st.button("⛔ Сканувати іншою моделлю", type="secondary"):
-                                st.stop()
-                        with col2:
-                            if st.button("⚠️ Так, точно сканувати", type="primary"):
-                                st.session_state['force_scan_confirmed'] = True
-                                st.rerun()
-
-                        if not st.session_state.get('force_scan_confirmed', False):
-                            st.stop()
+                        allow_pcap_with_warning = file_ext in PCAP_EXTENSIONS and not loaded_is_isolation_forest
+                        if allow_pcap_with_warning:
+                            st.warning(
+                                f"Модель `{selected_model}` не позначена як сумісна з `{file_ext}`, "
+                                "але запуск дозволено у fallback-режимі. "
+                                "Рекомендовано перевірити результат додатково на еталонних файлах."
+                            )
                         else:
-                            # Скидаємо прапорець після використання
-                            st.session_state['force_scan_confirmed'] = False
+                            fallback_model, fallback_reason = resolve_auto_model(dataset_path)
+                            if fallback_model and fallback_model != selected_model:
+                                st.warning(
+                                    f"Обрана модель `{selected_model}` несумісна з `{file_ext}`. "
+                                    f"Автоматично переключено на `{fallback_model}`."
+                                )
+                                selected_model = fallback_model
+                                model, preprocessor, metadata = engine.load_model(selected_model)
+                                loaded_is_isolation_forest = "Isolation Forest" in str(metadata.get('algorithm', '')) if metadata else False
+                                loaded_is_isolation_forest = loaded_is_isolation_forest or (
+                                    "Isolation Forest" in str(getattr(engine, 'algorithm_name', ''))
+                                )
+                                compatible_types = _normalize_compatible_types(
+                                    metadata.get('compatible_file_types', sorted(TABULAR_EXTENSIONS))
+                                    if metadata else sorted(TABULAR_EXTENSIONS)
+                                )
+                            elif fallback_model == selected_model:
+                                st.info(
+                                    f"Використовується найкраща доступна модель `{selected_model}`, "
+                                    f"але результат може бути менш надійним для `{file_ext}`."
+                                )
+                            else:
+                                st.error(
+                                    f"Для файлу типу `{file_ext}` не знайдено жодної сумісної моделі. "
+                                    "Навчіть відповідну модель у вкладці Тренування."
+                                )
+                                st.stop()
 
                     if preprocessor is None:
                         st.error("Ця модель була створена в старій версії без препроцесора. Перетренуйте модель.")
                         st.stop()
+
+                    schema_mode = str(metadata.get('schema_mode', 'unified')).strip().lower() if metadata else 'unified'
+                    align_to_schema = schema_mode != 'family'
+                    loader = DataLoader()
+                    file_stat = dataset_path.stat()
+                    scan_row_cap, scan_cap_msg = _resolve_scan_row_cap(file_ext, int(file_stat.st_size))
+                    # Hard safety cap for tabular scans even when file size is deceptively small.
+                    # Prevents browser/UI freezes on million-row inputs.
+                    if file_ext in TABULAR_EXTENSIONS and scan_row_cap is None:
+                        scan_row_cap = 150000
+                        scan_cap_msg = (
+                            "Для стабільної роботи інтерфейсу застосовано безпечний ліміт 150,000 рядків "
+                            "для інтерактивного сканування табличного файлу."
+                        )
+                    if scan_cap_msg:
+                        st.warning(scan_cap_msg)
+
+                    df = loader.load_file(
+                        str(dataset_path),
+                        max_rows=scan_row_cap,
+                        multiclass=True,
+                        align_to_schema=align_to_schema,
+                        preserve_context=True
+                    )
+                    original_df = df
+
+                    # Add family hint if the model was trained on multiple families.
+                    if hasattr(preprocessor, 'feature_columns') and 'family_hint' in preprocessor.feature_columns:
+                        file_family = _infer_dataset_family_name(dataset_path.name)
+                        if dataset_path.exists():
+                            try:
+                                stat = dataset_path.stat()
+                                fam_info = detect_scan_file_family_info(str(dataset_path), stat.st_mtime, stat.st_size)
+                                detected_family = str(fam_info.get('family', '')).strip()
+                                if detected_family:
+                                    file_family = detected_family
+                            except Exception:
+                                pass
+                        df = df.copy()
+                        df['family_hint'] = file_family or "Unknown"
 
                     st.info("Обробка даних...")
                     progress.progress(45)
@@ -742,6 +934,8 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                     is_two_stage = isinstance(model, TwoStageModel)
 
                     # PREDICTION - use appropriate method based on model type
+                    aux_ood_mask = None
+                    ood_from_benign_mask = None
                     if is_two_stage:
                         predictions = model.predict(X, threshold=selected_two_stage_threshold)
                         st.caption(
@@ -750,13 +944,63 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                             f"Threshold: {selected_two_stage_threshold:.2f}, "
                             f"еквівалент чутливості: {sensitivity_level}/99)"
                         )
+                        # Анти-колапс у "все benign":
+                        # якщо модель на цьому файлі дала майже 0 атак, знижуємо threshold
+                        # через квантиль ймовірностей Stage-1 (контрольований recall boost).
+                        try:
+                            benign_code = getattr(model, 'benign_code_', 0)
+                            base_attack_rate = float(np.mean(np.asarray(predictions) != benign_code))
+                            if file_ext in TABULAR_EXTENSIONS and base_attack_rate < 0.001:
+                                attack_idx = getattr(model, 'attack_idx_', 1)
+                                binary_probas = model.binary_model.predict_proba(X)
+                                if binary_probas.shape[1] > int(attack_idx):
+                                    attack_probs = binary_probas[:, int(attack_idx)]
+                                    diag_preview_rate = 0.0
+                                    try:
+                                        diag_preview_rate = float((checks or {}).get('preview_anomaly_rate', 0.0))
+                                    except Exception:
+                                        diag_preview_rate = 0.0
+                                    target_rate = float(np.clip(max(diag_preview_rate, 0.01), 0.01, 0.08))
+                                    adaptive_threshold = _clamp_two_stage_threshold(
+                                        float(np.quantile(attack_probs, 1.0 - target_rate))
+                                    )
+                                    adaptive_threshold = max(0.08, adaptive_threshold)
+                                    if adaptive_threshold + 1e-6 < float(selected_two_stage_threshold):
+                                        alt_predictions = model.predict(X, threshold=adaptive_threshold)
+                                        alt_attack_rate = float(np.mean(np.asarray(alt_predictions) != benign_code))
+                                        if 0.001 <= alt_attack_rate <= 0.35:
+                                            predictions = alt_predictions
+                                            st.warning(
+                                                "Динамічно знижено поріг Two-Stage для цього файлу, "
+                                                "щоб уникнути пропуску аномалій при колапсі в повний benign."
+                                            )
+                                            print(
+                                                "[LOG] Two-Stage threshold auto-adjust: "
+                                                f"base={selected_two_stage_threshold:.4f}, "
+                                                f"adaptive={adaptive_threshold:.4f}, "
+                                                f"base_rate={base_attack_rate:.6f}, "
+                                                f"new_rate={alt_attack_rate:.6f}"
+                                            )
+                                            selected_two_stage_threshold = adaptive_threshold
+                                            selected_two_stage_profile_label = (
+                                                f"{selected_two_stage_profile_label} + авто-корекція"
+                                            )
+                        except Exception as auto_thr_exc:
+                            print(f"[WARN] Two-Stage threshold auto-adjust skipped: {auto_thr_exc}")
                     elif is_isolation_forest:
                         # Use engine.predict() which handles IF correctly with threshold
                         predictions = engine.predict(X)
 
                         # Get anomaly scores for visualization
                         scores = model.decision_function(X)
-                        st.session_state['anomaly_scores'] = scores.tolist()
+                        if len(scores) <= 300000:
+                            st.session_state['anomaly_scores'] = scores.tolist()
+                        else:
+                            st.session_state['anomaly_scores'] = None
+                            st.caption(
+                                "Для великого файлу детальні score-дані IF не збережено, "
+                                "щоб не перевищувати ліміт памʼяті."
+                            )
 
                         # Show IF statistics
                         if hasattr(engine, 'if_threshold_') and engine.if_threshold_ is not None:
@@ -867,10 +1111,76 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                                         )
 
                     raw_anomalies = int(np.sum(predictions == 1)) if is_isolation_forest else int(np.sum(predictions != 0))
+
+                    # Rescue detection for tabular/supervised runs:
+                    # if model returns almost all-benign, run lightweight OOD detector and mark suspicious flows.
+                    if (not is_isolation_forest) and file_ext in TABULAR_EXTENSIONS:
+                        base_rate = float(raw_anomalies / max(1, len(predictions)))
+                        if base_rate < 0.001:
+                            try:
+                                from sklearn.ensemble import IsolationForest
+                                aux_if = IsolationForest(
+                                    n_estimators=80,
+                                    contamination=0.02,
+                                    random_state=42,
+                                    n_jobs=1
+                                )
+                                fit_source = X
+                                score_source = X
+                                score_index = None
+
+                                # OOD rescue must stay lightweight on very large scans.
+                                if len(X) > 150000:
+                                    sample_size = min(150000, len(X))
+                                    rng = np.random.default_rng(42)
+                                    sampled_idx = np.sort(rng.choice(len(X), size=sample_size, replace=False))
+                                    if hasattr(X, 'iloc'):
+                                        fit_source = X.iloc[sampled_idx]
+                                        score_source = fit_source
+                                    else:
+                                        fit_source = X[sampled_idx]
+                                        score_source = fit_source
+                                    score_index = sampled_idx
+                                    st.info(
+                                        "OOD-перевірку виконано на репрезентативній вибірці великого файлу "
+                                        "для стабільної швидкодії."
+                                    )
+
+                                aux_if.fit(fit_source)
+                                aux_scores = aux_if.decision_function(score_source)
+                                aux_threshold = float(np.quantile(aux_scores, 0.02))
+                                aux_ood_mask = np.zeros(len(predictions), dtype=bool)
+                                local_mask = np.asarray(aux_scores <= aux_threshold, dtype=bool)
+                                if score_index is None:
+                                    aux_ood_mask = local_mask
+                                else:
+                                    aux_ood_mask[score_index] = local_mask
+                                rescued_hits = int(np.sum(aux_ood_mask))
+                                if rescued_hits > 0:
+                                    # Зберігаємо тільки маску rescue для рядків, що були benign.
+                                    # Тип атаки не вигадуємо: пізніше позначимо ці рядки як "Аномалія (OOD)".
+                                    benign_numeric_mask = (predictions == 0)
+                                    ood_from_benign_mask = (aux_ood_mask & benign_numeric_mask)
+                                    rescued_numeric = int(np.sum(ood_from_benign_mask))
+                                    st.warning(
+                                        "Модель позначила майже весь трафік як нормальний. "
+                                        "Додатково застосовано OOD-перевірку для підозрілих відхилень."
+                                    )
+                                    print(
+                                        f"[LOG] OOD rescue applied: base_rate={base_rate:.6f}, "
+                                        f"rescued_hits={rescued_hits}, rescued_numeric={rescued_numeric}, "
+                                        f"aux_threshold={aux_threshold:.6f}"
+                                    )
+                            except Exception as aux_exc:
+                                print(f"[WARN] OOD rescue skipped: {aux_exc}")
+
+                    ood_rescued_count = int(np.sum(ood_from_benign_mask)) if ood_from_benign_mask is not None else 0
                     print(f"[LOG] Prediction finished. Found {raw_anomalies} anomalies (raw)")
+                    if ood_rescued_count > 0:
+                        print(f"[LOG] OOD rescue benign overrides: {ood_rescued_count}")
 
                     # Діагностика - чому 0 аномалій?
-                    if raw_anomalies == 0:
+                    if raw_anomalies == 0 and ood_rescued_count == 0:
                         print(f"[DIAGNOSTIC] WARNING: 0 anomalies detected!")
                         print(f"[DIAGNOSTIC] Model type: {type(model)}")
                         print(f"[DIAGNOSTIC] Predictions unique values: {np.unique(predictions, return_counts=True)}")
@@ -882,99 +1192,106 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                     print(f"[LOG] Raw predictions (first 20): {predictions[:20]}")
                     print(f"[LOG] Unique predictions: {np.unique(predictions, return_counts=True)}")
 
-                    # Декодування міток назад у оригінальні (0, 1 -> BENIGN, DDoS)
-                    # Для Isolation Forest не використовуємо decode_labels, бо encoder тренувався тільки на нормальних даних
+                    # ── Декодування міток назад у оригінальні назви атак ──
                     is_anomaly_model = is_isolation_forest
+                    anomaly_scores_list = st.session_state.get('anomaly_scores', None)
 
                     if is_anomaly_model:
-                        # Для Isolation Forest: 0 = норма, 1 = аномалія
-                        predictions_decoded = ['BENIGN' if p == 0 else 'Anomaly' for p in predictions]
-                        print(f"[LOG] Isolation Forest predictions decoded (first 20): {predictions_decoded[:20]}")
+                        # IF: severity на основі anomaly scores
+                        if anomaly_scores_list:
+                            scores_arr = np.array(anomaly_scores_list)
+                            predictions_decoded = []
+                            for i, p in enumerate(predictions):
+                                if p == 0:
+                                    predictions_decoded.append('Норма')
+                                else:
+                                    score = scores_arr[i] if i < len(scores_arr) else 0.0
+                                    score_info = classify_if_anomaly_score(score)
+                                    predictions_decoded.append(score_info['label'])
+                        else:
+                            predictions_decoded = ['Норма' if p == 0 else 'Аномалія' for p in predictions]
+                        print(f"[LOG] IF predictions decoded (first 20): {predictions_decoded[:20]}")
                     elif hasattr(preprocessor, 'decode_labels'):
                         predictions_decoded = preprocessor.decode_labels(predictions)
                         print(f"[LOG] Decoded predictions (first 20): {predictions_decoded[:20]}")
                     else:
-                        # Fallback for models/scalers without label decoding
-                        # 0 is usually BENIGN in our pipeline, 1 is the positive class
                         predictions_decoded = ['Норма' if p == 0 else 'Виявлено загрозу' for p in predictions]
 
-                    # --- LOCALIZATION FIX: Map English Threats to Ukrainian (Case-Insensitive) ---
+                    # ── Локалізація через threat_catalog ──
                     def localize_label(pred):
-                        s = str(pred).strip().lower() # Normalize to lowercase
-
-                        # Dictionary of translations (all keys must be lowercase)
-                        translations = {
-                            # Basic
-                            '0': 'Норма', '0.0': 'Норма', 'benign': 'Норма', 'normal': 'Норма', 'ok': 'Норма',
-                            '1': 'Виявлено загрозу', '1.0': 'Виявлено загрозу',
-
-                            # Anomaly Detection results
-                            'anomaly': 'Аномалія',
-                            'attack': 'Атака',
-                            'malicious': 'Шкідливий трафік',
-
-                            # Specific Attacks (CIC-IDS / UNSW-NB15 / NSL-KDD)
-                            'ddos': 'DDoS-атака',
-                            'portscan': 'Сканування портів',
-                            'bot': 'Ботнет',
-                            'infiltration': 'Вторгнення',
-                            'web attack - brute force': 'Веб-атака (Brute Force)',
-                            'web attack - xss': 'Веб-атака (XSS)',
-                            'web attack - sql injection': 'SQL-ін\'єкція',
-                            'ftp-patator': 'FTP Brute Force',
-                            'ssh-patator': 'SSH Brute Force',
-                            'dos goldeneye': 'DoS (GoldenEye)',
-                            'dos hulk': 'DoS (Hulk)',
-                            'dos slowhttptest': 'DoS (SlowHTTP)',
-                            'dos slowloris': 'DoS (Slowloris)',
-                            'heartbleed': 'Вразливість Heartbleed',
-                            'backdoor': 'Бекдор',
-                            'exploits': 'Експлойт',
-                            'fuzzers': 'Фаззінг',
-                            'generic': 'Загальна загроза',
-                            'reconnaissance': 'Розвідка',
-                            'shellcode': 'Шелл-код',
-                            'worms': 'Хробак',
-                            'analysis': 'Аналіз портів/XSS',
-                            'probe': 'Пробінг (Сканування)',
-                            'r2l': 'Атака R2L (Remote to Local)',
-                            'u2r': 'Атака U2R (User to Root)',
-                            'dos': 'DoS-атака',
-                            'bruteforce': 'Brute Force',
-                            'synflood': 'SYN Flood',
-                            'udpflood': 'UDP Flood'
-                        }
-
-                        # Try exact match first
-                        if s in translations:
-                            return translations[s]
-
-                        # Fuzzy matching for variations (e.g., "ddos attack" -> "DDoS-атака")
-                        for key, val in translations.items():
-                            if key in s and len(key) > 3: # Avoid matching short keys like '1' inside words
-                                return val
-
-                        return str(pred) # Return original if no match
+                        s = str(pred).strip()
+                        s_lower = s.lower()
+                        if _is_benign_prediction(s):
+                            return 'Норма'
+                        # IF severity labels — вже українською, пропускаємо
+                        if s_lower.startswith(('критична ', 'висока ', 'помірна ', 'слабка ')):
+                            return s
+                        # Використовуємо threat_catalog для всього іншого
+                        info = get_threat_info(s)
+                        return info.get('name_uk', s)
 
                     predictions_decoded = [localize_label(p) for p in predictions_decoded]
+
+                    if ood_from_benign_mask is not None and len(ood_from_benign_mask) == len(predictions_decoded):
+                        patched = 0
+                        for idx, flag in enumerate(ood_from_benign_mask):
+                            if not flag:
+                                continue
+                            predictions_decoded[idx] = "Аномалія (OOD)"
+                            patched += 1
+                        if patched > 0:
+                            print(f"[LOG] OOD rescue relabeled benign flows: {patched}")
 
                     st.info("Аналіз результатів...")
                     progress.progress(85)
 
-                    # Створюємо result_df з обробленими даними
-                    # X.index містить індекси рядків, що залишились після очищення
-                    result_df = original_df.loc[X.index].copy()
-
-                    # Safer assignment using index
+                    # Створюємо компактний result_df, щоб не забивати RAM на великих сканах.
+                    selected_columns = _select_result_columns(
+                        source_df=original_df,
+                        feature_columns=getattr(preprocessor, 'feature_columns', []),
+                        total_rows=len(X.index)
+                    )
+                    result_df = original_df.loc[X.index, selected_columns].copy()
                     result_df['prediction'] = pd.Series(predictions_decoded, index=X.index).astype(str)
 
-                    is_anomaly = result_df['prediction'].apply(
-                        lambda x: str(x).upper() not in ['0', 'BENIGN', 'NORMAL', 'НОРМА']
+                    # ── Збагачення severity та описами з threat_catalog ──
+                    enriched = enrich_predictions(
+                        predictions=predictions.tolist(),
+                        prediction_labels=predictions_decoded,
+                        anomaly_scores=anomaly_scores_list,
+                        is_isolation_forest=is_anomaly_model
                     )
-                    anomalies = result_df[is_anomaly]
+                    result_df['severity'] = pd.Series(
+                        [e['severity'] for e in enriched], index=X.index
+                    )
+                    result_df['severity_label'] = pd.Series(
+                        [e['severity_label'] for e in enriched], index=X.index
+                    )
+                    result_df['threat_description'] = pd.Series(
+                        [e['description'] for e in enriched], index=X.index
+                    )
 
-                    total = len(result_df)
-                    anomalies_count = len(anomalies)
+                    is_anomaly = result_df['prediction'].apply(lambda x: not _is_benign_prediction(x))
+                    # Safety: force OOD-rescued rows into anomaly counters even if label decoding changes.
+                    if ood_from_benign_mask is not None and len(ood_from_benign_mask) == len(result_df):
+                        ood_series = pd.Series(ood_from_benign_mask, index=result_df.index)
+                        is_anomaly = (is_anomaly | ood_series)
+                    total = int(len(result_df))
+                    anomalies_count = int(is_anomaly.sum())
+                    top_threats = (
+                        result_df.loc[is_anomaly, 'prediction'].value_counts().head(5).to_dict()
+                        if anomalies_count > 0 else {}
+                    )
+
+                    # Для великих сканів зберігаємо в сесії лише оптимізовану вибірку для UI,
+                    # а не весь масив рядків (інакше браузер/процес може "зависати").
+                    result_df_ui, ui_sampled = _build_ui_result_sample(result_df, is_anomaly, max_rows=100000)
+                    anomalies_ui = result_df_ui[result_df_ui['prediction'].apply(lambda x: not _is_benign_prediction(x))]
+                    if ui_sampled:
+                        st.info(
+                            f"Для стабільної роботи інтерфейсу показано вибірку {len(result_df_ui):,} із {total:,} рядків. "
+                            "Підсумкові метрики пораховано на повному скані."
+                        )
 
                     # --- PERFORMANCE FIX: High Precision Risk Score ---
                     risk_score_raw = (anomalies_count / max(total, 1)) * 100
@@ -989,15 +1306,16 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                     # --- Persistence Logic ---
                     # Saving results to session state
                     st.session_state['scan_done'] = True
-                    st.session_state['scan_results'] = result_df
-                    st.session_state['scan_anomalies'] = anomalies
+                    st.session_state['scan_results'] = result_df_ui
+                    st.session_state['scan_anomalies'] = anomalies_ui
                     st.session_state['scan_metrics'] = {
                         'total': total,
                         'anomalies_count': anomalies_count,
                         'risk_score': risk_score,
                         'model_name': selected_model,
                         'algorithm': engine.algorithm_name if hasattr(engine, 'algorithm_name') else 'Unknown',
-                        'filename': dataset_path.name
+                        'filename': dataset_path.name,
+                        'ui_sampled': ui_sampled
                     }
 
                     # Clear previously generated reports for new scan
@@ -1012,14 +1330,18 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                         risk_score=risk_score,
                         model_name=selected_model,
                         duration=0.0,
-                        details={'top_threats': anomalies['prediction'].value_counts().head(5).to_dict() if anomalies_count > 0 else {}}
+                        details={'top_threats': top_threats}
                     )
+                    del df, X, predictions, result_df, result_df_ui, anomalies_ui
+                    gc.collect()
 
                 except Exception as e:
                     st.error(f"Помилка під час аналізу: {str(e)}")
                     print(f"[ERROR] Scan failed: {e}")
                     import traceback
                     traceback.print_exc()
+                finally:
+                    st.session_state['scan_in_progress'] = False
 
                 # Clean memory
                 gc.collect()
@@ -1036,5 +1358,11 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                         services=services,
                         gemini_key=gemini_key
                     )
+
+
+
+
+
+
 
 

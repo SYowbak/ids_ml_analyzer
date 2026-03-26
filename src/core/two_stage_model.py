@@ -27,18 +27,60 @@ class TwoStageModel(BaseEstimator, ClassifierMixin):
         binary_threshold: Поріг для бінарного класифікатора (default=0.3 для High Recall)
     """
     
-    def __init__(self, binary_model=None, multiclass_model=None, binary_threshold=0.3):
+    def __init__(
+        self,
+        binary_model=None,
+        multiclass_model=None,
+        binary_threshold=0.3,
+        binary_target_attack_rate=0.20,
+        binary_downsample=True,
+        stage2_balance=True,
+        stage2_balance_min_samples=800,
+        stage2_balance_max_multiplier=3.0,
+        random_state=42
+    ):
         # NOTE: Do not use truthiness for sklearn estimators.
         # Unfitted estimators may define __len__ and raise AttributeError.
-        self.binary_model = binary_model if binary_model is not None else RandomForestClassifier(n_jobs=-1, random_state=42)
-        self.multiclass_model = multiclass_model if multiclass_model is not None else RandomForestClassifier(n_jobs=-1, random_state=42)
+        # Stability-first defaults: n_jobs=1 avoids process storms / RAM spikes in Streamlit runtime.
+        self.binary_model = binary_model if binary_model is not None else RandomForestClassifier(n_jobs=1, random_state=42)
+        self.multiclass_model = multiclass_model if multiclass_model is not None else RandomForestClassifier(n_jobs=1, random_state=42)
         self.binary_threshold = binary_threshold
+        self.binary_target_attack_rate = binary_target_attack_rate
+        self.binary_downsample = binary_downsample
+        self.stage2_balance = stage2_balance
+        self.stage2_balance_min_samples = stage2_balance_min_samples
+        self.stage2_balance_max_multiplier = stage2_balance_max_multiplier
+        self.random_state = random_state
         self.classes_ = None
         self.binary_classes_ = None
         self.singleton_attack_label_ = None # Якщо тільки один тип атаки
         self.stage2_label_to_index_ = None
         self.stage2_index_to_label_ = None
         self.is_fitted_ = False
+        self.binary_sampling_info_ = {}
+        self.stage2_sampling_info_ = {}
+
+    @staticmethod
+    def _force_single_thread(model) -> None:
+        """
+        У predict/predict_proba працюємо в single-thread режимі для стабільності.
+        Це прибирає пікові навантаження та WinError у деяких середовищах.
+        """
+        if model is None:
+            return
+        try:
+            if hasattr(model, "n_jobs"):
+                try:
+                    model.n_jobs = 1
+                except Exception:
+                    pass
+            if hasattr(model, "set_params"):
+                try:
+                    model.set_params(n_jobs=1)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def fit(self, X, y, benign_label='BENIGN', benign_code=None):
         """
@@ -132,8 +174,47 @@ class TwoStageModel(BaseEstimator, ClassifierMixin):
         # --- STAGE 1: Тренування бінарної моделі ---
         # Бінарні мітки: 0 = Benign, 1 = Attack
         y_binary = (y != benign_code).astype(int)
-        
-        self.binary_model.fit(X, y_binary)
+
+        X_stage1 = X
+        y_stage1 = y_binary
+        self.binary_sampling_info_ = {
+            'enabled': bool(self.binary_downsample),
+            'attack_rate_raw': float(np.mean(y_binary)) if len(y_binary) else 0.0,
+            'target_rate': float(np.clip(self.binary_target_attack_rate, 0.05, 0.50)),
+            'used_attack_samples': int(np.sum(y_binary == 1)) if len(y_binary) else 0,
+            'used_benign_samples': int(np.sum(y_binary == 0)) if len(y_binary) else 0,
+        }
+
+        # Optional downsampling of dominant attack class to reduce base-rate bias.
+        if self.binary_downsample and len(y_binary) > 0:
+            attack_idx = np.flatnonzero(y_binary == 1)
+            benign_idx = np.flatnonzero(y_binary == 0)
+            if len(attack_idx) > 0 and len(benign_idx) > 0:
+                attack_rate = float(len(attack_idx) / len(y_binary))
+                target_rate = self.binary_sampling_info_['target_rate']
+                if attack_rate > (target_rate + 0.02):
+                    desired_attack = int(round(len(benign_idx) * target_rate / max(1e-9, (1.0 - target_rate))))
+                    desired_attack = max(1, min(desired_attack, len(attack_idx)))
+                    rng = np.random.default_rng(self.random_state)
+                    attack_sample = rng.choice(attack_idx, size=desired_attack, replace=False)
+                    keep_idx = np.concatenate([benign_idx, attack_sample])
+                    rng.shuffle(keep_idx)
+                    X_stage1 = X.iloc[keep_idx]
+                    y_stage1 = y_binary.iloc[keep_idx]
+                    self.binary_sampling_info_.update({
+                        'attack_rate_raw': float(attack_rate),
+                        'used_attack_samples': int(desired_attack),
+                        'used_benign_samples': int(len(benign_idx)),
+                        'downsampled': True
+                    })
+                else:
+                    self.binary_sampling_info_.update({'downsampled': False})
+            else:
+                self.binary_sampling_info_.update({'downsampled': False})
+        else:
+            self.binary_sampling_info_.update({'downsampled': False})
+
+        self.binary_model.fit(X_stage1, y_stage1)
         self.binary_classes_ = self.binary_model.classes_
         
         # Зберігаємо індекс attack класу для predict_proba
@@ -176,7 +257,62 @@ class TwoStageModel(BaseEstimator, ClassifierMixin):
             y_attack_encoded = pd.Series(y_attack).map(self.stage2_label_to_index_)
             if y_attack_encoded.isnull().any():
                 raise ValueError("TwoStageModel: Failed to encode Stage-2 attack labels.")
-            self.multiclass_model.fit(X_attack, y_attack_encoded.to_numpy(dtype=int))
+
+            # Балансування рідкісних типів атак для Stage-2.
+            # Мета: зменшити washout-ефект у Mega/змішаних датасетах,
+            # не роздуваючи вибірку агресивним oversampling.
+            X_stage2 = X_attack
+            y_stage2 = y_attack_encoded.to_numpy(dtype=int)
+            self.stage2_sampling_info_ = {
+                'enabled': bool(self.stage2_balance),
+                'samples_raw': int(len(y_stage2)),
+                'classes_raw': int(len(unique_attacks)),
+                'min_samples_target': int(self.stage2_balance_min_samples),
+                'max_multiplier': float(self.stage2_balance_max_multiplier),
+                'samples_after': int(len(y_stage2)),
+                'oversampled_classes': 0,
+            }
+
+            if self.stage2_balance and len(y_stage2) > 0:
+                class_counts = pd.Series(y_stage2).value_counts().to_dict()
+                rng = np.random.default_rng(self.random_state)
+                sampled_indices = []
+                oversampled_classes = 0
+
+                for cls_id, cls_count in class_counts.items():
+                    cls_idx = np.flatnonzero(y_stage2 == int(cls_id))
+                    if len(cls_idx) == 0:
+                        continue
+
+                    max_for_class = int(max(1, round(cls_count * float(self.stage2_balance_max_multiplier))))
+                    target_for_class = max(
+                        cls_count,
+                        min(int(self.stage2_balance_min_samples), max_for_class)
+                    )
+
+                    if target_for_class > cls_count:
+                        extra = rng.choice(cls_idx, size=(target_for_class - cls_count), replace=True)
+                        cls_idx = np.concatenate([cls_idx, extra])
+                        oversampled_classes += 1
+
+                    sampled_indices.append(cls_idx)
+
+                if sampled_indices:
+                    keep_idx = np.concatenate(sampled_indices)
+                    rng.shuffle(keep_idx)
+                    X_stage2 = X_attack.iloc[keep_idx]
+                    y_stage2 = y_stage2[keep_idx]
+                    self.stage2_sampling_info_.update({
+                        'samples_after': int(len(y_stage2)),
+                        'oversampled_classes': int(oversampled_classes),
+                    })
+                    logger.info(
+                        "[TwoStageModel] Stage-2 balancing applied: "
+                        f"{self.stage2_sampling_info_['samples_raw']} -> {self.stage2_sampling_info_['samples_after']} samples, "
+                        f"oversampled_classes={oversampled_classes}/{len(class_counts)}"
+                    )
+
+            self.multiclass_model.fit(X_stage2, y_stage2)
             self.singleton_attack_label_ = None
         
         self.classes_ = np.unique(y) # Всі можливі класи
@@ -196,6 +332,9 @@ class TwoStageModel(BaseEstimator, ClassifierMixin):
         """
         check_is_fitted(self, 'is_fitted_')
         thresh = threshold if threshold is not None else self.binary_threshold
+
+        self._force_single_thread(self.binary_model)
+        self._force_single_thread(self.multiclass_model)
         
         # Stage 1
         # Proba для класу 1 (Attack)
@@ -230,7 +369,7 @@ class TwoStageModel(BaseEstimator, ClassifierMixin):
         dtype = self.classes_.dtype if hasattr(self, 'classes_') and self.classes_ is not None else object
         final_preds = np.full(len(X), self.benign_code_, dtype=dtype)
         
-        # Ті, що пройшли поріг, відправляємо на Stage 2
+        # ҳ, що пройшли поріг, відправляємо на Stage 2
         if np.any(is_attack):
             X_attacks = X[is_attack]
             if self.multiclass_model is not None:
@@ -258,4 +397,5 @@ class TwoStageModel(BaseEstimator, ClassifierMixin):
         # Це складно для Hybrid model.
         # Поки повернемо заглушку або реалізуємо пізніше, якщо треба для метрик.
         # Для ROC-AUC треба.
+        self._force_single_thread(self.binary_model)
         return self.binary_model.predict_proba(X) # Повертаємо бінарні ймовірності поки що

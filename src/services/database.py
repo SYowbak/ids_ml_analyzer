@@ -23,8 +23,8 @@ def get_engine():
     global _engine
     
     if _engine is None:
-        # Check settings
-        settings_path = Path("user_settings.json")
+        # Check settings — читаємо з того ж місця що і SettingsService (src/services/)
+        settings_path = Path(__file__).parent / "user_settings.json"
         db_path = "ids_history.db"
         if settings_path.exists():
             try:
@@ -105,7 +105,7 @@ def init_db():
     Base.metadata.create_all(bind=engine)
     
     # Створення директорії для бази, якщо потрібно
-    settings_path = Path("user_settings.json")
+    settings_path = Path(__file__).parent / "user_settings.json"
     db_path_str = "ids_history.db"
     if settings_path.exists():
         try:

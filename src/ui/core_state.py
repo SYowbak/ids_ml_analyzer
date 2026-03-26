@@ -55,7 +55,8 @@ def clear_session_memory():
         'preprocessor', 'engine', 'model', 'features_list',
         'anomalies_df', 'predictions_df', 'current_file_path',
         'scan_done', 'scan_results', 'scan_anomalies', 'scan_metrics',
-        'anomaly_scores', 'heavy_reports', 'ai_analysis', 'exec_summary'
+        'anomaly_scores', 'heavy_reports', 'ai_analysis', 'exec_summary',
+        'scan_in_progress', 'training_in_progress'
     ]
     for key in keys_to_remove:
         if key in st.session_state:
@@ -65,6 +66,9 @@ def clear_session_memory():
     gc.collect()
 
 def _switch_tab(target_tab: str) -> None:
+    if st.session_state.get('scan_in_progress') or st.session_state.get('training_in_progress'):
+        st.warning("Зачекайте завершення поточного процесу перед перемиканням вкладки.")
+        return
     if st.session_state.active_tab != target_tab:
         st.session_state.active_tab = target_tab
         st.rerun()

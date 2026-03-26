@@ -17,6 +17,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from src.services.threat_catalog import get_severity
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +172,10 @@ class Visualizer:
     ATTACK_LABELS_UA = {
         "benign": "Норма",
         "normal": "Норма",
+        "nan": "Невідомо",
+        "none": "Невідомо",
+        "undefined": "Невідомо",
+        "unknown": "Невідомо",
         "anomaly": "Аномалія",
         "attack": "Атака",
         "portscan": "Сканування портів",
@@ -1002,17 +1007,7 @@ class Visualizer:
             "low": "низький",
         }
         for threat, count in compact.items():
-            threat_lower = threat.lower()
-            if "ddos" in threat_lower or "dos" in threat_lower:
-                severity = "critical"
-            elif "botnet" in threat_lower or "malware" in threat_lower:
-                severity = "high"
-            elif "scan" in threat_lower or "probe" in threat_lower or "скан" in threat_lower:
-                severity = "medium"
-            elif "brute" in threat_lower:
-                severity = "high"
-            else:
-                severity = "medium"
+            severity = get_severity(threat)
 
             severity_data[threat] = {key: 0 for key in severity_order}
             severity_data[threat][severity] = int(count)
