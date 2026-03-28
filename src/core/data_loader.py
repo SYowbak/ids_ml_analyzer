@@ -490,7 +490,11 @@ class DataLoader:
                     count += 1
             
             finished_flows.extend(flows.values())
-            
+            if not finished_flows:
+                raise ValueError(
+                    "PCAP не містить підтримуваного IP-трафіку. Екстракція ознак неможлива."
+                )
+
             # Convert to DataFrame with ALL CIC-IDS-like columns
             features_list = []
             for f in finished_flows:

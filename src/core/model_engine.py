@@ -48,6 +48,62 @@ except ImportError:
 # Логування
 logger = logging.getLogger(__name__)
 
+PCAP_SCAN_EXTENSIONS = ('.pcap', '.pcapng', '.cap')
+IF_HEURISTIC_SCORE_OVERRIDE = -0.5
+
+
+def _pcap_heuristic_anomaly_mask(df_features: pd.DataFrame) -> np.ndarray:
+    """
+    Heuristic rescue detector for PCAP flows when IF reports near-zero anomalies.
+    """
+    if df_features is None or len(df_features) == 0:
+        return np.zeros(0, dtype=bool)
+
+    def _pick_numeric(candidates: list[str], default: float = 0.0) -> pd.Series:
+        for col in candidates:
+            if col in df_features.columns:
+                return pd.to_numeric(df_features[col], errors='coerce').fillna(default)
+        return pd.Series(default, index=df_features.index, dtype=float)
+
+    syn = _pick_numeric(['tcp_syn_count', 'syn_flag_count', 'syn flags', 'syn'])
+    ack = _pick_numeric(['tcp_ack_count', 'ack_flag_count', 'ack flags', 'ack'])
+    pps = _pick_numeric(['flow_packets/s', 'flow_pkts/s', 'packet_rate'])
+    fwd = _pick_numeric(['packets_fwd', 'total fwd packets', 'fwd_pkts'])
+    bwd = _pick_numeric(['packets_bwd', 'total backward packets', 'bwd_pkts'])
+    duration = _pick_numeric(['duration', 'flow duration', 'flow_duration'], default=0.0)
+    rst = _pick_numeric(['tcp_rst_count', 'rst_flag_count'], default=0.0)
+
+    pps_q75 = float(pps.quantile(0.75)) if len(pps) > 0 else 0.0
+    dur_q50 = float(duration.quantile(0.50)) if len(duration) > 0 else 0.0
+
+    cond_syn_present = syn >= 1.0
+    cond_no_ack = ack <= 0.0
+    cond_one_way = bwd <= 0.0
+    cond_high_rate = pps >= max(20.0, pps_q75)
+    cond_short_duration = duration <= max(0.02, dur_q50)
+    cond_rst_present = rst >= 1.0
+    cond_syn_ack_ratio = ((ack + 1.0) / (syn + 1.0)) <= 0.80
+    cond_sparse_reply = (fwd <= 2.0) & (bwd <= 0.0)
+
+    risk_score = (
+        cond_syn_present.astype(int)
+        + cond_no_ack.astype(int)
+        + cond_one_way.astype(int)
+        + cond_high_rate.astype(int)
+        + cond_short_duration.astype(int)
+        + cond_syn_ack_ratio.astype(int)
+        + cond_sparse_reply.astype(int)
+        + cond_rst_present.astype(int)
+    )
+
+    primary_mask = risk_score >= 4
+    if float(primary_mask.mean()) < 0.005:
+        fallback_mask = cond_syn_present & cond_no_ack & cond_one_way & cond_high_rate
+        return fallback_mask.to_numpy(dtype=bool)
+
+    return primary_mask.to_numpy(dtype=bool)
+
+
 AlgorithmType = Literal['Random Forest', 'XGBoost', 'Logistic Regression', 'Isolation Forest']
 SearchType = Literal['grid', 'random']
 
@@ -224,34 +280,56 @@ class ModelEngine:
         # Вибір сітки параметрів
         param_grid = self.FAST_PARAM_GRIDS[algorithm] if fast else self.PARAM_GRIDS[algorithm]
         cv_folds = 2 if fast else 3
+        min_class_count = int(y_fit.value_counts().min())
+        
+        if min_class_count < 2:
+            from sklearn.model_selection import KFold
+            actual_cv_folds = 2
+            cv = KFold(n_splits=actual_cv_folds, shuffle=True, random_state=42)
+            logger.warning(
+                f"[ModelEngine] min_class_count={min_class_count} < 2. "
+                "Falling back to unstratified KFold(n_splits=2) to prevent StratifiedKFold crash."
+            )
+        else:
+            actual_cv_folds = max(2, min(cv_folds, min_class_count))
+            cv = StratifiedKFold(n_splits=actual_cv_folds, shuffle=True, random_state=42)
+
+        if actual_cv_folds != cv_folds:
+            logger.info(
+                "[ModelEngine] CV folds adjusted: requested=%s, actual=%s (min class count=%s)",
+                cv_folds,
+                actual_cv_folds,
+                min_class_count,
+            )
         
         # Підрахунок кількості комбінацій
         n_candidates = 1
         for values in param_grid.values():
             n_candidates *= len(values)
         
-        total_fits = n_candidates * cv_folds
+        total_fits = n_candidates * actual_cv_folds
         
         # Інформація для callback
         search_info = {
             'algorithm': algorithm,
             'mode': mode,
             'n_candidates': n_candidates,
-            'cv_folds': cv_folds,
+            'cv_folds': actual_cv_folds,
+            'cv_folds_requested': cv_folds,
             'total_fits': total_fits
         }
         
         if progress_callback:
             progress_callback(f"Алгоритм: {algorithm} | Режим: {mode}")
             progress_callback(f"Комбінацій параметрів: {n_candidates}")
-            progress_callback(f"Крос-валідація: {cv_folds} фолди")
+            progress_callback(f"Крос-валідація: {actual_cv_folds} фолдів (запитано {cv_folds})")
             progress_callback(f"Всього ітерацій: {total_fits}")
             progress_callback("---")
         
-        logger.info(f"Оптимізація {algorithm} ({search_type}, {mode}): {total_fits} fits")
-        
-        # Стратифікована крос-валідація для дисбалансованих даних
-        cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+        logger.info(
+            f"Оптимізація {algorithm} ({search_type}, {mode}): {total_fits} fits, "
+            f"{cv.__class__.__name__} n_splits={actual_cv_folds}"
+        )
         
         # Пошук
         if search_type == 'grid':
@@ -827,6 +905,92 @@ class ModelEngine:
             y_pred = np.array([inverse.get(int(p), p) for p in y_pred])
 
         return y_pred
+
+    def apply_pcap_if_heuristics(
+        self,
+        predictions: np.ndarray,
+        scores: np.ndarray,
+        original_df: pd.DataFrame,
+        metadata: Optional[dict],
+        file_ext: Optional[str],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Post-process IF predictions and scores for PCAP using flow heuristics.
+        Rows promoted to attack by heuristics get a severity-aligned score override
+        so downstream IF severity classification treats them as critical.
+        """
+        if not self._is_isolation_forest():
+            return np.asarray(predictions), np.asarray(scores, dtype=float)
+        ext = (file_ext or '').lower()
+        if ext not in PCAP_SCAN_EXTENSIONS:
+            return np.asarray(predictions), np.asarray(scores, dtype=float)
+        preds = np.asarray(predictions).astype(int).copy()
+        sc = np.asarray(scores, dtype=float).copy()
+        n = len(preds)
+        if n == 0 or len(sc) != n:
+            return preds, sc
+
+        base_df = original_df.drop(columns=['label'], errors='ignore').copy()
+        raw_if_anomalies = int(np.sum(preds == 1))
+        min_expected = max(1, int(n * 0.005))
+        if raw_if_anomalies < min_expected:
+            heuristic_mask = _pcap_heuristic_anomaly_mask(base_df)
+            if len(heuristic_mask) == n:
+                heuristic_hits = int(np.sum(heuristic_mask))
+                if heuristic_hits > 0:
+                    before = preds.copy()
+                    preds = np.where((preds == 1) | heuristic_mask, 1, 0).astype(int)
+                    promoted = (preds == 1) & (before == 0)
+                    sc[promoted] = np.minimum(sc[promoted], IF_HEURISTIC_SCORE_OVERRIDE)
+                    logger.info(
+                        "[ModelEngine] IF PCAP rescue: if_hits=%s heuristic_hits=%s combined=%s",
+                        raw_if_anomalies,
+                        heuristic_hits,
+                        int(np.sum(preds == 1)),
+                    )
+
+        combined_hits = int(np.sum(preds == 1))
+        if combined_hits < min_expected:
+            syn = (
+                pd.to_numeric(base_df['tcp_syn_count'], errors='coerce').fillna(0)
+                if 'tcp_syn_count' in base_df.columns
+                else pd.Series(0, index=base_df.index, dtype=float)
+            )
+            ack = (
+                pd.to_numeric(base_df['tcp_ack_count'], errors='coerce').fillna(0)
+                if 'tcp_ack_count' in base_df.columns
+                else pd.Series(0, index=base_df.index, dtype=float)
+            )
+            bwd = (
+                pd.to_numeric(base_df['packets_bwd'], errors='coerce').fillna(0)
+                if 'packets_bwd' in base_df.columns
+                else pd.Series(0, index=base_df.index, dtype=float)
+            )
+            pcap_suspicion = float(np.mean((syn >= 1) & (ack <= 0) & (bwd <= 0)))
+
+            if pcap_suspicion >= 0.05:
+                meta = metadata or {}
+                floor_rate = float(
+                    np.clip(
+                        float(meta.get('if_min_anomaly_rate', 0.02)),
+                        0.005,
+                        0.10,
+                    )
+                )
+                adaptive_threshold = float(np.quantile(sc, floor_rate))
+                adaptive_mask = sc <= adaptive_threshold
+                before = preds.copy()
+                preds = np.where((preds == 1) | adaptive_mask, 1, 0).astype(int)
+                promoted = (preds == 1) & (before == 0)
+                sc[promoted] = np.minimum(sc[promoted], IF_HEURISTIC_SCORE_OVERRIDE)
+                logger.info(
+                    "[ModelEngine] IF PCAP adaptive floor: old_hits=%s new_hits=%s suspicion=%.3f",
+                    combined_hits,
+                    int(np.sum(preds == 1)),
+                    pcap_suspicion,
+                )
+
+        return preds, sc
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
         """

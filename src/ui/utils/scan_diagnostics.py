@@ -23,58 +23,6 @@ from src.ui.utils.model_helpers import (
 
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent.parent
 
-def _pcap_heuristic_anomaly_mask(df_features: pd.DataFrame) -> np.ndarray:
-    """
-    Heuristic rescue detector for PCAP flows.
-    Activated as fallback when IF predicts near-zero anomalies.
-    """
-    if df_features is None or len(df_features) == 0:
-        return np.zeros(0, dtype=bool)
-
-    def _pick_numeric(candidates: list[str], default: float = 0.0) -> pd.Series:
-        for col in candidates:
-            if col in df_features.columns:
-                return pd.to_numeric(df_features[col], errors='coerce').fillna(default)
-        return pd.Series(default, index=df_features.index, dtype=float)
-
-    syn = _pick_numeric(['tcp_syn_count', 'syn_flag_count', 'syn flags', 'syn'])
-    ack = _pick_numeric(['tcp_ack_count', 'ack_flag_count', 'ack flags', 'ack'])
-    pps = _pick_numeric(['flow_packets/s', 'flow_pkts/s', 'packet_rate'])
-    fwd = _pick_numeric(['packets_fwd', 'total fwd packets', 'fwd_pkts'])
-    bwd = _pick_numeric(['packets_bwd', 'total backward packets', 'bwd_pkts'])
-    duration = _pick_numeric(['duration', 'flow duration', 'flow_duration'], default=0.0)
-    rst = _pick_numeric(['tcp_rst_count', 'rst_flag_count'], default=0.0)
-
-    pps_q75 = float(pps.quantile(0.75)) if len(pps) > 0 else 0.0
-    dur_q50 = float(duration.quantile(0.50)) if len(duration) > 0 else 0.0
-
-    cond_syn_present = syn >= 1.0
-    cond_no_ack = ack <= 0.0
-    cond_one_way = bwd <= 0.0
-    cond_high_rate = pps >= max(20.0, pps_q75)
-    cond_short_duration = duration <= max(0.02, dur_q50)
-    cond_rst_present = rst >= 1.0
-    cond_syn_ack_ratio = ((ack + 1.0) / (syn + 1.0)) <= 0.80
-    cond_sparse_reply = (fwd <= 2.0) & (bwd <= 0.0)
-
-    risk_score = (
-        cond_syn_present.astype(int)
-        + cond_no_ack.astype(int)
-        + cond_one_way.astype(int)
-        + cond_high_rate.astype(int)
-        + cond_short_duration.astype(int)
-        + cond_syn_ack_ratio.astype(int)
-        + cond_sparse_reply.astype(int)
-        + cond_rst_present.astype(int)
-    )
-
-    primary_mask = risk_score >= 4
-    if float(primary_mask.mean()) < 0.005:
-        fallback_mask = cond_syn_present & cond_no_ack & cond_one_way & cond_high_rate
-        return fallback_mask.to_numpy(dtype=bool)
-
-    return primary_mask.to_numpy(dtype=bool)
-
 def _build_training_distribution_profile(
     X: Any,
     feature_names: list[str] | None,
@@ -296,7 +244,7 @@ def compute_scan_readiness_diagnostics(
             quality_score -= 8
 
         schema_mode = str(metadata.get('schema_mode', 'unified')).strip().lower() if isinstance(metadata, dict) else 'unified'
-        align_to_schema = schema_mode != 'family'
+        align_to_schema = False
         loader = DataLoader()
         df_preview = loader.load_file(file_path, max_rows=3000, align_to_schema=align_to_schema)
         report['checks']['preview_rows'] = int(len(df_preview))

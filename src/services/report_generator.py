@@ -175,6 +175,7 @@ class ReportGenerator:
 
     def generate_pdf_report(self, summary: dict, 
                             details_df: Optional[pd.DataFrame] = None,
+                            network_context: Optional[dict] = None,
                             ai_analysis: Optional[str] = None,
                             executive_summary: Optional[str] = None) -> bytes:
         """
@@ -207,9 +208,8 @@ class ReportGenerator:
             story.extend(self._create_threats_table(details_df, styles))
             story.append(Spacer(1, 1*cm))
             
-            # P3: Add Suspicious IP Report if IP context exists
-            if 'src_ip' in details_df.columns or 'dst_ip' in details_df.columns:
-                story.extend(self._create_suspicious_ips_section(details_df, styles))
+            if network_context:
+                story.extend(self._create_suspicious_ips_section(network_context, styles))
                 story.append(Spacer(1, 1*cm))
         
         if ai_analysis:
@@ -460,6 +460,75 @@ class ReportGenerator:
             
             elements.append(threats_table)
         
+        return elements
+
+    def _create_suspicious_ips_section(self, network_context: dict, styles) -> list:
+        """
+        Секція PDF: топ IP-адрес за частотою у підозрілих записах (src/dst).
+        Береться з попередньо розрахованого контексту. Пріоритет - повнота статистики.
+        """
+        elements: list = [
+            Paragraph("Top suspicious network activity", styles['SectionHeader']),
+            HRFlowable(
+                width="100%", thickness=0.5,
+                color=colors.HexColor('#e2e8f0'),
+                spaceAfter=15
+            ),
+        ]
+        
+        table_data = [['Role / Category', 'Value (IP / Port / Proto)', 'Count']]
+        
+        mapping = [
+            ('top_src_ips', 'Source IP'),
+            ('top_dst_ips', 'Destination IP'),
+            ('top_dst_ports', 'Dest Port'),
+            ('top_protocols', 'Protocol'),
+        ]
+        
+        added_any = False
+        for key, label in mapping:
+            data_list = network_context.get(key)
+            if not data_list:
+                continue
+                
+            # data_list is a List of Dicts (from to_dict('records')) or a List of Tuples
+            # We assume it matches the structure from scan_renderer's _top_value_table
+            items = data_list if isinstance(data_list, list) else []
+            for item in items[:10]: # Top 10 per category for PDF readability
+                val = ""
+                cnt = 0
+                if isinstance(item, dict):
+                    # Try English and Ukrainian keys
+                    val = item.get('Value') or item.get('Значення') or ""
+                    cnt = item.get('Count') or item.get('Кількість') or 0
+                elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                    val, cnt = item[0], item[1]
+                
+                if val:
+                    table_data.append([label, str(val), f"{int(cnt):,}"])
+                    added_any = True
+
+        if not added_any:
+            elements.append(Paragraph(
+                "Мережеві деталі для агрегації відсутні або не завантажені.",
+                styles['CustomBodyText']
+            ))
+            return elements
+
+        ip_table = Table(table_data, colWidths=[3 * cm, 8 * cm, 3 * cm])
+        ip_table.setStyle(TableStyle([
+            ('FONTNAME', (0, 0), (-1, -1), self.font_name),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#6366f1')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('ALIGN', (1, 1), (1, -1), 'LEFT'),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e2e8f0')),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f8fafc')]),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+            ('TOPPADDING', (0, 0), (-1, -1), 8),
+        ]))
+        elements.append(ip_table)
         return elements
 
     def _create_ai_section(self, ai_analysis: str, styles) -> list:

@@ -301,11 +301,7 @@ def resolve_auto_model(file_target: str | Path, model_files: list[Path]) -> tupl
     for recency_idx, candidate in enumerate(model_names):
         manifest = get_manifest_for_model(candidate, model_file_map)
         compatible_types = _normalize_compatible_types(manifest.get('compatible_file_types'))
-        pcap_tabular_fallback = (
-            normalized_ext in PCAP_EXTENSIONS
-            and bool(set(compatible_types) & TABULAR_EXTENSIONS)
-        )
-        if normalized_ext not in compatible_types and not pcap_tabular_fallback:
+        if normalized_ext not in compatible_types:
             continue
 
         trained_families = set(manifest.get('trained_families', []))
@@ -320,14 +316,10 @@ def resolve_auto_model(file_target: str | Path, model_files: list[Path]) -> tupl
         is_two_stage = bool(manifest.get('two_stage_mode'))
 
         if normalized_ext in PCAP_EXTENSIONS:
-            if is_if:
-                score += 1000.0
-                reason = 'pcap_if'
-            else:
-                # Не блокуємо табличні моделі для PCAP:
-                # знижуємо пріоритет, але дозволяємо fallback-вибір.
-                score -= 80.0
-                reason = 'pcap_tabular_fallback'
+            if not is_if:
+                continue
+            score += 1000.0
+            reason = 'pcap_if'
         else:
             if is_two_stage:
                 score += 160.0

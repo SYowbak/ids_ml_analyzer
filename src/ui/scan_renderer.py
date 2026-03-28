@@ -327,6 +327,7 @@ def render_comprehensive_dashboard(
     anomalies_count = int(metrics.get("anomalies_count", 0))
     normal_traffic = max(total - anomalies_count, 0)
     risk_score = float(metrics.get("risk_score", 0))
+    network_context_data = {}
 
     if "scan_light_mode" not in st.session_state:
         st.session_state["scan_light_mode"] = True
@@ -597,6 +598,7 @@ def render_comprehensive_dashboard(
     if anomalies_count <= 0:
         st.info("Аномалій не виявлено — мережеві деталі інциденту відсутні.")
     else:
+        # --- Network Context Preparation (Unified for UI, PDF and AI) ---
         src_ip_col = _first_existing_column(
             anomalies,
             ["src_ip", "source_ip", "ip_src", "src", "srcaddr", "src address", "srcip"],
@@ -617,6 +619,19 @@ def render_comprehensive_dashboard(
             anomalies,
             ["protocol", "protocol_name", "proto", "ip_proto", "service"],
         )
+
+        network_context_data = {}
+        if src_ip_col:
+            network_context_data["top_src_ips"] = _top_value_table(anomalies, src_ip_col).to_dict('records')
+        if dst_ip_col:
+            network_context_data["top_dst_ips"] = _top_value_table(anomalies, dst_ip_col).to_dict('records')
+        if dst_port_col:
+            network_context_data["top_dst_ports"] = _top_value_table(anomalies, dst_port_col).to_dict('records')
+        if src_port_col:
+            network_context_data["top_src_ports"] = _top_value_table(anomalies, src_port_col).to_dict('records')
+        if proto_col:
+            network_context_data["top_protocols"] = _top_value_table(anomalies, proto_col).to_dict('records')
+        # ---------------------------------------------------------------
 
         missing_fields = []
         if not src_ip_col:
@@ -644,23 +659,23 @@ def render_comprehensive_dashboard(
         with info_cols[0]:
             if src_ip_col:
                 st.markdown("**Найактивніші IP-джерела (аномалії)**")
-                st.dataframe(_style_dataframe(_top_value_table(anomalies, src_ip_col)), width="stretch", hide_index=True)
+                st.dataframe(_style_dataframe(pd.DataFrame(network_context_data["top_src_ips"])), width="stretch", hide_index=True)
             elif dst_ip_col:
                 st.markdown("**Найактивніші IP-призначення (аномалії)**")
-                st.dataframe(_style_dataframe(_top_value_table(anomalies, dst_ip_col)), width="stretch", hide_index=True)
+                st.dataframe(_style_dataframe(pd.DataFrame(network_context_data["top_dst_ips"])), width="stretch", hide_index=True)
 
         with info_cols[1]:
             if dst_port_col:
                 st.markdown("**Найчастіші порти призначення (аномалії)**")
-                st.dataframe(_style_dataframe(_top_value_table(anomalies, dst_port_col)), width="stretch", hide_index=True)
+                st.dataframe(_style_dataframe(pd.DataFrame(network_context_data["top_dst_ports"])), width="stretch", hide_index=True)
             elif src_port_col:
                 st.markdown("**Найчастіші порти джерела (аномалії)**")
-                st.dataframe(_style_dataframe(_top_value_table(anomalies, src_port_col)), width="stretch", hide_index=True)
+                st.dataframe(_style_dataframe(pd.DataFrame(network_context_data["top_src_ports"])), width="stretch", hide_index=True)
 
         with info_cols[2]:
             if proto_col:
                 st.markdown("**Найчастіші протоколи (аномалії)**")
-                st.dataframe(_style_dataframe(_top_value_table(anomalies, proto_col)), width="stretch", hide_index=True)
+                st.dataframe(_style_dataframe(pd.DataFrame(network_context_data["top_protocols"])), width="stretch", hide_index=True)
 
         time_col_details = _resolve_time_column(anomalies)
         detail_columns = []
@@ -801,6 +816,7 @@ def render_comprehensive_dashboard(
                 pdf_bytes = report_gen.generate_pdf_report(
                     summary=export_summary,
                     details_df=anomalies.head(50) if len(anomalies) > 0 else None,
+                    network_context=network_context_data if anomalies_count > 0 else None,
                     executive_summary=plain_summary_text,
                 )
                 st.download_button(
@@ -821,28 +837,7 @@ def render_comprehensive_dashboard(
         gemini = GeminiService(api_key=gemini_key)
         if gemini.available:
             with st.expander("AI-пояснення результату (Gemini)", expanded=False):
-                network_context = {}
-                if 'dst_port_col' in locals() and dst_port_col and dst_port_col in anomalies.columns:
-                    network_context["top_dst_ports"] = (
-                        anomalies[dst_port_col].dropna().astype(str).value_counts().head(5).index.tolist()
-                    )
-                if 'src_port_col' in locals() and src_port_col and src_port_col in anomalies.columns:
-                    network_context["top_src_ports"] = (
-                        anomalies[src_port_col].dropna().astype(str).value_counts().head(5).index.tolist()
-                    )
-                if 'proto_col' in locals() and proto_col and proto_col in anomalies.columns:
-                    network_context["top_protocols"] = (
-                        anomalies[proto_col].dropna().astype(str).value_counts().head(5).index.tolist()
-                    )
-                if 'src_ip_col' in locals() and src_ip_col and src_ip_col in anomalies.columns:
-                    network_context["top_src_ips"] = (
-                        anomalies[src_ip_col].dropna().astype(str).value_counts().head(5).index.tolist()
-                    )
-                if 'dst_ip_col' in locals() and dst_ip_col and dst_ip_col in anomalies.columns:
-                    network_context["top_dst_ips"] = (
-                        anomalies[dst_ip_col].dropna().astype(str).value_counts().head(5).index.tolist()
-                    )
-
+                # Словник network_context_data вже обчислено вище у блоці аномалій
                 summary_input = {
                     "total": total,
                     "anomalies": anomalies_count,
@@ -850,7 +845,7 @@ def render_comprehensive_dashboard(
                     "model_name": metrics.get("model_name", ""),
                     "algorithm": metrics.get("algorithm", ""),
                     "filename": metrics.get("filename", ""),
-                    "network_context": network_context,
+                    "network_context": network_context_data, # Реюзимо обчислений контекст
                 }
                 top_threats_list = [{"type": k, "count": int(v)} for k, v in list(threat_counts.items())[:10]]
                 all_threats = {str(k): int(v) for k, v in threat_counts.items()}

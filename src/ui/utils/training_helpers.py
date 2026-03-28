@@ -110,7 +110,7 @@ def _calibrate_two_stage_threshold(
 ) -> dict[str, Any]:
     """
     Auto-select the best Two-Stage binary threshold on validation data.
-    Objective: maximize attack F2 (recall-oriented) with precision guard.
+    Objective: maximize attack F3 (recall-oriented) with softened FP penalty.
     """
     from sklearn.metrics import f1_score, precision_score, recall_score
 
@@ -120,7 +120,7 @@ def _calibrate_two_stage_threshold(
     result: dict[str, Any] = {
         'threshold': fallback_threshold,
         'f1_attack': 0.0,
-        'f2_attack': 0.0,
+        'f3_attack': 0.0,
         'precision_attack': 0.0,
         'recall_attack': 0.0,
         'evaluated_points': 0,
@@ -151,28 +151,28 @@ def _calibrate_two_stage_threshold(
         target_fp_rate = 0.005
         precision_floor = 0.75
         max_attack_rate = min(0.08, (attack_rate * 2.5) + 0.02)
-        fp_penalty_weight = 1.6
+        fp_penalty_weight = 1.0
         over_pred_weight = 0.7
         precision_weight = 0.45
     elif attack_rate < 0.05:
         target_fp_rate = 0.01
         precision_floor = 0.70
         max_attack_rate = min(0.12, (attack_rate * 2.0) + 0.03)
-        fp_penalty_weight = 1.2
+        fp_penalty_weight = 0.75
         over_pred_weight = 0.55
         precision_weight = 0.40
     elif attack_rate < 0.10:
         target_fp_rate = 0.02
         precision_floor = 0.65
         max_attack_rate = min(0.20, (attack_rate * 1.8) + 0.04)
-        fp_penalty_weight = 1.0
+        fp_penalty_weight = 0.65
         over_pred_weight = 0.40
         precision_weight = 0.38
     else:
         target_fp_rate = 0.03 if attack_rate < 0.25 else 0.04
         precision_floor = 0.60
         max_attack_rate = min(0.60, (attack_rate * 1.6) + 0.05)
-        fp_penalty_weight = 0.9
+        fp_penalty_weight = 0.55
         over_pred_weight = 0.25
         precision_weight = 0.35
     max_attack_rate = float(np.clip(max_attack_rate, 0.01, 0.90))
@@ -180,7 +180,7 @@ def _calibrate_two_stage_threshold(
     best = {
         'threshold': fallback_threshold,
         'f1_attack': -1.0,
-        'f2_attack': -1.0,
+        'f3_attack': -1.0,
         'precision_attack': 0.0,
         'recall_attack': 0.0,
         'objective': -1e9,
@@ -208,15 +208,15 @@ def _calibrate_two_stage_threshold(
             tn = int(np.sum((y_true_attack == 0) & (y_pred_attack == 0)))
             fp = int(np.sum((y_true_attack == 0) & (y_pred_attack == 1)))
             fp_rate = fp / (fp + tn) if (fp + tn) else 0.0
-        denom = (4.0 * precision) + recall
-        f2 = float((5.0 * precision * recall) / denom) if denom > 0 else 0.0
+        denom_f3 = (9.0 * precision) + recall
+        f3 = float((10.0 * precision * recall) / denom_f3) if denom_f3 > 0 else 0.0
 
         # Soft guard against extremely low precision.
         precision_penalty = max(0.0, precision_floor - precision)
         fp_penalty = max(0.0, fp_rate - target_fp_rate)
         over_pred_penalty = max(0.0, pred_attack_rate - max_attack_rate)
         objective = (
-            f2
+            f3
             - (precision_penalty * precision_penalty * precision_weight)
             - (fp_penalty * fp_penalty_weight)
             - (over_pred_penalty * over_pred_weight)
@@ -225,7 +225,7 @@ def _calibrate_two_stage_threshold(
             {
                 'threshold': threshold,
                 'f1_attack': f1,
-                'f2_attack': f2,
+                'f3_attack': f3,
                 'precision_attack': precision,
                 'recall_attack': recall,
                 'fp_rate': fp_rate,
@@ -251,21 +251,21 @@ def _calibrate_two_stage_threshold(
             best = {
                 'threshold': threshold,
                 'f1_attack': f1,
-                'f2_attack': f2,
+                'f3_attack': f3,
                 'precision_attack': precision,
                 'recall_attack': recall,
                 'objective': objective,
             }
 
     # Стабілізація порогу:
-    # якщо кілька порогів майже рівноцінні за F2, обираємо той, що ближче
+    # якщо кілька порогів майже рівноцінні за F3, обираємо той, що ближче
     # до дефолтного і зазвичай дає стабільніший баланс FP/FN.
     if threshold_stats:
-        f2_tolerance = 0.002
+        f3_tolerance = 0.002
         precision_tolerance = 0.03
         stable_pool = [
             item for item in threshold_stats
-            if item['f2_attack'] >= (best['f2_attack'] - f2_tolerance)
+            if item['f3_attack'] >= (best['f3_attack'] - f3_tolerance)
             and item['precision_attack'] >= max(0.0, best['precision_attack'] - precision_tolerance)
         ]
         if stable_pool:
@@ -274,7 +274,7 @@ def _calibrate_two_stage_threshold(
                 key=lambda item: (
                     abs(item['threshold'] - DEFAULT_SENSITIVITY_THRESHOLD),
                     -item['recall_attack'],
-                    -item['f2_attack']
+                    -item['f3_attack']
                 )
             )
             best = stable_choice
@@ -307,7 +307,7 @@ def _calibrate_two_stage_threshold(
     result.update({
         'threshold': float(model.binary_threshold),
         'f1_attack': float(f1_score(y_true_attack, y_pred_attack_final, zero_division=0)),
-        'f2_attack': float(best.get('f2_attack', 0.0)),
+        'f3_attack': float(best.get('f3_attack', 0.0)),
         'precision_attack': float(precision_score(y_true_attack, y_pred_attack_final, zero_division=0)),
         'recall_attack': float(recall_score(y_true_attack, y_pred_attack_final, zero_division=0)),
         'evaluated_points': int(result.get('evaluated_points', 0)),

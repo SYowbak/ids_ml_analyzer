@@ -13,7 +13,15 @@ import pandas as pd
 from sklearn.base import BaseEstimator, ClassifierMixin, clone
 from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.utils.class_weight import compute_sample_weight
 import logging
+
+try:
+    from xgboost import XGBClassifier
+    _XGB_AVAILABLE = True
+except ImportError:
+    XGBClassifier = None  # type: ignore[misc, assignment]
+    _XGB_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +51,10 @@ class TwoStageModel(BaseEstimator, ClassifierMixin):
         # Unfitted estimators may define __len__ and raise AttributeError.
         # Stability-first defaults: n_jobs=1 avoids process storms / RAM spikes in Streamlit runtime.
         self.binary_model = binary_model if binary_model is not None else RandomForestClassifier(
-            n_jobs=1, random_state=42, class_weight='balanced'
+            n_jobs=1, random_state=42, class_weight='balanced_subsample'
         )
         self.multiclass_model = multiclass_model if multiclass_model is not None else RandomForestClassifier(
-            n_jobs=1, random_state=42, class_weight='balanced'
+            n_jobs=1, random_state=42, class_weight='balanced_subsample'
         )
         self.binary_threshold = binary_threshold
         self.binary_target_attack_rate = binary_target_attack_rate
@@ -151,94 +159,6 @@ class TwoStageModel(BaseEstimator, ClassifierMixin):
             else:
                 lower_map = {str(v).strip().lower(): v for v in np.unique(y)}
                 fallback = lower_map.get(str(benign_label).strip().lower())
-
-    @staticmethod
-    def _force_single_thread(model) -> None:
-        """
-        У predict/predict_proba працюємо в single-thread режимі для стабільності.
-        Це прибирає пікові навантаження та WinError у деяких середовищах.
-        """
-        if model is None:
-            return
-        try:
-            if hasattr(model, "n_jobs"):
-                try:
-                    model.n_jobs = 1
-                except Exception:
-                    pass
-            if hasattr(model, "set_params"):
-                try:
-                    model.set_params(n_jobs=1)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    def fit(self, X, y, benign_label='BENIGN', benign_code=None):
-        """
-        Тренування двоетапної моделі.
-        
-        Args:
-            X: Ознаки
-            y: Мітки (можуть бути числовими або рядковими)
-            benign_label: Назва нормального класу (для рядкових міток)
-            benign_code: Числовий код нормального класу (для закодованих міток)
-        """
-        X = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
-        y = pd.Series(y) if not isinstance(y, pd.Series) else y
-        
-        logger.info(f"[DIAGNOSTIC] TwoStageModel.fit() called")
-        logger.info(f"[DIAGNOSTIC] Training data shape: {X.shape}")
-        logger.info(f"[DIAGNOSTIC] Unique labels in y: {np.unique(y)}")
-        
-        # Клонуємо базові оцінювачі перед кожним fit, щоб уникати застарілого стану
-        # (критично для стабільної індексації класів у XGBoost при повторному навчанні).
-        self.binary_model = clone(self.binary_model)
-        if self.multiclass_model is not None:
-            self.multiclass_model = clone(self.multiclass_model)
-
-        # DIAGNOSTIC: warn only on re-fit, not on first fit.
-        if getattr(self, 'is_fitted_', False):
-            logger.warning(f"[DIAGNOSTIC] WARNING: Overwriting existing binary_model!")
-            logger.warning(f"[DIAGNOSTIC] Catastrophic Forgetting Risk: YES")
-            logger.warning(f"[DIAGNOSTIC] Previous knowledge will be lost!")
-        
-        logger.info(f"TwoStageModel: Training Stage 1 (Binary) on {len(X)} samples...")
-        
-        # --- STAGE 1 PREPARATION ---
-        # Створюємо бінарні мітки: 0 = Benign, 1 = Attack
-        # Важливо обробити випадок, коли y може бути вже закодованим (числа) або рядками
-        # Припускаємо, що benign_label - це мітка нормального трафіку.
-        # Якщо y - числа, треба знати, яке число відповідає Benign.
-        # Але зазвичай в нашому pipeline сюди приходять вже закодовані числа (0=BENIGN).
-        # Тому зробимо припущення: 0 - це завжди нормальний трафік (стандарт LabelEncoder).
-        
-        # Перевірка: якщо benign_label це рядок, а y - числа, то треба бути обережним.
-        # Наш Preprocessor кодує мітки. Зазвичай найпопулярніший клас (BENIGN) отримує код 0 або інший.
-        # Але ми не можемо гарантувати це.
-        # Тому надійніше тренувати на тому, що є, але для чистоти експерименту
-        # краще передавати сюди НЕЗАКОДОВАНІ y, або знати мапінг.
-        
-        # Aле ModelEngine отримує вже закодовані X, y від Preprocessor.
-        # Тому ми будемо вважати: 0 = BENIGN (якщо це так працює в нашому Preprocessor).
-        # Давайте перевіримо: Preprocessor використовує LabelEncoder.
-        # LabelEncoder сортує алфавітно. "BENIGN" < "DDoS". Тобто BENIGN швидше за все не 0?
-        # "BENIGN" vs "Bot". BENIGN йде першим. 
-        # "BENIGN" vs "BruteForce". BENIGN йде першим.
-        # Але краще не гадати. 
-        
-        # --- ВИЗНАЧЕННЯ BENIGN КЛАСУ ---
-        # Явне визначення пріоритетніше за евристику
-        if benign_code is not None:
-            # Explicit benign class/code provided by caller.
-            pass
-        elif isinstance(y.iloc[0] if hasattr(y, 'iloc') else y[0], str):
-            # String labels: try exact match first, then safe case-insensitive fallbacks.
-            if benign_label in y.values:
-                benign_code = benign_label
-            else:
-                lower_map = {str(v).strip().lower(): v for v in np.unique(y)}
-                fallback = lower_map.get(str(benign_label).strip().lower())
                 if fallback is not None:
                     benign_code = fallback
                 elif 'benign' in lower_map:
@@ -246,21 +166,31 @@ class TwoStageModel(BaseEstimator, ClassifierMixin):
                 elif 'normal' in lower_map:
                     benign_code = lower_map['normal']
                 else:
-                    raise ValueError(
-                        f"У датасеті відсутній клас '{benign_label}' (Нормальний трафік).\n"
-                        f"Для тренування системи виявлення аномалій обов'язково потрібні "
-                        f"як нормальні дані, так і атаки. Знайдено лише: {np.unique(y)}"
+                    if y.nunique() < 2:
+                        raise ValueError(
+                            "Для тренування Two-Stage обов'язково потрібні як нормальні дані, так і атаки "
+                            f"(знайдено лише один клас: {np.unique(y)})."
+                        )
+                    benign_code = pd.Series(y).value_counts().idxmax()
+                    logger.warning(
+                        "[TwoStageModel] No benign token matched; using most frequent label as benign: %s",
+                        benign_code,
                     )
         else:
-            # Numeric labels: try class 0 first, otherwise raise error.
+            # Numeric labels: prefer 0; if absent, use most frequent class (LabelEncoder edge cases).
             unique_vals = np.unique(y)
+            if len(unique_vals) < 2:
+                raise ValueError(
+                    "Для тренування потрібні як мінімум нормальний трафік, так і атаки "
+                    f"(знайдено лише один клас: {unique_vals})."
+                )
             if 0 in set(unique_vals.tolist()):
                 benign_code = 0
             else:
-                raise ValueError(
-                    f"У датасеті відсутній клас '0' (BENIGN/Норма).\n"
-                    f"Для тренування потрібні як мінімум нормальний трафік, так і атаки. "
-                    f"Знайдено класи: {unique_vals}"
+                benign_code = int(pd.Series(y).value_counts().idxmax())
+                logger.warning(
+                    "[TwoStageModel] Class 0 absent; using most frequent numeric class as benign: %s",
+                    benign_code,
                 )
         
         logger.info(f"[TwoStageModel] Benign code set to: '{benign_code}'")
@@ -275,13 +205,20 @@ class TwoStageModel(BaseEstimator, ClassifierMixin):
             'enabled': False,
             'attack_rate_raw': float(np.mean(y_binary)) if len(y_binary) else 0.0,
             'downsampled': False,
-            'note': 'class_weight=balanced handles imbalance without data destruction',
+            'note': 'RF: balanced_subsample; XGB: scale_pos_weight (binary) / sample_weight (multiclass)',
         }
 
-        # class_weight='balanced' is set in __init__ and enforced here.
         if hasattr(self.binary_model, 'set_params'):
             try:
-                self.binary_model.set_params(class_weight='balanced')
+                if isinstance(self.binary_model, RandomForestClassifier):
+                    self.binary_model.set_params(class_weight='balanced_subsample')
+                elif _XGB_AVAILABLE and isinstance(self.binary_model, XGBClassifier):
+                    n_benign = int(np.sum(y_binary == 0))
+                    n_attack = int(np.sum(y_binary == 1))
+                    if n_attack > 0:
+                        spw = float(n_benign) / float(n_attack)
+                        self.binary_model.set_params(scale_pos_weight=spw)
+                        logger.info(f"[TwoStageModel] XGB binary scale_pos_weight={spw:.6f}")
             except Exception:
                 pass
 
@@ -383,15 +320,18 @@ class TwoStageModel(BaseEstimator, ClassifierMixin):
                         f"oversampled_classes={oversampled_classes}/{len(class_counts)}"
                     )
 
-            # Ensure class_weight='balanced' for multiclass stage.
-            # This is the most impactful fix for rare-class washout.
             if hasattr(self.multiclass_model, 'set_params'):
                 try:
-                    self.multiclass_model.set_params(class_weight='balanced')
+                    if isinstance(self.multiclass_model, RandomForestClassifier):
+                        self.multiclass_model.set_params(class_weight='balanced_subsample')
                 except Exception:
                     pass
 
-            self.multiclass_model.fit(X_stage2, y_stage2)
+            if _XGB_AVAILABLE and isinstance(self.multiclass_model, XGBClassifier):
+                sw = compute_sample_weight('balanced', y_stage2)
+                self.multiclass_model.fit(X_stage2, y_stage2, sample_weight=sw)
+            else:
+                self.multiclass_model.fit(X_stage2, y_stage2)
             self.singleton_attack_label_ = None
         
         self.classes_ = np.unique(y) # Всі можливі класи

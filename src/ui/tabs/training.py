@@ -297,7 +297,7 @@ def render_training_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
             tab_threshold_info: dict[str, Any] = {
                 'threshold': float(DEFAULT_SENSITIVITY_THRESHOLD),
                 'f1_attack': 0.0,
-                'f2_attack': 0.0,
+                'f3_attack': 0.0,
                 'precision_attack': 0.0,
                 'recall_attack': 0.0,
                 'evaluated_points': 0,
@@ -358,7 +358,7 @@ def render_training_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                         "Two-Stage авто-поріг: "
                         f"{float(tab_threshold_info['threshold']):.2f} "
                         f"(F1_attack={float(tab_threshold_info['f1_attack']):.3f}, "
-                        f"F2_attack={float(tab_threshold_info.get('f2_attack', 0.0)):.3f}, "
+                        f"F3_attack={float(tab_threshold_info.get('f3_attack', 0.0)):.3f}, "
                         f"Recall_attack={float(tab_threshold_info['recall_attack']):.3f})"
                     )
                     engine_tab.model = best_model
@@ -389,7 +389,7 @@ def render_training_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                         ),
                         'two_stage_threshold_calibration': {
                             'f1_attack': float(tab_threshold_info.get('f1_attack', 0.0)),
-                            'f2_attack': float(tab_threshold_info.get('f2_attack', 0.0)),
+                            'f3_attack': float(tab_threshold_info.get('f3_attack', 0.0)),
                             'precision_attack': float(tab_threshold_info.get('precision_attack', 0.0)),
                             'recall_attack': float(tab_threshold_info.get('recall_attack', 0.0)),
                             'evaluated_points': int(tab_threshold_info.get('evaluated_points', 0)),
@@ -1443,10 +1443,8 @@ def render_training_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
 
                 y = pd.concat([y_train, y_test])
 
-                # Clean rare classes from TRAIN only
+                # Clean rare classes from TRAIN only (fixed floor: class_weight handles imbalance)
                 min_samples = 5
-                if is_mega_model and len(y_train):
-                    min_samples = max(min_samples, int(0.001 * len(y_train)))
                 class_counts = y_train.value_counts()
                 rare_classes = class_counts[class_counts < min_samples].index.tolist()
 
@@ -1514,7 +1512,7 @@ def render_training_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                 two_stage_threshold_info: dict[str, Any] = {
                     'threshold': float(DEFAULT_SENSITIVITY_THRESHOLD),
                     'f1_attack': 0.0,
-                    'f2_attack': 0.0,
+                    'f3_attack': 0.0,
                     'precision_attack': 0.0,
                     'recall_attack': 0.0,
                     'evaluated_points': 0,
@@ -1566,7 +1564,7 @@ def render_training_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                         "Two-Stage авто-поріг: "
                         f"{float(two_stage_threshold_info['threshold']):.2f} "
                         f"(F1_attack={float(two_stage_threshold_info['f1_attack']):.3f}, "
-                        f"F2_attack={float(two_stage_threshold_info.get('f2_attack', 0.0)):.3f}, "
+                        f"F3_attack={float(two_stage_threshold_info.get('f3_attack', 0.0)):.3f}, "
                         f"Recall_attack={float(two_stage_threshold_info['recall_attack']):.3f})"
                     )
 
@@ -1801,7 +1799,7 @@ def render_training_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                     )
                     model_metadata['two_stage_threshold_calibration'] = {
                         'f1_attack': float(two_stage_threshold_info.get('f1_attack', 0.0)),
-                        'f2_attack': float(two_stage_threshold_info.get('f2_attack', 0.0)),
+                        'f3_attack': float(two_stage_threshold_info.get('f3_attack', 0.0)),
                         'precision_attack': float(two_stage_threshold_info.get('precision_attack', 0.0)),
                         'recall_attack': float(two_stage_threshold_info.get('recall_attack', 0.0)),
                         'evaluated_points': int(two_stage_threshold_info.get('evaluated_points', 0)),
