@@ -151,6 +151,94 @@ class TwoStageModel(BaseEstimator, ClassifierMixin):
             else:
                 lower_map = {str(v).strip().lower(): v for v in np.unique(y)}
                 fallback = lower_map.get(str(benign_label).strip().lower())
+
+    @staticmethod
+    def _force_single_thread(model) -> None:
+        """
+        У predict/predict_proba працюємо в single-thread режимі для стабільності.
+        Це прибирає пікові навантаження та WinError у деяких середовищах.
+        """
+        if model is None:
+            return
+        try:
+            if hasattr(model, "n_jobs"):
+                try:
+                    model.n_jobs = 1
+                except Exception:
+                    pass
+            if hasattr(model, "set_params"):
+                try:
+                    model.set_params(n_jobs=1)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def fit(self, X, y, benign_label='BENIGN', benign_code=None):
+        """
+        Тренування двоетапної моделі.
+        
+        Args:
+            X: Ознаки
+            y: Мітки (можуть бути числовими або рядковими)
+            benign_label: Назва нормального класу (для рядкових міток)
+            benign_code: Числовий код нормального класу (для закодованих міток)
+        """
+        X = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
+        y = pd.Series(y) if not isinstance(y, pd.Series) else y
+        
+        logger.info(f"[DIAGNOSTIC] TwoStageModel.fit() called")
+        logger.info(f"[DIAGNOSTIC] Training data shape: {X.shape}")
+        logger.info(f"[DIAGNOSTIC] Unique labels in y: {np.unique(y)}")
+        
+        # Клонуємо базові оцінювачі перед кожним fit, щоб уникати застарілого стану
+        # (критично для стабільної індексації класів у XGBoost при повторному навчанні).
+        self.binary_model = clone(self.binary_model)
+        if self.multiclass_model is not None:
+            self.multiclass_model = clone(self.multiclass_model)
+
+        # DIAGNOSTIC: warn only on re-fit, not on first fit.
+        if getattr(self, 'is_fitted_', False):
+            logger.warning(f"[DIAGNOSTIC] WARNING: Overwriting existing binary_model!")
+            logger.warning(f"[DIAGNOSTIC] Catastrophic Forgetting Risk: YES")
+            logger.warning(f"[DIAGNOSTIC] Previous knowledge will be lost!")
+        
+        logger.info(f"TwoStageModel: Training Stage 1 (Binary) on {len(X)} samples...")
+        
+        # --- STAGE 1 PREPARATION ---
+        # Створюємо бінарні мітки: 0 = Benign, 1 = Attack
+        # Важливо обробити випадок, коли y може бути вже закодованим (числа) або рядками
+        # Припускаємо, що benign_label - це мітка нормального трафіку.
+        # Якщо y - числа, треба знати, яке число відповідає Benign.
+        # Але зазвичай в нашому pipeline сюди приходять вже закодовані числа (0=BENIGN).
+        # Тому зробимо припущення: 0 - це завжди нормальний трафік (стандарт LabelEncoder).
+        
+        # Перевірка: якщо benign_label це рядок, а y - числа, то треба бути обережним.
+        # Наш Preprocessor кодує мітки. Зазвичай найпопулярніший клас (BENIGN) отримує код 0 або інший.
+        # Але ми не можемо гарантувати це.
+        # Тому надійніше тренувати на тому, що є, але для чистоти експерименту
+        # краще передавати сюди НЕЗАКОДОВАНІ y, або знати мапінг.
+        
+        # Aле ModelEngine отримує вже закодовані X, y від Preprocessor.
+        # Тому ми будемо вважати: 0 = BENIGN (якщо це так працює в нашому Preprocessor).
+        # Давайте перевіримо: Preprocessor використовує LabelEncoder.
+        # LabelEncoder сортує алфавітно. "BENIGN" < "DDoS". Тобто BENIGN швидше за все не 0?
+        # "BENIGN" vs "Bot". BENIGN йде першим. 
+        # "BENIGN" vs "BruteForce". BENIGN йде першим.
+        # Але краще не гадати. 
+        
+        # --- ВИЗНАЧЕННЯ BENIGN КЛАСУ ---
+        # Явне визначення пріоритетніше за евристику
+        if benign_code is not None:
+            # Explicit benign class/code provided by caller.
+            pass
+        elif isinstance(y.iloc[0] if hasattr(y, 'iloc') else y[0], str):
+            # String labels: try exact match first, then safe case-insensitive fallbacks.
+            if benign_label in y.values:
+                benign_code = benign_label
+            else:
+                lower_map = {str(v).strip().lower(): v for v in np.unique(y)}
+                fallback = lower_map.get(str(benign_label).strip().lower())
                 if fallback is not None:
                     benign_code = fallback
                 elif 'benign' in lower_map:
@@ -159,19 +247,20 @@ class TwoStageModel(BaseEstimator, ClassifierMixin):
                     benign_code = lower_map['normal']
                 else:
                     raise ValueError(
-                        f"Benign label '{benign_label}' not found in y. Available: {np.unique(y)}"
+                        f"У датасеті відсутній клас '{benign_label}' (Нормальний трафік).\n"
+                        f"Для тренування системи виявлення аномалій обов'язково потрібні "
+                        f"як нормальні дані, так і атаки. Знайдено лише: {np.unique(y)}"
                     )
         else:
-            # Numeric labels: try class 0 first, fallback to most frequent class.
+            # Numeric labels: try class 0 first, otherwise raise error.
             unique_vals = np.unique(y)
             if 0 in set(unique_vals.tolist()):
                 benign_code = 0
             else:
-                # P1.5 FIX: auto-detect benign as the most frequent class
-                benign_code = int(pd.Series(y).value_counts().idxmax())
-                logger.warning(
-                    f"[TwoStageModel] No class 0 found. Auto-detected benign_code={benign_code} "
-                    f"(most frequent class). Available: {unique_vals}"
+                raise ValueError(
+                    f"У датасеті відсутній клас '0' (BENIGN/Норма).\n"
+                    f"Для тренування потрібні як мінімум нормальний трафік, так і атаки. "
+                    f"Знайдено класи: {unique_vals}"
                 )
         
         logger.info(f"[TwoStageModel] Benign code set to: '{benign_code}'")

@@ -24,11 +24,11 @@ def render_home_tab(services: dict[str, Any], root_dir: Path):
     
     st.markdown("""
     <div class="section-card">
-        <div class="section-title">Як користуватись системою</div>
-        <div class="info-box">
-            <strong>Крок 1:</strong> Перейдіть до <b>Тренування</b> — завантажте датасет та створіть модель.<br><br>
-            <strong>Крок 2:</strong> Використовуйте <b>Сканування</b> для аналізу мережевого трафіку.<br><br>
-            <strong>Крок 3:</strong> Переглядайте результати в розділі <b>Історія</b>.
+        <div class="section-title">Швидкий старт</div>
+        <div class="info-box" style="line-height: 1.6;">
+            <strong>Крок 1:</strong> Завантажте файл трафіку (<b>CSV</b> або <b>PCAP</b>) у вкладці "Сканування" або "Тренування".<br>
+            <strong>Крок 2:</strong> Натисніть <b>"Навчити модель"</b> (або виберіть вже готову модель зі списку).<br>
+            <strong>Крок 3:</strong> Натисніть <b>"Сканувати"</b> та отримайте детальний <b>PDF звіт</b> з AI-аналізом.
         </div>
     </div>
     """, unsafe_allow_html=True)

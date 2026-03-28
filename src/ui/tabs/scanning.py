@@ -12,9 +12,44 @@ from src.core.feature_registry import FeatureRegistry
 from src.core.preprocessor import Preprocessor
 from src.core.model_engine import ModelEngine
 from src.core.two_stage_model import TwoStageModel
-from src.ui.utils.scan_diagnostics import *
+
 from src.ui.utils.training_helpers import *
 from src.ui.utils.model_helpers import *
+
+import logging
+
+def _batch_predict(predictor_func, X_data, batch_size=5000, prog_text="Аналіз", **kwargs):
+    """
+    Виконує передбачення батчами, щоб уникнути MemoryError на великих датасетах.
+    """
+    import streamlit as st
+    import numpy as np
+    preds = []
+    total = len(X_data)
+    
+    if total <= batch_size:
+        return np.asarray(predictor_func(X_data, **kwargs))
+        
+    prog_bar = st.progress(0, text=f"{prog_text}: 0 / {total}")
+    for i in range(0, total, batch_size):
+        end = min(i + batch_size, total)
+        chunk = getattr(X_data, 'iloc', X_data)[i:end] if hasattr(X_data, 'iloc') else X_data[i:end]
+        
+        res = predictor_func(chunk, **kwargs)
+        
+        # Unpack if necessary
+        if hasattr(res, 'values'):
+            res = res.values
+        elif isinstance(res, list):
+            pass
+            
+        preds.extend(res)
+        prog_bar.progress(end / total, text=f"{prog_text}: {end:,} / {total:,}")
+        
+    prog_bar.empty()
+    return np.array(preds)
+
+logger = logging.getLogger(__name__)
 
 from src.ui.core_state import (
     clear_session_memory,
@@ -944,7 +979,9 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                     ood_from_benign_mask = None
                     try:
                         if is_two_stage:
-                            predictions = model.predict(X, threshold=selected_two_stage_threshold)
+                            predictions = _batch_predict(
+                                model.predict, X, batch_size=10000, prog_text="Two-Stage Класифікація", threshold=selected_two_stage_threshold
+                            )
                             st.caption(
                                 "Використано Two-Stage Detection "
                                 f"(Профіль: {selected_two_stage_profile_label}, "
@@ -957,7 +994,9 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                                 base_attack_rate = float(np.mean(np.asarray(predictions) != benign_code))
                                 if file_ext in TABULAR_EXTENSIONS and base_attack_rate < 0.001:
                                     attack_idx = getattr(model, 'attack_idx_', 1)
-                                    binary_probas = model.binary_model.predict_proba(X)
+                                    binary_probas = _batch_predict(
+                                        model.binary_model.predict_proba, X, batch_size=10000, prog_text="Оцінка Binary Probas"
+                                    )
                                     if binary_probas.shape[1] > int(attack_idx):
                                         attack_probs = binary_probas[:, int(attack_idx)]
                                         diag_preview_rate = 0.0
@@ -971,7 +1010,9 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                                         )
                                         adaptive_threshold = max(0.08, adaptive_threshold)
                                         if adaptive_threshold + 1e-6 < float(selected_two_stage_threshold):
-                                            alt_predictions = model.predict(X, threshold=adaptive_threshold)
+                                            alt_predictions = _batch_predict(
+                                                model.predict, X, batch_size=10000, prog_text="Адаптивна класифікація", threshold=adaptive_threshold
+                                            )
                                             alt_attack_rate = float(np.mean(np.asarray(alt_predictions) != benign_code))
                                             if 0.001 <= alt_attack_rate <= 0.35:
                                                 predictions = alt_predictions
@@ -994,10 +1035,10 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                                 print(f"[WARN] Two-Stage threshold auto-adjust skipped: {auto_thr_exc}")
                         elif is_isolation_forest:
                             # Use engine.predict() which handles IF correctly with threshold
-                            predictions = engine.predict(X)
+                            predictions = _batch_predict(engine.predict, X, batch_size=10000, prog_text="Anomaly Detection")
 
                             # Get anomaly scores for visualization
-                            scores = model.decision_function(X)
+                            scores = _batch_predict(model.decision_function, X, batch_size=10000, prog_text="Обчислення Anomaly Scores")
                             if len(scores) <= 300000:
                                 st.session_state['anomaly_scores'] = scores.tolist()
                             else:
@@ -1020,7 +1061,7 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                             print(f"[LOG] IF scores: min={scores.min():.4f}, max={scores.max():.4f}, mean={scores.mean():.4f}")
                         else:
                             # Standard classification model
-                            predictions = engine.predict(X)
+                            predictions = _batch_predict(engine.predict, X, batch_size=10000, prog_text="Класифікація (Standard)")
                     except RuntimeError as pred_err:
                         st.error(
                             f"❌ Помилка прогнозування: {pred_err}\n\n"
@@ -1265,6 +1306,17 @@ def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                         total_rows=len(X.index)
                     )
                     result_df = original_df.loc[X.index, selected_columns].copy()
+                    
+                    # P3: Inject preserved context (IPs, Ports) back into UI dataset
+                    if df_context is not None and not df_context.empty:
+                        context_cols = [c for c in ['src_ip', 'dst_ip', 'src_port', 'dst_port', 'protocol'] if c in df_context.columns]
+                        if context_cols:
+                            valid_idx = X.index.intersection(df_context.index)
+                            if len(valid_idx) > 0:
+                                context_data = df_context.loc[valid_idx, context_cols]
+                                for col in context_cols:
+                                    result_df[col] = context_data[col]
+
                     result_df['prediction'] = pd.Series(predictions_decoded, index=X.index).astype(str)
 
                     # ── Збагачення severity та описами з threat_catalog ──

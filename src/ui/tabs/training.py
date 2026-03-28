@@ -1377,6 +1377,13 @@ def render_training_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
 
                 st.info(f"Знайдено {len(df):,} записів та {df['label'].nunique()} типів трафіку")
 
+                with st.expander("📊 Перегляд даних (Dataset Preview)", expanded=False):
+                    st.markdown("**Перші 5 рядків:**")
+                    st.dataframe(df.head(5), use_container_width=True)
+                    if 'label' in df.columns:
+                        st.markdown("**Розподіл класів:**")
+                        st.bar_chart(df['label'].value_counts())
+
                 progress.progress(30)
                 st.info("Обробка та підготовка даних...")
 

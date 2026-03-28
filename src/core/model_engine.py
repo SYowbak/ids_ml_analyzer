@@ -159,8 +159,8 @@ class ModelEngine:
         unique = np.unique(y)
         if len(unique) < 2:
             raise ValueError(
-                f"Для алгоритму '{algorithm}' потрібно щонайменше 2 класи. "
-                f"Зараз знайдено: {unique.tolist()}"
+                f"Для навчання алгоритму '{algorithm}' потрібні мінімум 2 класи "
+                f"(наприклад, BENIGN і ATTACK). Зараз знайдено: {unique.tolist()}"
             )
 
     @staticmethod
@@ -304,7 +304,8 @@ class ModelEngine:
         y: pd.Series,
         algorithm: AlgorithmType = 'Random Forest',
         params: Optional[dict] = None,
-        training_mode: Optional[str] = None
+        training_mode: Optional[str] = None,
+        max_samples: Optional[int] = 100000
     ) -> Any:
         """
         Тренування моделі з заданими параметрами.
@@ -315,18 +316,37 @@ class ModelEngine:
             algorithm: Алгоритм
             params: Додаткові параметри (опціонально)
             training_mode: Режим навчання ('specialized', 'universal', 'transfer')
+            max_samples: Максимальна кількість рядків. Якщо більше, застосовується вибірка.
             
         Returns:
             Навчена модель
         """
         if algorithm not in self.ALGORITHMS:
             raise ValueError(f"Невідомий алгоритм: {algorithm}")
+            
+        if X is None or X.empty:
+            raise ValueError("Датасет ознак порожній (X.empty).")
         
         logger.info(f"[ModelEngine] Algorithm: {algorithm}")
         logger.info(f"[ModelEngine] Training mode: {training_mode}")
         logger.info(f"[ModelEngine] Data shape: {X.shape}")
         
         is_unsupervised = algorithm == 'Isolation Forest'
+
+        if max_samples is not None and len(X) > max_samples:
+            logger.info(f"[ModelEngine] Dataset has {len(X)} rows, using sample of {max_samples} for fast training")
+            if is_unsupervised:
+                X = X.sample(n=max_samples, random_state=42)
+                y = y.loc[X.index]
+            else:
+                from sklearn.model_selection import train_test_split
+                try:
+                    X, _, y, _ = train_test_split(X, y, train_size=max_samples, stratify=y, random_state=42)
+                except ValueError:
+                    # Fallback if stratify fails (e.g., class with 1 sample)
+                    logger.warning("[ModelEngine] Stratified split failed, falling back to random sample")
+                    X = X.sample(n=max_samples, random_state=42)
+                    y = y.loc[X.index]
 
         if is_unsupervised:
             self.model = self._create_base_model(algorithm, params, None)
@@ -534,7 +554,8 @@ class ModelEngine:
         X: pd.DataFrame,
         y: pd.Series,
         config: TrainingConfig,
-        feature_adapter: Optional[FeatureAdapter] = None
+        feature_adapter: Optional[FeatureAdapter] = None,
+        max_samples: Optional[int] = 100000
     ) -> TrainingResult:
         """
         Тренування моделі з використан TrainingConfig.
@@ -574,8 +595,26 @@ class ModelEngine:
             X = X[mask]
             y = y[mask]
             logger.info(f"[ModelEngine] Specialized mode: filtered to {len(y)} samples")
-        
+            
+        if X is None or X.empty:
+            raise ValueError("Датасет ознак порожній (або став порожнім після фільтрації класів).")
+            
+        if max_samples is not None and len(X) > max_samples:
+            logger.info(f"[ModelEngine] Dataset has {len(X)} rows, using sample of {max_samples} for fast training")
+            if config.algorithm == 'Isolation Forest':
+                X = X.sample(n=max_samples, random_state=42)
+                y = y.loc[X.index]
+            else:
+                from sklearn.model_selection import train_test_split
+                try:
+                    X, _, y, _ = train_test_split(X, y, train_size=max_samples, stratify=y, random_state=42)
+                except ValueError:
+                    logger.warning("[ModelEngine] Stratified split failed, falling back to random sample")
+                    X = X.sample(n=max_samples, random_state=42)
+                    y = y.loc[X.index]
+
         # Standard training
+
         result = self._train_standard(X, y, config)
         
         # Обчислюємо час
@@ -844,6 +883,12 @@ class ModelEngine:
         if getattr(self, 'xgboost_label_inverse_', None):
             bundle['xgboost_label_inverse'] = self.xgboost_label_inverse_
 
+        # P2: Preserve TwoStageModel binary_threshold
+        if hasattr(self.model, 'binary_threshold'):
+            if not isinstance(bundle['metadata'], dict):
+                bundle['metadata'] = {}
+            bundle['metadata']['binary_threshold'] = getattr(self.model, 'binary_threshold')
+
         # P2.7: Add uuid suffix to prevent filename collisions
         stem = Path(filename).stem
         suffix = Path(filename).suffix or '.joblib'
@@ -917,6 +962,10 @@ class ModelEngine:
             # P0.2: Restore XGBoost label inverse mapping
             if 'xgboost_label_inverse' in loaded:
                 self.xgboost_label_inverse_ = loaded['xgboost_label_inverse']
+                
+            # P2: Restore TwoStageModel binary_threshold
+            if hasattr(self.model, 'binary_threshold') and isinstance(metadata, dict) and 'binary_threshold' in metadata:
+                self.model.binary_threshold = metadata['binary_threshold']
         else:
             # Старий формат — тільки модель
             self.model = loaded

@@ -82,6 +82,12 @@ class DataLoader:
         """
         ext = os.path.splitext(file_path)[1].lower()
         
+        if not os.path.exists(file_path):
+            raise RuntimeError(
+                f"❌ Файл не знайдено: {file_path}.\n"
+                "Переконайтесь, що файл існує і не був переміщений або видалений."
+            )
+            
         loaders = {
             '.csv': self._load_csv,
             '.pcap': self._load_pcap,
@@ -341,6 +347,20 @@ class DataLoader:
                                     df = full_df.sample(n=max_rows, random_state=42).reset_index(drop=True)
 
             return df
+        except ValueError as e:
+            err_msg = str(e).lower()
+            if "could not convert string to float" in err_msg:
+                logger.error(f"CSV Load Error (Float Conversion): {err_msg}")
+                raise RuntimeError(
+                    "❌ Помилка формату даних: знайдено текст у числовій колонці.\n"
+                    "Перевірте ваш CSV файл. Можливо, він містить кілька блоків із заголовками (headers) "
+                    "чи пошкоджені текстові значення замість чисел."
+                )
+            logger.error(f"CSV Load Error (ValueError): {e}")
+            raise
+        except pd.errors.EmptyDataError:
+            logger.error("CSV Load Error: Empty file")
+            raise RuntimeError("❌ Файл порожній або не містить valid data.")
         except Exception as e:
             logger.error(f"CSV Load Error: {e}")
             raise

@@ -206,6 +206,11 @@ class ReportGenerator:
         if details_df is not None and not details_df.empty:
             story.extend(self._create_threats_table(details_df, styles))
             story.append(Spacer(1, 1*cm))
+            
+            # P3: Add Suspicious IP Report if IP context exists
+            if 'src_ip' in details_df.columns or 'dst_ip' in details_df.columns:
+                story.extend(self._create_suspicious_ips_section(details_df, styles))
+                story.append(Spacer(1, 1*cm))
         
         if ai_analysis:
             story.extend(self._create_ai_section(ai_analysis, styles))

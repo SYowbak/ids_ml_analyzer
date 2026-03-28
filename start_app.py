@@ -43,8 +43,8 @@ def start():
         "--browser.gatherUsageStats", "false"
     ]
     
-    # We use CREATE_NO_WINDOW to keep it clean on Windows
-    process = subprocess.Popen(cmd, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+    # Remove CREATE_NO_WINDOW so the user can see Streamlit logs/tracebacks in the console
+    process = subprocess.Popen(cmd)
     
     print("[2/2] Opening browser...")
     url = "http://localhost:8501"
