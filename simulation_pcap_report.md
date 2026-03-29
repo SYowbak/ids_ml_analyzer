@@ -1,3 +1,0 @@
-# Симуляція PCAP: Навчання та Тестування (Isolation Forest)
-\n### 1. Тренування Baseline (Нормальний трафік)\n- **Датасет**: `Тест_Сканування_Нормальний_трафік.pcap`\n- **Кількість з'єднань (Flows)**: 36\n- **Алгоритм**: Isolation Forest (Unsupervised)
-\n### 2. Тестування Загроз (PCAP files)\n| PCAP Файл | Тип | З'єднань (Flows) | Виявлено Аномалій | Відсоток тривоги |\n| :--- | :--- | :--- | :--- | :--- |\n| `Тест_Сканування_Нормальний_трафік.pcap` | ANOMALY | 40 | 2 | 5.0% |\n| `Public_DNS_Anomaly.pcap` | ANOMALY | 8 | 8 | 100.0% |\n| `Public_Teardrop_DoS_Anomaly.pcap` | ANOMALY | 4 | 2 | 50.0% |

@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 import logging
 import json
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Union, Tuple
 from pathlib import Path
 
 import pandas as pd
@@ -76,7 +76,7 @@ class DataLoader:
         multiclass: bool = False,
         align_to_schema: bool = True,
         preserve_context: bool = False
-    ):
+    ) -> Union[pd.DataFrame, Tuple[pd.DataFrame, pd.DataFrame]]:
         """
         Loads file and runs the Unified Pipeline.
         """
@@ -309,7 +309,8 @@ class DataLoader:
                                     break
                                 if scanned >= scan_budget:
                                     break
-                        except Exception:
+                        except Exception as e:
+                            logger.warning(f"Label scan error during chunk reading: {e}")
                             mixed_detected = False
 
                         if mixed_detected:
@@ -362,10 +363,10 @@ class DataLoader:
             logger.error("CSV Load Error: Empty file")
             raise RuntimeError("❌ Файл порожній або не містить valid data.")
         except Exception as e:
-            logger.error(f"CSV Load Error: {e}")
-            raise
+            logger.error(f"CSV Load Error (Unexpected): {e}")
+            raise RuntimeError(f"❌ Помилка завантаження CSV: {e}") from e
 
-    def _load_pcap(self, file_path: str, max_packets: Optional[int] = 10000, streaming: bool = False, batch_size: int = 1000) -> pd.DataFrame:
+    def _load_pcap(self, file_path: str, max_packets: Optional[int] = 10000) -> pd.DataFrame:
         """
         Converts PCAP to DataFrame with FULL feature extraction for ML model compatibility.
         Computes all CIC-IDS-like features including:
@@ -380,9 +381,6 @@ class DataLoader:
             count = 0
             FLOW_TIMEOUT = 120.0
             
-            # Track packet timestamps for IAT calculation
-            first_timestamp = None
-            
             with PcapReader(file_path) as pcap:
                 for pkt in pcap:
                     if max_packets and count >= max_packets:
@@ -396,10 +394,6 @@ class DataLoader:
                     proto = pkt[IP].proto
                     length = len(pkt)
                     timestamp = float(pkt.time)
-                    
-                    # Initialize first timestamp
-                    if first_timestamp is None:
-                        first_timestamp = timestamp
                     
                     sport = 0
                     dport = 0
@@ -617,9 +611,6 @@ class DataLoader:
             
         except Exception as e:
             logger.error(f"PCAP Error: {e}")
-            raise ValueError(f"PCAP processing failed: {e}")
-
-    # No need for detect_dataset_type here as it's extracted to DatasetDetector
-
+            raise ValueError(f"PCAP processing failed: {e}") from e
 
 

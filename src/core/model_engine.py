@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 import logging
 import time
-from typing import Optional, Literal, Any, Dict
+from typing import Optional, Literal, Any, Dict, Callable
 from pathlib import Path
 
 import pandas as pd
@@ -39,11 +39,8 @@ try:
     from xgboost import XGBClassifier
     XGBOOST_AVAILABLE = True
 except ImportError:
-    XGBoostClassifier = None
+    XGBClassifier = None
     XGBOOST_AVAILABLE = False
-    import logging
-    logger = logging.getLogger(__name__)
-    logger.warning("XGBoost не встановлено. Використовуйте: pip install xgboost")
 
 # Логування
 logger = logging.getLogger(__name__)
@@ -238,7 +235,7 @@ class ModelEngine:
         algorithm: AlgorithmType = 'Random Forest',
         search_type: SearchType = 'grid',
         fast: bool = False,
-        progress_callback: Optional[callable] = None
+        progress_callback: Optional[Callable[[str], None]] = None
     ) -> tuple[Any, dict]:
         """
         Автоматичний підбір гіперпараметрів.

@@ -7,18 +7,16 @@ import traceback
 from pathlib import Path
 from datetime import datetime
 from typing import Any
-from src.core.data_loader import DataLoader
-from src.core.feature_registry import FeatureRegistry
-from src.core.preprocessor import Preprocessor
-from src.core.model_engine import ModelEngine
-from src.core.two_stage_model import TwoStageModel
-from src.ui.utils.scan_diagnostics import *
-from src.ui.utils.training_helpers import *
-from src.ui.utils.model_helpers import *
 
-from sklearn.model_selection import train_test_split
 from src.ui.core_state import clear_session_memory
 
+# Core ML imports
+from src.core.model_engine import ModelEngine
+
+# Service imports (for Smart Training)
+from src.services.training_service import TrainingService
+
+# Expert mode imports (lazy import pattern - only used in Expert Mode)
 from src.ui.utils.training_helpers import (
     _find_training_ready_files,
     _resolve_normal_label_ids,
@@ -34,6 +32,7 @@ from src.ui.utils.model_helpers import (
     _resolve_two_stage_profile_threshold,
     detect_scan_file_family_info
 )
+
 
 def render_training_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI: dict, BENIGN_LABEL_TOKENS: list, PCAP_EXTENSIONS: set, TABULAR_EXTENSIONS: set, SUPPORTED_SCAN_EXTENSIONS: set, DEFAULT_SENSITIVITY_THRESHOLD: float, DEFAULT_IF_CONTAMINATION: float, DEFAULT_IF_TARGET_FP_RATE: float, DEFAULT_TWO_STAGE_PROFILE: str) -> None:
     if 'training_in_progress' not in st.session_state:
@@ -60,7 +59,7 @@ def render_training_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
                     'Precision': f"{m.get('precision', 0):.3f}",
                     'Recall': f"{m.get('recall', 0):.3f}",
                     'F1': f"{m.get('f1', 0):.3f}",
-                    'Статус': '✓ Переможець' if algo_name == best_algo else ''
+                    'Статус': 'Переможець' if algo_name == best_algo else ''
                 })
             st.markdown("**Порівняння алгоритмів (Smart Training):**")
             st.dataframe(_pd_st.DataFrame(rows), hide_index=True, use_container_width=True)
@@ -206,337 +205,73 @@ def render_training_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI
             smart_logs.append(message)
             smart_log_container.code('\n'.join(smart_logs), language='text')
 
+        def update_progress(pct: int) -> None:
+            progress.progress(pct)
+
         try:
-            from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-
-            rows_per_file = 25000 if smart_quick_mode else 50000
-            smart_log(f"Режим: {'Швидкий' if smart_quick_mode else 'Повний'} (до {rows_per_file:,} рядків/файл)")
-            progress.progress(8)
-
-            loader = DataLoader()
+            # Find training files
             all_ready_files, normal_files, attack_files, pcap_files = _find_training_ready_files()
             if not all_ready_files:
                 st.error("У datasets/Training_Ready не знайдено файлів для розумного тренування.")
                 st.stop()
 
-            smart_log(f"Знайдено Training_Ready файлів: {len(all_ready_files)}")
-            smart_log(f"Нормальних: {len(normal_files)}, атакуючих: {len(attack_files)}")
+            # Execute smart training via service
+            training_service = TrainingService(
+                models_dir=ROOT_DIR / 'models',
+                default_sensitivity_threshold=DEFAULT_SENSITIVITY_THRESHOLD,
+                default_if_contamination=DEFAULT_IF_CONTAMINATION,
+                default_if_target_fp_rate=DEFAULT_IF_TARGET_FP_RATE,
+                default_two_stage_profile=DEFAULT_TWO_STAGE_PROFILE
+            )
 
-            # 1) TABULAR MODEL (Two-Stage, авто-вибір алгоритму)
-            progress.progress(15)
-            smart_log("Крок 1/2: Формуємо універсальну tabular-модель (Two-Stage, авто-вибір алгоритму)...")
+            result = training_service.smart_train(
+                ready_files=all_ready_files,
+                normal_files=normal_files,
+                attack_files=attack_files,
+                pcap_files=pcap_files,
+                quick_mode=smart_quick_mode,
+                log_callback=smart_log,
+                progress_callback=update_progress,
+                tabular_extensions=TABULAR_EXTENSIONS,
+                supported_scan_extensions=SUPPORTED_SCAN_EXTENSIONS
+            )
 
-            tabular_candidates = list(dict.fromkeys(normal_files[:2] + attack_files[:4]))
-            if not tabular_candidates:
-                tabular_candidates = all_ready_files[:4]
-
-            dfs_tab: list[pd.DataFrame] = []
-            for file_path in tabular_candidates:
-                try:
-                    df_part = loader.load_file(str(file_path), max_rows=rows_per_file, multiclass=True)
-                    if 'label' in df_part.columns:
-                        dfs_tab.append(df_part)
-                        smart_log(f"+ {file_path.name}: {len(df_part):,} рядків")
-                except Exception as exc:
-                    smart_log(f"! Пропущено {file_path.name}: {exc}")
-
-            if not dfs_tab:
-                st.error("Не вдалося зібрати датасети для tabular-моделі.")
-                st.stop()
-
-            df_tab = pd.concat(dfs_tab, ignore_index=True)
-
-            # *** ANTI-LEAKAGE: split raw DataFrame FIRST, then fit preprocessor only on train ***
-            from sklearn.model_selection import train_test_split as _tts_smart
-            # Stratify on the raw label column to preserve class balance
-            label_raw_tab = df_tab['label'].astype(str).str.strip().str.lower()
-            tab_split_ok = label_raw_tab.nunique() >= 2 and label_raw_tab.value_counts().min() >= 2
-            if tab_split_ok:
-                df_tab_train, df_tab_test = _tts_smart(
-                    df_tab, test_size=0.2, random_state=42,
-                    stratify=label_raw_tab
-                )
-            else:
-                df_tab_train, df_tab_test = _tts_smart(df_tab, test_size=0.2, random_state=42)
-
-            preprocessor_tab = Preprocessor(enable_scaling=False)
-            X_train_tab, y_train_tab = preprocessor_tab.fit_transform(df_tab_train, target_col='label')
-            X_test_tab = preprocessor_tab.transform(df_tab_test.drop(columns=['label'], errors='ignore'))
-            # Encode test labels with the already-fitted target_encoder
-            y_test_tab_raw = df_tab_test['label'].astype(str).str.strip()
-            try:
-                y_test_tab = pd.Series(
-                    preprocessor_tab.target_encoder.transform(y_test_tab_raw),
-                    index=df_tab_test.index
-                )
-            except Exception:
-                # fallback: keep rows whose label is known
-                known_mask = y_test_tab_raw.isin(preprocessor_tab.target_encoder.classes_)
-                X_test_tab = X_test_tab[known_mask]
-                y_test_tab = pd.Series(
-                    preprocessor_tab.target_encoder.transform(y_test_tab_raw[known_mask]),
-                    index=df_tab_test.index[known_mask]
-                )
-            smart_log(f"[Anti-leakage] Preprocessor fitted ONLY on train split ({len(X_train_tab):,} rows). Test: {len(X_test_tab):,} rows.")
-
-            # Clean rare classes from TRAIN only
-            min_samples = 5
-            rare_classes = y_train_tab.value_counts()[y_train_tab.value_counts() < min_samples].index.tolist()
-            if rare_classes:
-                mask_tr = ~y_train_tab.isin(rare_classes)
-                X_train_tab = X_train_tab[mask_tr]
-                y_train_tab = y_train_tab[mask_tr]
-                # Also clean test of labels not seen in train
-                mask_te = ~y_test_tab.isin(rare_classes)
-                X_test_tab = X_test_tab[mask_te]
-                y_test_tab = y_test_tab[mask_te]
-
-            tab_model_created = False
-            tab_best_algo: str | None = None
-            tab_best_metrics: dict[str, float] = {'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0}
-            tab_threshold_info: dict[str, Any] = {
-                'threshold': float(DEFAULT_SENSITIVITY_THRESHOLD),
-                'f1_attack': 0.0,
-                'f3_attack': 0.0,
-                'precision_attack': 0.0,
-                'recall_attack': 0.0,
-                'evaluated_points': 0,
-                'objective': 0.0,
-            }
-            tab_model_benchmarks: dict[str, dict[str, float]] = {}
-            engine_tab = ModelEngine(models_dir=str(ROOT_DIR / 'models'))
-
-            if y_train_tab.nunique() >= 2:
-
-                candidate_algorithms: list[str] = ['Random Forest']
-                if 'XGBoost' in ModelEngine.ALGORITHMS:
-                    candidate_algorithms.append('XGBoost')
-
-                best_f1 = -1.0
-                best_model: TwoStageModel | None = None
-
-                for algo in candidate_algorithms:
-                    smart_log(f"Спроба Two-Stage моделі на базі {algo}...")
-                    binary_base = engine_tab._create_base_model(algo)
-                    multiclass_base = engine_tab._create_base_model(algo)
-                    local_model = TwoStageModel(binary_model=binary_base, multiclass_model=multiclass_base)
-
-                    normal_ids_tab = _resolve_normal_label_ids(preprocessor_tab.get_label_map())
-                    local_model.fit(X_train_tab, y_train_tab, benign_code=normal_ids_tab[0])
-
-                    local_threshold_info = _calibrate_two_stage_threshold(
-                        local_model,
-                        X_test_tab,
-                        y_test_tab,
-                        benign_code=normal_ids_tab[0]
+            if result.error:
+                st.error(f"Помилка тренування: {result.error}")
+            elif result.success:
+                # Build success message
+                if result.tabular_model_created and result.if_model_created:
+                    st.success("Розумне тренування завершено. Створено дві моделі для табличного трафіку та PCAP.")
+                    st.session_state['training_flash_message'] = (
+                        f"Додано моделі: {result.tabular_model_name}, {result.if_model_name}."
                     )
-                    y_pred_tab = local_model.predict(X_test_tab, threshold=float(local_threshold_info['threshold']))
-                    local_metrics = {
-                        'accuracy': float(accuracy_score(y_test_tab, y_pred_tab)),
-                        'precision': float(precision_score(y_test_tab, y_pred_tab, average='weighted', zero_division=0)),
-                        'recall': float(recall_score(y_test_tab, y_pred_tab, average='weighted', zero_division=0)),
-                        'f1': float(f1_score(y_test_tab, y_pred_tab, average='weighted', zero_division=0)),
-                    }
-                    tab_model_benchmarks[algo] = local_metrics
-
-                    smart_log(
-                        f"{algo}: F1={local_metrics['f1']:.3f}, "
-                        f"Accuracy={local_metrics['accuracy']:.3f}, "
-                        f"Threshold={float(local_threshold_info['threshold']):.2f}"
-                    )
-
-                    if local_metrics['f1'] > best_f1:
-                        best_f1 = local_metrics['f1']
-                        tab_best_algo = algo
-                        tab_best_metrics = local_metrics
-                        tab_threshold_info = local_threshold_info
-                        best_model = local_model
-
-                if best_model is not None and tab_best_algo is not None:
-                    smart_log(f"Обрано найкращий алгоритм для Two-Stage: {tab_best_algo}")
-                    smart_log(
-                        "Two-Stage авто-поріг: "
-                        f"{float(tab_threshold_info['threshold']):.2f} "
-                        f"(F1_attack={float(tab_threshold_info['f1_attack']):.3f}, "
-                        f"F3_attack={float(tab_threshold_info.get('f3_attack', 0.0)):.3f}, "
-                        f"Recall_attack={float(tab_threshold_info['recall_attack']):.3f})"
-                    )
-                    engine_tab.model = best_model
-                    engine_tab.algorithm_name = f"Two-Stage ({tab_best_algo})"
-                    tab_model_created = True
-                else:
-                    smart_log("! Не вдалося стабільно підібрати Two-Stage модель. Створено лише IF-модель.")
-            else:
-                smart_log("! Недостатньо класів для Two-Stage. Створено лише IF-модель.")
-            timestamp = datetime.now().strftime("%H%M%S_%d%m%Y")
-            smart_tab_model_name = f"ids_model_smart_tabular_{timestamp}.joblib"
-            if tab_model_created:
-                engine_tab.save_model(
-                    smart_tab_model_name,
-                    preprocessor=preprocessor_tab,
-                    metadata={
-                        'algorithm': tab_best_algo or 'Random Forest',
-                        'model_type': 'classification',
-                        'training_strategy': 'Smart Auto',
-                        'two_stage_mode': True,
-                        'turbo_mode': True,
-                        'smart_autotrain': True,
-                        'two_stage_threshold_default': float(tab_threshold_info['threshold']),
-                        'two_stage_profile_default': DEFAULT_TWO_STAGE_PROFILE,
-                        'two_stage_threshold_strict': _resolve_two_stage_profile_threshold(
-                            float(tab_threshold_info['threshold']),
-                            "strict"
-                        ),
-                        'two_stage_threshold_calibration': {
-                            'f1_attack': float(tab_threshold_info.get('f1_attack', 0.0)),
-                            'f3_attack': float(tab_threshold_info.get('f3_attack', 0.0)),
-                            'precision_attack': float(tab_threshold_info.get('precision_attack', 0.0)),
-                            'recall_attack': float(tab_threshold_info.get('recall_attack', 0.0)),
-                            'evaluated_points': int(tab_threshold_info.get('evaluated_points', 0)),
-                            'objective': float(tab_threshold_info.get('objective', 0.0)),
-                        },
-                        'model_benchmarks': tab_model_benchmarks,
-                        'compatible_file_types': sorted(TABULAR_EXTENSIONS),
-                        'description': 'Smart one-click Two-Stage model for CSV/NF'
-                    }
-                )
-                smart_log(f"Збережено tabular-модель: {smart_tab_model_name}")
-            progress.progress(55)
-
-            # 2) PCAP MODEL (Isolation Forest + auto calibration)
-            smart_log("Крок 2/2: Формуємо PCAP anomaly-модель (Isolation Forest)...")
-            if_source_files = pcap_files[:2] if pcap_files else []
-            dfs_if: list[pd.DataFrame] = []
-            
-            if not if_source_files:
-                smart_log("! Не знайдено доречних PCAP-файлів у Training_Ready.")
-            
-            for file_path in if_source_files:
-                try:
-                    df_part = loader.load_file(str(file_path), max_rows=rows_per_file, multiclass=False)
-                    if 'label' not in df_part.columns:
-                        df_part['label'] = 'BENIGN'
-                    dfs_if.append(df_part)
-                except Exception as exc:
-                    smart_log(f"! IF source skip {file_path.name}: {exc}")
-
-            if not dfs_if:
-                smart_log("! Тренування PCAP-моделі скасовано. Бракує даних.")
-                progress.progress(100)
-                if tab_model_created:
+                elif result.tabular_model_created:
                     st.success("Розумне тренування завершено (тільки для табличного трафіку).")
-                    st.session_state['training_flash_message'] = f"Додано модель: {smart_tab_model_name}."
+                    st.session_state['training_flash_message'] = f"Додано модель: {result.tabular_model_name}."
+                elif result.if_model_created:
+                    st.success("Розумне тренування завершено. Створено IF-модель для PCAP/аномалій.")
+                    st.session_state['training_flash_message'] = f"Додано модель: {result.if_model_name}."
+
+                # Persist results for comparison table
+                if result.tabular_model_created:
                     st.session_state['smart_training_results'] = {
-                        'benchmarks': dict(tab_model_benchmarks),
-                        'best_metrics': dict(tab_best_metrics),
-                        'best_algo': str(tab_best_algo or ''),
+                        'benchmarks': dict(result.tabular_benchmarks),
+                        'best_metrics': dict(result.tabular_metrics),
+                        'best_algo': str(result.best_algo or ''),
                     }
-                    st.rerun()
                 else:
-                    st.error("Не вдалося створити жодну модель.")
-                    st.stop()
+                    st.session_state.pop('smart_training_results', None)
 
-            df_if = pd.concat(dfs_if, ignore_index=True)
-            preprocessor_if = Preprocessor(enable_scaling=False)
-            X_if, y_if = preprocessor_if.fit_transform(df_if, target_col='label')
-            normal_ids_if = _resolve_normal_label_ids(preprocessor_if.get_label_map())
-            normal_mask_if = y_if.isin(normal_ids_if)
-            X_if_normal = X_if[normal_mask_if]
-
-            if len(X_if_normal) < 10:
-                st.error("Недостатньо нормального трафіку для розумного IF-тренування.")
-                st.stop()
-
-            engine_if = ModelEngine(models_dir=str(ROOT_DIR / 'models'))
-            model_if = engine_if.train(
-                X_if_normal,
-                y_if[normal_mask_if],
-                algorithm='Isolation Forest',
-                params={
-                    'n_estimators': 120 if smart_quick_mode else 180,
-                    'contamination': float(DEFAULT_IF_CONTAMINATION),
-                    'random_state': 42,
-                    'n_jobs': 1
-                }
-            )
-
-            # Try supervised calibration from external attack-labeled files.
-            X_calib_if, y_attack_if = _load_if_external_calibration(
-                loader=loader,
-                preprocessor=preprocessor_if,
-                exclude_path=if_source_files[0] if if_source_files else None
-            )
-
-            if X_calib_if is not None and y_attack_if is not None and int(np.sum(y_attack_if == 1)) > 0:
-                calib_info = engine_if.auto_calibrate_isolation_threshold(
-                    X_calib_if,
-                    y_attack_binary=y_attack_if,
-                    target_fp_rate=float(DEFAULT_IF_TARGET_FP_RATE)
-                )
-                smart_log(
-                    f"IF calibration: mode={calib_info.get('mode')}, "
-                    f"threshold={float(calib_info.get('threshold', 0.0)):.4f}"
-                )
-            else:
-                calib_info = engine_if.auto_calibrate_isolation_threshold(
-                    X_if_normal,
-                    y_attack_binary=None,
-                    target_fp_rate=float(DEFAULT_IF_TARGET_FP_RATE)
-                )
-                smart_log("IF calibration: unsupervised fallback")
-
-            smart_if_model_name = f"ids_model_smart_if_{timestamp}.joblib"
-            engine_if.save_model(
-                smart_if_model_name,
-                preprocessor=preprocessor_if,
-                metadata={
-                    'algorithm': 'Isolation Forest',
-                    'model_type': 'anomaly_detection',
-                    'training_strategy': 'Smart Auto',
-                    'two_stage_mode': False,
-                    'turbo_mode': True,
-                    'smart_autotrain': True,
-                    'if_contamination': float(DEFAULT_IF_CONTAMINATION),
-                    'if_auto_calibration': True,
-                    'if_target_fp_rate': float(DEFAULT_IF_TARGET_FP_RATE),
-                    'if_threshold_mode': getattr(engine_if, 'if_threshold_mode_', 'decision_zero'),
-                    'compatible_file_types': sorted(SUPPORTED_SCAN_EXTENSIONS),
-                    'description': 'Smart one-click IF model for PCAP anomaly detection',
-                    'if_calibration': calib_info
-                }
-            )
-            smart_log(f"Збережено IF-модель: {smart_if_model_name}")
-            progress.progress(100)
-
-            if tab_model_created:
-                st.success("Розумне тренування завершено. Створено дві моделі для табличного трафіку та PCAP.")
-                st.session_state['training_flash_message'] = (
-                    f"Розумне тренування завершено. Додано моделі: {smart_tab_model_name}, {smart_if_model_name}."
-                )
-                # Persist benchmark results so the comparison table survives rerun
-                st.session_state['smart_training_results'] = {
-                    'benchmarks': dict(tab_model_benchmarks),
-                    'best_metrics': dict(tab_best_metrics),
-                    'best_algo': str(tab_best_algo or ''),
-                }
+                gc.collect()
                 st.rerun()
             else:
-                st.success("Розумне тренування завершено. Створено IF-модель для PCAP/аномалій.")
-                st.caption(f"Модель: {smart_if_model_name}")
-                st.session_state['training_flash_message'] = (
-                    f"Розумне тренування завершено. Додано модель: {smart_if_model_name}."
-                )
-                st.session_state.pop('smart_training_results', None)
-                st.rerun()
-
-            gc.collect()
+                st.error("Не вдалося створити жодну модель.")
 
         except Exception as exc:
             st.error(
                 "Під час розумного тренування сталася помилка. "
                 "Спробуйте інший датасет або зменшити обсяг даних."
             )
-            # Деталі помилки пишемо в лог, але не показуємо сирий traceback користувачу
             print("[SmartTraining][ERROR]", exc)
             traceback.print_exc()
             gc.collect()

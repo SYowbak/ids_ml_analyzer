@@ -12,7 +12,7 @@ IDS ML Analyzer — Препроцесор Даних
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Optional, Any, Dict, Tuple
 from src.core.feature_registry import FeatureRegistry
 from src.core.feature_adapter import FeatureAdapter, AdaptationStrategy
 
@@ -318,7 +318,7 @@ class Preprocessor:
         """
         return self.feature_adapter
     
-    def validate_data_quality(self, df: pd.DataFrame, raise_on_error: bool = False) -> dict:
+    def validate_data_quality(self, df: pd.DataFrame, raise_on_error: bool = False) -> Dict[str, Any]:
         """
         Validate data quality and return report.
         
@@ -464,13 +464,13 @@ class Preprocessor:
         
         return self.target_encoder.inverse_transform(y_encoded)
     
-    def get_label_map(self) -> dict:
+    def get_label_map(self) -> Dict[int, str]:
         """Повертає словник {числова_мітка: оригінальна_мітка}."""
         if not self._is_fitted:
             return {}
         return dict(enumerate(self.target_encoder.classes_))
         
-    def save(self, path: str):
+    def save(self, path: str) -> None:
         """Збереження препроцесора (wrapper для joblib)."""
         import joblib
         joblib.dump(self, path)

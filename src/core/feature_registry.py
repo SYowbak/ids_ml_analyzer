@@ -93,14 +93,14 @@ class FeatureRegistry:
         'duration': ['flow duration', 'flow_duration', 'dur', 'total_duration', 'flow_dur', 'duration_sec'],
         'protocol': ['proto', 'protocol_type', 'ip_proto'],
         
-        # Packet Counts - with comprehensive aliases
+        # Packet Counts - with comprehensive aliases including CIC-IDS to UNSW/NSL mappings
         'packets_fwd': ['total fwd packets', 'total_fwd_packets', 'tot_pkts', 'src_pkts', 'fwd_packets', 
                         'spkts', 'total_fwd_pkts', 'tot fwd pkts', 'fwd_pkts', 'fwd pkts', 'totfwdpkts'],
         'packets_bwd': ['total backward packets', 'total_backward_packets', 'dst_pkts', 'bwd_packets', 
                         'dpkts', 'total_bwd_pkts', 'tot bwd pkts', 'bwd_pkts', 'bwd pkts', 'totbwdpkts',
                         'total backward pkts'],
         
-        # Bytes / Lengths - comprehensive
+        # Bytes / Lengths - comprehensive including CIC-IDS to UNSW/NSL mappings
         'bytes_fwd': ['total length of fwd packets', 'total_length_of_fwd_packets', 'sbytes', 'src_bytes', 
                       'fwd_bytes', 'totlen_fwd_pkts', 'totlen fwd pkts', 'fwd_bytes_total', 'fwd bytes',
                       'totlenfwdpkts', 'total length of fwd pkts'],
@@ -129,7 +129,7 @@ class FeatureRegistry:
         'bwd_packet_length_std': ['bwd packet length std', 'bwd_pkt_len_std', 'std_bwd_pkt_len',
                                    'bwd pkt len std', 'bwdpktlenstd'],
         
-        # Flow Rates
+        # Flow Rates - including CIC to UNSW rate mapping
         'flow_bytes/s': ['flow bytes/s', 'rate', 'flow_bytes_s', 'flow_byts/s', 'byte rate', 'flowbytess',
                           'flow_bytes_per_s', 'bytes_per_s'],
         'flow_packets/s': ['flow packets/s', 'flow_pkts_s', 'flow_packets_s', 'flow_pkts/s', 'packet rate',
@@ -181,6 +181,19 @@ class FeatureRegistry:
         'fwd_bwd_ratio': ['down/up ratio', 'fwd/bwd ratio', 'down/up', 'downupratio', 'fwd_bwd_pkt_ratio'],
         'packet_rate': ['packet rate', 'packetrate', 'pkt_rate'],
         'byte_rate': ['byte rate', 'byterate', 'byte_rate_s'],
+        
+        # Cross-domain reverse mappings: NSL-KDD features that map from CIC-style PCAP
+        'count': ['total fwd packets', 'total_fwd_packets', 'packets_fwd', 'fwd_pkts', 'spkts'],
+        'src_bytes': ['total length of fwd packets', 'total_length_of_fwd_packets', 'bytes_fwd', 'fwd_bytes', 'sbytes'],
+        'dst_bytes': ['total length of bwd packets', 'total_length_of_bwd_packets', 'bytes_bwd', 'bwd_bytes', 'dbytes'],
+        
+        # Cross-domain reverse mappings: UNSW-NB15 features that map from CIC-style PCAP
+        'spkts': ['total fwd packets', 'total_fwd_packets', 'packets_fwd', 'fwd_pkts', 'count'],
+        'dpkts': ['total backward packets', 'total_backward_packets', 'packets_bwd', 'bwd_pkts'],
+        'sbytes': ['total length of fwd packets', 'total_length_of_fwd_packets', 'bytes_fwd', 'fwd_bytes', 'src_bytes'],
+        'dbytes': ['total length of bwd packets', 'total_length_of_bwd_packets', 'bytes_bwd', 'bwd_bytes', 'dst_bytes'],
+        'dur': ['flow duration', 'flow_duration', 'duration', 'duration_us'],
+        'rate': ['flow bytes/s', 'flow_bytes/s', 'flow_bytes_s', 'byte rate'],
         
         # Label column synonyms
         'label': ['class', 'attack', 'attack_cat', 'type', 'category', 'threat_level', 'Label', 'CLASS']

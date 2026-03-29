@@ -20,6 +20,65 @@ PLOTLY_CONFIG_LIGHT = {
     "staticPlot": True,
 }
 
+# Modern Card-Based Design System
+DASHBOARD_CSS = """
+<style>
+:root {
+    --color-bg: #fafafa;
+    --color-card: #ffffff;
+    --color-text: #1a1a2e;
+    --color-muted: #64748b;
+    --color-border: #e2e8f0;
+    --shadow: 0 1px 3px rgba(0,0,0,0.1);
+    --radius: 12px;
+}
+.card {
+    background: var(--color-card);
+    border-radius: var(--radius);
+    padding: 1.5rem;
+    margin-bottom: 1.5rem;
+    box-shadow: var(--shadow);
+    border: 1px solid var(--color-border);
+}
+.card-header {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+    padding-bottom: 0.75rem;
+    border-bottom: 2px solid var(--color-border);
+}
+.card-icon {
+    width: 40px; height: 40px; border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 1.25rem;
+}
+.card-title { font-size: 1.25rem; font-weight: 700; color: var(--color-text); margin: 0; }
+.card-subtitle { font-size: 0.875rem; color: var(--color-muted); }
+.kpi-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 1.5rem; }
+.kpi-box {
+    background: var(--color-card);
+    border-radius: 10px;
+    padding: 1.25rem;
+    border: 1px solid var(--color-border);
+    box-shadow: var(--shadow);
+    text-align: center;
+}
+.kpi-label { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; color: var(--color-muted); margin-bottom: 0.5rem; }
+.kpi-value { font-size: 1.75rem; font-weight: 800; color: var(--color-text); }
+.kpi-delta { font-size: 0.875rem; font-weight: 600; margin-top: 0.25rem; }
+.severity-badge {
+    display: inline-flex; align-items: center;
+    padding: 0.25rem 0.75rem; border-radius: 999px;
+    font-size: 0.75rem; font-weight: 700; text-transform: uppercase;
+}
+.severity-critical { background: #fef2f2; color: #dc2626; }
+.severity-high { background: #fef2f2; color: #ef4444; }
+.severity-medium { background: #fffbeb; color: #f59e0b; }
+.severity-low { background: #f0fdf4; color: #10b981; }
+</style>
+"""
+
 
 def _style_dataframe(df: pd.DataFrame):
     """Примусово задає світлий стиль для таблиць (щоб текст завжди читався)."""
@@ -421,8 +480,14 @@ def render_comprehensive_dashboard(
     st.markdown("---")
     st.markdown(
         """
-        <div class="section-card">
-            <div class="section-title">Склад трафіку</div>
+        <div class="card">
+            <div class="card-header">
+                <div class="card-icon" style="background: #3b82f615; color: #3b82f6;">📊</div>
+                <div>
+                    <div class="card-title">Склад трафіку</div>
+                    <div class="card-subtitle">Розподіл нормального та підозрілого трафіку</div>
+                </div>
+            </div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -443,8 +508,14 @@ def render_comprehensive_dashboard(
     st.markdown("---")
     st.markdown(
         """
-        <div class="section-card">
-            <div class="section-title">Часова лінія атак</div>
+        <div class="card">
+            <div class="card-header">
+                <div class="card-icon" style="background: #f59e0b15; color: #f59e0b;">📈</div>
+                <div>
+                    <div class="card-title">Часова лінія атак</div>
+                    <div class="card-subtitle">Активність загроз у часі</div>
+                </div>
+            </div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -517,8 +588,14 @@ def render_comprehensive_dashboard(
         st.markdown("---")
         st.markdown(
             """
-            <div class="section-card">
-                <div class="section-title">Деталі виявлених загроз</div>
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-icon" style="background: #8b5cf615; color: #8b5cf6;">🔍</div>
+                    <div>
+                        <div class="card-title">Деталі виявлених загроз</div>
+                        <div class="card-subtitle">Інформація про загрози та рекомендації</div>
+                    </div>
+                </div>
             </div>
             """,
             unsafe_allow_html=True,

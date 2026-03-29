@@ -1,4 +1,0 @@
-Traceback (most recent call last):
-  File "e:\IDS_ML_Analyzer\scripts\simulate_pcap.py", line 55, in run_pcap_simulation
-    model = engine.train(X_train, algorithm='Isolation Forest', unsupervised=True)
-TypeError: ModelEngine.train() got an unexpected keyword argument 'unsupervised'

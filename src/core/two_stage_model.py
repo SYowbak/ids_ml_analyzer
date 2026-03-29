@@ -166,15 +166,10 @@ class TwoStageModel(BaseEstimator, ClassifierMixin):
                 elif 'normal' in lower_map:
                     benign_code = lower_map['normal']
                 else:
-                    if y.nunique() < 2:
-                        raise ValueError(
-                            "Для тренування Two-Stage обов'язково потрібні як нормальні дані, так і атаки "
-                            f"(знайдено лише один клас: {np.unique(y)})."
-                        )
-                    benign_code = pd.Series(y).value_counts().idxmax()
-                    logger.warning(
-                        "[TwoStageModel] No benign token matched; using most frequent label as benign: %s",
-                        benign_code,
+                    raise ValueError(
+                        f"У датасеті відсутній нормальний трафік (клас '{benign_label}'). "
+                        f"Для навчання Two-Stage обов'язково потрібні як нормальні дані, так і атаки. "
+                        f"Знайдені класи: {np.unique(y)}"
                     )
         else:
             # Numeric labels: prefer 0; if absent, use most frequent class (LabelEncoder edge cases).
@@ -187,10 +182,10 @@ class TwoStageModel(BaseEstimator, ClassifierMixin):
             if 0 in set(unique_vals.tolist()):
                 benign_code = 0
             else:
-                benign_code = int(pd.Series(y).value_counts().idxmax())
-                logger.warning(
-                    "[TwoStageModel] Class 0 absent; using most frequent numeric class as benign: %s",
-                    benign_code,
+                raise ValueError(
+                    "У датасеті відсутній клас '0' (BENIGN). "
+                    f"Для навчання Two-Stage обов'язково потрібні як нормальні дані, так і атаки. "
+                    f"Знайдені класи: {unique_vals}"
                 )
         
         logger.info(f"[TwoStageModel] Benign code set to: '{benign_code}'")
