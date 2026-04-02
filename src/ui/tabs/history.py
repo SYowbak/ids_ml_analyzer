@@ -1,54 +1,37 @@
-import streamlit as st
-import pandas as pd
-from typing import Any
+from __future__ import annotations
+
 from pathlib import Path
+from typing import Any
 
-def render_history_tab(services: dict[str, Any], ROOT_DIR: Path) -> None:
-    history_limit = 200
-    history = services['db'].get_history(limit=history_limit)
-    total_scans = int(services['db'].get_scans_count())
+import pandas as pd
+import streamlit as st
 
+
+def render_history_tab(services: dict[str, Any], root_dir: Path) -> None:
+    del root_dir
+
+    history = services["db"].get_history(limit=200)
     if not history:
-        st.info("Історія сканувань порожня. Виконайте перше сканування у відповідному розділі.")
-    else:
-        df = pd.DataFrame(history)
-        
-        st.markdown(f"""
-        <div class="section-card">
-            <div class="section-title">Статистика сканувань</div>
-        </div>
-        <div class="metric-grid">
-            <div class="metric-card">
-                <div class="metric-value">{total_scans:,}</div>
-                <div class="metric-label">Всього сканувань</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-value">{df['anomalies_count'].sum():,}</div>
-                <div class="metric-label">Виявлено загроз</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-value">{df['risk_score'].mean():.1f}%</div>
-                <div class="metric-label">Середній ризик</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-value">{len(df[df['risk_score'] > 50])}</div>
-                <div class="metric-label">Критичних</div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+        st.info("Історія сканувань ще порожня.")
+        return
 
-        if total_scans > len(df):
-            st.caption(f"Показано останні {len(df):,} записів із {total_scans:,}.")
+    frame = pd.DataFrame(history)
+    metrics_col1, metrics_col2, metrics_col3 = st.columns(3)
+    metrics_col1.metric("Сканувань", int(len(frame)))
+    metrics_col2.metric("Виявлених алертів", int(frame["anomalies_count"].fillna(0).sum()))
+    metrics_col3.metric("Середній ризик", f"{frame['risk_score'].fillna(0).mean():.2f}%")
 
-        st.markdown("<br>", unsafe_allow_html=True)
-        
-        st.markdown("""
-        <div class="section-card">
-            <div class="section-title">Журнал сканувань</div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        display_df = df[['id', 'timestamp', 'filename', 'total_records', 'anomalies_count', 'risk_score', 'model_name']].copy()
-        display_df.columns = ['ID', 'Дата', 'Файл', 'Записів', 'Загроз', 'Ризик %', 'Модель']
-        
-        st.dataframe(display_df, width="stretch", hide_index=True)
+    st.dataframe(
+        frame.rename(
+            columns={
+                "timestamp": "Час",
+                "filename": "Файл",
+                "total_records": "Записів",
+                "anomalies_count": "Алертів",
+                "risk_score": "Ризик %",
+                "model_name": "Модель",
+            }
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )

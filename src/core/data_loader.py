@@ -1,616 +1,478 @@
-
-"""
-IDS ML Analyzer — Універсальний Завантажувач (Unified Pipeline)
-
-Модуль відповідає за:
-- Завантаження CSV/PCAP
-- Виконання Unified Pipeline (Detect -> Map -> Normalize -> Validate -> Align)
-- Підготовку даних для ModelEngine
-"""
-
 from __future__ import annotations
 
-import os
-import logging
-import json
-from typing import Optional, List, Dict, Union, Tuple
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
+import logging
 
-import pandas as pd
 import numpy as np
-from scapy.all import PcapReader, IP, TCP, UDP
+import pandas as pd
+from scapy.all import IP, TCP, UDP, PcapReader  # type: ignore
 
-# Core Modules
 from src.core.dataset_detector import DatasetDetector
-from src.core.feature_mapper import FeatureMapper
-from src.core.protocol_normalizer import ProtocolNormalizer
-from src.core.unit_normalizer import UnitNormalizer
-from src.core.leakage_filter import LeakageFilter
-from src.core.feature_validator import FeatureValidator
-from src.core.feature_aligner import FeatureAligner
-from src.core.label_normalizer import LabelNormalizer
-from src.core.category_encoder import CategoryEncoder
+from src.core.domain_schemas import (
+    DATASET_SCHEMAS,
+    DatasetSchema,
+    get_schema,
+    normalize_column_name,
+    normalize_frame_columns,
+    resolve_target_labels,
+)
 
-# Логування
+
 logger = logging.getLogger(__name__)
+
+
+PCAP_EXTENSIONS = {".pcap", ".pcapng", ".cap"}
+
+
+@dataclass(frozen=True)
+class FileInspection:
+    path: Path
+    input_type: str
+    dataset_type: str
+    analysis_mode: str
+    confidence: float
+
 
 class DataLoader:
     """
-    Unified Data Loader integrating the Expert Grade Pipeline.
+    Строгий завантажувач даних без feature alignment.
+
+    Гарантії:
+    - датасет класифікується лише як CIC-IDS, NSL-KDD або UNSW-NB15;
+    - CSV має містити очікувані для домену ознаки;
+    - PCAP конвертується лише в CIC-IDS-сумісний NIDS feature contract;
+    - жодних zero-padding або змішування різних доменів.
     """
-    
-    def __init__(self, schema_path: str = "src/core/schema_definition.json", verbose_diagnostics: Optional[bool] = None):
+
+    def __init__(self) -> None:
         self.detector = DatasetDetector()
-        self.mapper = FeatureMapper()
-        self.proto_norm = ProtocolNormalizer()
-        self.unit_norm = UnitNormalizer()
-        self.label_norm = LabelNormalizer()
-        self.leakage = LeakageFilter()
-        self.validator = FeatureValidator()
-        self.cat_encoder = CategoryEncoder()
-        self.aligner = FeatureAligner()
-        self.verbose_diagnostics = (
-            (os.getenv("IDS_VERBOSE_DIAGNOSTICS", "0").strip() == "1")
-            if verbose_diagnostics is None else bool(verbose_diagnostics)
+
+    def inspect_file(self, file_path: str | Path) -> FileInspection:
+        path = Path(file_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Файл не знайдено: {path}")
+
+        extension = path.suffix.lower()
+        if extension in PCAP_EXTENSIONS:
+            result = self.detector.detect_path(path)
+            return FileInspection(
+                path=path,
+                input_type="pcap",
+                dataset_type=result.dataset_type,
+                analysis_mode=result.analysis_mode,
+                confidence=result.confidence,
+            )
+
+        if extension != ".csv":
+            raise ValueError("Підтримуються лише CSV та PCAP файли.")
+
+        result = self.detector.detect_path(path)
+        return FileInspection(
+            path=path,
+            input_type="csv",
+            dataset_type=result.dataset_type,
+            analysis_mode=result.analysis_mode,
+            confidence=result.confidence,
         )
-        
-        # Load Schema
-        try:
-            # Абсолютний шлях відносно цього файлу (src/core/) — незалежно від CWD
-            full_path = Path(__file__).parent / "schema_definition.json"
-            if not full_path.exists():
-                # Запасний варіант: відносно кореня проекту
-                full_path = Path(__file__).parent.parent.parent / schema_path
-            with open(full_path, 'r') as f:
-                self.schema = json.load(f)
-                self.schema_features = self.schema["features"]
-        except Exception as e:
-            logger.error(f"Failed to load schema from {schema_path}: {e}")
-            # Fallback trivial schema to prevent crash, though system is degraded
-            self.schema_features = []
 
     def load_file(
-        self, 
-        file_path: str, 
+        self,
+        file_path: str,
         max_rows: Optional[int] = None,
         multiclass: bool = False,
         align_to_schema: bool = True,
-        preserve_context: bool = False
-    ) -> Union[pd.DataFrame, Tuple[pd.DataFrame, pd.DataFrame]]:
-        """
-        Loads file and runs the Unified Pipeline.
-        """
-        ext = os.path.splitext(file_path)[1].lower()
-        
-        if not os.path.exists(file_path):
-            raise RuntimeError(
-                f"❌ Файл не знайдено: {file_path}.\n"
-                "Переконайтесь, що файл існує і не був переміщений або видалений."
+        preserve_context: bool = False,
+        expected_dataset: Optional[str] = None,
+    ) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
+        del multiclass, align_to_schema
+
+        inspection = self.inspect_file(file_path)
+        if inspection.dataset_type == "Unknown":
+            raise ValueError(
+                "Не вдалося визначити домен CSV. Підтримуються лише CIC-IDS, NSL-KDD та UNSW-NB15."
             )
-            
-        loaders = {
-            '.csv': self._load_csv,
-            '.pcap': self._load_pcap,
-            '.pcapng': self._load_pcap,
-            '.cap': self._load_pcap
-        }
-        
-        loader = loaders.get(ext)
-        if not loader:
-            raise ValueError(f"Unsupported file format: {ext}")
-            
-        print(f"[LOG] Loading file: {file_path}")
-        df = loader(file_path, max_rows)
 
-        # P0.1: Capture IP/port/timestamp context BEFORE any pipeline steps.
-        df_context = None
-        if preserve_context:
-            context_column_candidates = [
-                "src_ip", "source_ip", "src ip", "src-ip", "srcaddr", "src_addr", "src",
-                "dst_ip", "destination_ip", "dst ip", "dst-ip", "dstaddr", "dst_addr", "dst",
-                "src_port", "sport", "source_port",
-                "src port", "source port",
-                "dst_port", "dport", "destination_port", "dest_port", "port",
-                "dst port", "destination port",
-                "protocol", "proto",
-                "timestamp", "time", "datetime", "date", "flow_start_time", "flow start time"
-            ]
-            present_context_cols = [c for c in context_column_candidates if c in df.columns]
-            if present_context_cols:
-                df_context = df[present_context_cols].copy()
-                print(f"[LOG] Preserved context columns: {present_context_cols}")
-            else:
-                df_context = pd.DataFrame(index=df.index)
-                print("[LOG] No context columns found to preserve")
+        if expected_dataset and inspection.dataset_type != expected_dataset:
+            raise ValueError(
+                f"Файл належить до домену {inspection.dataset_type}, а очікувався {expected_dataset}."
+            )
 
-        # --- PIPELINE START ---
-        print("[LOG] Starting Unified Pipeline...")
-
-        # DIAGNOSTIC: input snapshot (verbose mode only)
-        if self.verbose_diagnostics:
-            input_features = set(df.columns)
-            print(f"[DIAGNOSTIC] Input features count: {len(input_features)}")
-            print(f"[DIAGNOSTIC] Input features: {sorted(input_features)}")
-        
-        # 1. Detect Type
-        dataset_type = self.detector.detect(df)
-        print(f"[LOG] Detected Dataset Type: {dataset_type}")
-
-        # Force family-specific mode for NSL-KDD/UNSW to preserve rich features.
-        # Unified CIC schema drops most NSL/UNSW columns and hurts detection quality.
-        if align_to_schema and dataset_type in {"NSL-KDD", "UNSW-NB15"}:
-            print(f"[LOG] Family mode forced for {dataset_type}: preserving native feature space.")
-            align_to_schema = False
-        
-        if self.verbose_diagnostics:
-            print(f"[DIAGNOSTIC] Schema required features: {len(self.schema_features)}")
-        
-        # 2. Map Features (Rename to common schema)
-        df = self.mapper.map_features(df, dataset_type)
-        
-        if self.verbose_diagnostics:
-            mapped_features = set(df.columns)
-            print(f"[DIAGNOSTIC] After mapping: {len(mapped_features)} features")
-        
-        # Get schema feature names as set
-        schema_feature_names = {f.get('name') if isinstance(f, dict) else f for f in self.schema_features}
-        schema_feature_names.discard(None)
-        
-        # 2b. Align (Enforce Master Schema structure - Adds missing cols with defaults)
-        # CRITICAL: Must be done BEFORE normalization so that missing columns (e.g. packets_fwd) exist
-        # 2a. UNSW-NB15 attack_cat merge (MUST run before Aligner drops non-schema cols)
-        # The 'label' column in UNSW is binary 0/1; real attack names are in 'attack_cat'.
-        if multiclass and "attack_cat" in df.columns:
-            df = self.label_norm._merge_attack_cat(df)
-
-        if align_to_schema:
-            df = self.aligner.align(df, self.schema_features)
-            
-            # DIAGNOSTIC: After alignment - count of filled zeros
-            aligned_features = set(df.columns)
-            
-            # Get feature names from schema (list of dicts -> set of names)
-            schema_feature_names = {f.get('name') if isinstance(f, dict) else f for f in self.schema_features}
-            schema_feature_names.discard(None)  # Remove any None values
-            
-            missing_from_alignment = schema_feature_names - aligned_features
-            if missing_from_alignment:
-                print(f"[DIAGNOSTIC] WARNING: {len(missing_from_alignment)} features still missing after alignment")
-            elif self.verbose_diagnostics:
-                print(f"[DIAGNOSTIC] All schema features present after alignment")
-        elif self.verbose_diagnostics:
-            print("[DIAGNOSTIC] Schema alignment skipped (family-specific mode)")
-        
-        # 3. Normalize Protocol (if present)
-        if "protocol" in df.columns:
-            df["protocol"] = self.proto_norm.normalize(df["protocol"])
-            
-        # 4. Unit Normalization (Time units)
-        df = self.unit_norm.normalize(df, dataset_type)
-        
-        # 5. Compute Derived Features (MUST be after Unit Norm)
-        df = self.unit_norm.compute_derived(df, self.schema_features)
-        
-        # 5b. Label Normalization (Strings -> 0/1 or Clean Strings)
-        df = self.label_norm.normalize(df, multiclass=multiclass)
-
-        # Leakage Filter (Drop bad columns) — context was already saved above.
-        df = self.leakage.filter(df)
-        
-        # 7. Category Encoding (Strings -> Ints)
-        # Now safe strictly because Aligner has added any missing categorical columns
-        df = self.cat_encoder.encode(df, self.schema_features)
-        
-        # 9. Validate (Fix NaNs, Inf, Min/Max)
-        # In family-specific mode we validate only existing schema columns (don't add missing ones).
-        if align_to_schema:
-            schema_for_validation = self.schema_features
+        if inspection.input_type == "pcap":
+            frame = self._load_pcap(Path(file_path), max_packets=max_rows)
         else:
-            schema_for_validation = [
-                feat for feat in self.schema_features
-                if (isinstance(feat, dict) and feat.get("name") in df.columns)
-                or (isinstance(feat, str) and feat in df.columns)
-            ]
-        df = self.validator.validate(df, schema_for_validation)
-
-        # Post-pipeline coverage diagnostics on schema features (more reliable than pre-derived checks).
-        if align_to_schema:
-            schema_feature_names = [f.get('name') if isinstance(f, dict) else f for f in self.schema_features]
-            schema_feature_names = [str(name) for name in schema_feature_names if name]
-            numeric_schema_cols = [
-                col for col in schema_feature_names
-                if col in df.columns and pd.api.types.is_numeric_dtype(df[col])
-            ]
-            zero_schema_cols = []
-            for col in numeric_schema_cols:
-                series = pd.to_numeric(df[col], errors='coerce').fillna(0)
-                if float(series.abs().sum()) == 0.0:
-                    zero_schema_cols.append(col)
-
-            # Dataset-aware thresholds: CIC should keep richer coverage than NSL/UNSW.
-            expected_min_coverage = {
-                "CIC-IDS": 0.60,
-                "NSL-KDD": 0.10,
-                "UNSW-NB15": 0.18,
-                "Generic": 0.20,
-            }.get(dataset_type, 0.20)
-
-            coverage = 1.0
-            if numeric_schema_cols:
-                coverage = 1.0 - (len(zero_schema_cols) / len(numeric_schema_cols))
-
-            print(
-                f"[LOG] Feature coverage ({dataset_type}): "
-                f"{coverage * 100:.1f}% non-zero schema features"
-            )
-
-            if coverage < expected_min_coverage:
-                print(
-                    f"[DIAGNOSTIC] WARNING: low feature coverage for {dataset_type} "
-                    f"({coverage * 100:.1f}% < {expected_min_coverage * 100:.1f}%)."
-                )
-                if self.verbose_diagnostics and zero_schema_cols:
-                    print(f"[DIAGNOSTIC] Zero schema columns (sample): {zero_schema_cols[:12]}...")
-            elif self.verbose_diagnostics and zero_schema_cols:
-                print(
-                    f"[DIAGNOSTIC] Zero schema columns (expected for cross-family mapping): "
-                    f"{len(zero_schema_cols)}"
-                )
-
-        print(f"[LOG] Pipeline Complete. Output shape: {df.shape}")
-        logger.info(f"Pipeline complete for {file_path}. Type: {dataset_type}")
+            frame = self._load_csv(Path(file_path), inspection.dataset_type, max_rows=max_rows)
 
         if preserve_context:
-            return df, df_context
-        return df
+            context_columns = [col for col in ("src_ip", "dst_ip", "src_port", "destination_port") if col in frame.columns]
+            context = frame[context_columns].copy() if context_columns else pd.DataFrame(index=frame.index)
+            return frame, context
+        return frame
 
-    def _load_csv(self, file_path: str, max_rows: Optional[int] = None) -> pd.DataFrame:
+    def load_training_frame(
+        self,
+        file_path: str | Path,
+        expected_dataset: str,
+        max_rows: Optional[int] = None,
+    ) -> pd.DataFrame:
+        frame = self.load_file(
+            str(file_path),
+            max_rows=max_rows,
+            preserve_context=False,
+            expected_dataset=expected_dataset,
+        )
+        if not isinstance(frame, pd.DataFrame):
+            raise TypeError("Очікувався DataFrame під час завантаження тренувального CSV.")
+        return frame
+
+    def _load_csv(self, path: Path, dataset_type: str, max_rows: Optional[int] = None) -> pd.DataFrame:
+        schema = get_schema(dataset_type)
+        allowed_columns = set(schema.feature_columns) | set(schema.target_aliases)
+
+        def _use_column(column_name: object) -> bool:
+            normalized = normalize_column_name(column_name)
+            return normalized in allowed_columns
+
         try:
-            df = pd.read_csv(file_path, nrows=max_rows, low_memory=False, skipinitialspace=True)
-            # Basic cleanup of column names before pipeline
-            df.columns = df.columns.astype(str).str.strip()
-            
-            # CRITICAL FIX: CIC-IDS2018 contains repeating header rows throughout the CSV.
-            # This causes 'could not convert string to float' errors. 
-            # We must drop rows where the first column's value equals its name.
-            if len(df.columns) > 0:
-                first_col = df.columns[0]
-                df = df[df[first_col] != first_col].copy()
+            frame = pd.read_csv(
+                path,
+                nrows=max_rows,
+                usecols=_use_column,
+                low_memory=False,
+                skipinitialspace=True,
+            )
+        except ValueError as exc:
+            raise ValueError(f"Не вдалося прочитати CSV {path.name}: {exc}") from exc
 
-            # Якщо читаємо лише head(max_rows) і там вийшов 1 клас, це може зламати навчання
-            # (типово для впорядкованих датасетів, де спочатку йде лише normal).
-            if max_rows is not None and len(df) >= max_rows:
-                label_candidates = [c for c in df.columns if c.lower().strip() in {'label', 'labels', 'class', 'attack_cat'}]
-                if label_candidates:
-                    label_col = label_candidates[0]
-                    preview_unique = df[label_col].astype(str).str.strip().nunique(dropna=True)
+        frame = normalize_frame_columns(frame)
+        frame = self._drop_repeated_header_rows(frame)
+        self._validate_domain_columns(frame, schema, path.name)
 
-                    if preview_unique <= 1:
-                        # PERFORMANCE: у більшості "атака/норма" файлів класи і так однорідні.
-                        # Не читаємо весь CSV одразу (це спричиняло великі витрати RAM/часу).
-                        # Спершу швидко перевіряємо ще кілька чанків.
-                        discovered = set(df[label_col].astype(str).str.strip().tolist())
-                        mixed_detected = False
-                        try:
-                            scan_budget = int(min(max(max_rows * 4, 40000), 200000))
-                            scanned = 0
-                            for chunk in pd.read_csv(
-                                file_path,
-                                usecols=[label_col],
-                                chunksize=20000,
-                                low_memory=False,
-                                skipinitialspace=True
-                            ):
-                                col = chunk[label_col].astype(str).str.strip()
-                                discovered.update(col.unique().tolist())
-                                scanned += len(chunk)
-                                if len(discovered) > 1:
-                                    mixed_detected = True
-                                    break
-                                if scanned >= scan_budget:
-                                    break
-                        except Exception as e:
-                            logger.warning(f"Label scan error during chunk reading: {e}")
-                            mixed_detected = False
+        target = resolve_target_labels(frame, dataset_type)
+        features = frame.loc[:, list(schema.feature_columns)].copy()
+        features["target_label"] = target
+        return features
 
-                        if mixed_detected:
-                            full_df = pd.read_csv(file_path, low_memory=False, skipinitialspace=True)
-                            full_df.columns = full_df.columns.astype(str).str.strip()
-                            if len(full_df.columns) > 0:
-                                first_col_full = full_df.columns[0]
-                                full_df = full_df[full_df[first_col_full] != first_col_full].copy()
+    def _validate_domain_columns(self, frame: pd.DataFrame, schema: DatasetSchema, source_name: str) -> None:
+        missing = [column for column in schema.feature_columns if column not in frame.columns]
+        if missing:
+            preview = ", ".join(missing[:8])
+            raise ValueError(
+                f"{source_name} не відповідає схемі {schema.dataset_type}. "
+                f"Відсутні ознаки: {preview}."
+            )
 
-                            if len(full_df) > max_rows and label_col in full_df.columns:
-                                full_labels = full_df[label_col].astype(str).str.strip()
-                                full_unique = full_labels.nunique(dropna=True)
+    @staticmethod
+    def _drop_repeated_header_rows(frame: pd.DataFrame) -> pd.DataFrame:
+        if frame.empty:
+            return frame
 
-                                if full_unique > 1:
-                                    # Стратифікована вибірка для збереження часток класів.
-                                    sampled_parts = []
-                                    grouped = full_df.groupby(full_labels, sort=False, group_keys=False)
-                                    for _, group in grouped:
-                                        frac = len(group) / max(len(full_df), 1)
-                                        n_take = max(1, int(round(frac * max_rows)))
-                                        sampled_parts.append(group.sample(n=min(n_take, len(group)), random_state=42))
+        first_column = frame.columns[0]
+        mask = frame[first_column].astype(str).str.strip().str.lower() == first_column
+        if mask.any():
+            frame = frame.loc[~mask].copy()
+        return frame.reset_index(drop=True)
 
-                                    sampled_df = pd.concat(sampled_parts, ignore_index=True)
-                                    if len(sampled_df) > max_rows:
-                                        sampled_df = sampled_df.sample(n=max_rows, random_state=42)
-                                    elif len(sampled_df) < max_rows:
-                                        missing = max_rows - len(sampled_df)
-                                        extra_pool = full_df.drop(index=sampled_df.index, errors='ignore')
-                                        if len(extra_pool) > 0:
-                                            extra = extra_pool.sample(n=min(missing, len(extra_pool)), random_state=42)
-                                            sampled_df = pd.concat([sampled_df, extra], ignore_index=True)
+    def _load_pcap(self, path: Path, max_packets: Optional[int] = None) -> pd.DataFrame:
+        flows: dict[tuple[str, str, int, int, int], dict[str, object]] = {}
+        finished_flows: list[dict[str, object]] = []
+        packet_limit = max_packets if max_packets and max_packets > 0 else None
+        packet_count = 0
+        flow_timeout_seconds = 120.0
 
-                                    df = sampled_df.reset_index(drop=True)
-                                else:
-                                    df = full_df.sample(n=max_rows, random_state=42).reset_index(drop=True)
+        with PcapReader(str(path)) as packets:
+            for packet in packets:
+                if packet_limit is not None and packet_count >= packet_limit:
+                    break
 
-            return df
-        except ValueError as e:
-            err_msg = str(e).lower()
-            if "could not convert string to float" in err_msg:
-                logger.error(f"CSV Load Error (Float Conversion): {err_msg}")
-                raise RuntimeError(
-                    "❌ Помилка формату даних: знайдено текст у числовій колонці.\n"
-                    "Перевірте ваш CSV файл. Можливо, він містить кілька блоків із заголовками (headers) "
-                    "чи пошкоджені текстові значення замість чисел."
-                )
-            logger.error(f"CSV Load Error (ValueError): {e}")
-            raise
-        except pd.errors.EmptyDataError:
-            logger.error("CSV Load Error: Empty file")
-            raise RuntimeError("❌ Файл порожній або не містить valid data.")
-        except Exception as e:
-            logger.error(f"CSV Load Error (Unexpected): {e}")
-            raise RuntimeError(f"❌ Помилка завантаження CSV: {e}") from e
+                if IP not in packet:
+                    continue
 
-    def _load_pcap(self, file_path: str, max_packets: Optional[int] = 10000) -> pd.DataFrame:
-        """
-        Converts PCAP to DataFrame with FULL feature extraction for ML model compatibility.
-        Computes all CIC-IDS-like features including:
-        - TCP flags (SYN, ACK, FIN, RST, PSH, URG, CWR, ECE)
-        - Packet length statistics (min, max, mean, std)
-        - IAT (Inter-Arrival Time) statistics
-        - Flow rates (bytes/s, packets/s)
-        """
-        try:
-            flows = {}
-            finished_flows = []
-            count = 0
-            FLOW_TIMEOUT = 120.0
-            
-            with PcapReader(file_path) as pcap:
-                for pkt in pcap:
-                    if max_packets and count >= max_packets:
-                        break
-                    
-                    if IP not in pkt:
-                        continue
-                        
-                    src = pkt[IP].src
-                    dst = pkt[IP].dst
-                    proto = pkt[IP].proto
-                    length = len(pkt)
-                    timestamp = float(pkt.time)
-                    
-                    sport = 0
-                    dport = 0
-                    flags = ''
-                    
-                    if TCP in pkt:
-                        sport = pkt[TCP].sport
-                        dport = pkt[TCP].dport
-                        flags = str(pkt[TCP].flags)
-                    elif UDP in pkt:
-                        sport = pkt[UDP].sport
-                        dport = pkt[UDP].dport
-                        
-                    key = (src, dst, sport, dport, proto)
-                    rev_key = (dst, src, dport, sport, proto)
-                    
+                ip_layer = packet[IP]
+                timestamp = float(packet.time)
+                protocol = int(ip_layer.proto)
+                source_ip = str(ip_layer.src)
+                destination_ip = str(ip_layer.dst)
+                packet_length = int(len(packet))
+
+                source_port = 0
+                destination_port = 0
+                flags = ""
+                header_length = int(getattr(ip_layer, "ihl", 0) or 0) * 4
+                payload_length = max(packet_length - header_length, 0)
+
+                if TCP in packet:
+                    tcp_layer = packet[TCP]
+                    source_port = int(tcp_layer.sport)
+                    destination_port = int(tcp_layer.dport)
+                    flags = str(tcp_layer.flags)
+                    header_length += int(getattr(tcp_layer, "dataofs", 0) or 0) * 4
+                    payload_length = max(packet_length - header_length, 0)
+                elif UDP in packet:
+                    udp_layer = packet[UDP]
+                    source_port = int(udp_layer.sport)
+                    destination_port = int(udp_layer.dport)
+                    header_length += 8
+                    payload_length = max(packet_length - header_length, 0)
+
+                key = (source_ip, destination_ip, source_port, destination_port, protocol)
+                reverse_key = (destination_ip, source_ip, destination_port, source_port, protocol)
+
+                direction = "fwd"
+                active_key = key
+                flow = flows.get(key)
+
+                if flow is None:
+                    flow = flows.get(reverse_key)
+                    if flow is not None:
+                        direction = "bwd"
+                        active_key = reverse_key
+
+                if flow is not None and (timestamp - float(flow["last_time"])) > flow_timeout_seconds:
+                    finished_flows.append(flow)
+                    del flows[active_key]
                     flow = None
-                    is_rev = False
-                    
-                    if key in flows:
-                        flow = flows[key]
-                    elif rev_key in flows:
-                        flow = flows[rev_key]
-                        is_rev = True
-                    
-                    if flow:
-                        if (timestamp - flow['last_time']) > FLOW_TIMEOUT:
-                            finished_flows.append(flow)
-                            if is_rev: del flows[rev_key]
-                            else: del flows[key]
-                            flow = None
-                    
-                    if flow is None:
-                        flow = {
-                            'start_time': timestamp,
-                            'last_time': timestamp,
-                            'first_pkt_time': timestamp,
-                            'prev_time': timestamp,
-                            'fwd_pkts': 0, 'bwd_pkts': 0,
-                            'fwd_bytes': 0, 'bwd_bytes': 0,
-                            'protocol': proto, 'dst_port': dport,
-                            'src_ip': src, 'dst_ip': dst, 'src_port': sport,
-                            # TCP Flags
-                            'flags': {'FIN': 0, 'SYN': 0, 'RST': 0, 'PSH': 0, 'ACK': 0, 'URG': 0, 'CWR': 0, 'ECE': 0},
-                            # Packet length tracking
-                            'fwd_lengths': [], 'bwd_lengths': [],
-                            # IAT tracking
-                            'iat_values': [],
-                            'fwd_iat': [], 'bwd_iat': []
-                        }
-                        flows[key] = flow
-                        direction = 'fwd'
-                    else:
-                        direction = 'bwd' if is_rev else 'fwd'
-                    
-                    # Calculate IAT (inter-arrival time)
-                    iat = timestamp - flow['prev_time']
-                    flow['prev_time'] = timestamp
-                    flow['last_time'] = timestamp
-                    
-                    flow['iat_values'].append(iat)
-                    
-                    if direction == 'fwd':
-                        flow['fwd_iat'].append(iat)
-                    else:
-                        flow['bwd_iat'].append(iat)
-                    
-                    # Process TCP flags
-                    if proto == 6:  # TCP
-                        flag_map = {
-                            'F': 'FIN', 'S': 'SYN', 'R': 'RST', 
-                            'P': 'PSH', 'A': 'ACK', 'U': 'URG',
-                            'E': 'ECE', 'C': 'CWR'
-                        }
-                        for flag_char, flag_name in flag_map.items():
-                            if flag_char in flags:
-                                flow['flags'][flag_name] += 1
-                                
-                    if direction == 'fwd':
-                        flow['fwd_pkts'] += 1
-                        flow['fwd_bytes'] += length
-                        flow['fwd_lengths'].append(length)
-                    else:
-                        flow['bwd_pkts'] += 1
-                        flow['bwd_bytes'] += length
-                        flow['bwd_lengths'].append(length)
-                        
-                    count += 1
-            
-            finished_flows.extend(flows.values())
-            if not finished_flows:
-                raise ValueError(
-                    "PCAP не містить підтримуваного IP-трафіку. Екстракція ознак неможлива."
+                    direction = "fwd"
+                    active_key = key
+
+                if flow is None:
+                    flow = self._new_flow(
+                        source_ip=source_ip,
+                        destination_ip=destination_ip,
+                        source_port=source_port,
+                        destination_port=destination_port,
+                        protocol=protocol,
+                        timestamp=timestamp,
+                    )
+                    flows[key] = flow
+                    active_key = key
+
+                self._update_flow(
+                    flow=flow,
+                    direction=direction,
+                    timestamp=timestamp,
+                    packet_length=packet_length,
+                    header_length=header_length,
+                    payload_length=payload_length,
+                    flags=flags,
                 )
+                flows[active_key] = flow
+                packet_count += 1
 
-            # Convert to DataFrame with ALL CIC-IDS-like columns
-            features_list = []
-            for f in finished_flows:
-                duration = max(f['last_time'] - f['start_time'], 1e-6)
-                duration_us = duration * 1e6  # Convert to microseconds for CIC compatibility
-                
-                # Calculate packet length statistics
-                fwd_lengths = f['fwd_lengths']
-                bwd_lengths = f['bwd_lengths']
-                
-                fwd_len_max = max(fwd_lengths) if fwd_lengths else 0
-                fwd_len_min = min(fwd_lengths) if fwd_lengths else 0
-                fwd_len_mean = sum(fwd_lengths) / len(fwd_lengths) if fwd_lengths else 0
-                fwd_len_std = np.std(fwd_lengths) if len(fwd_lengths) > 1 else 0
-                
-                bwd_len_max = max(bwd_lengths) if bwd_lengths else 0
-                bwd_len_min = min(bwd_lengths) if bwd_lengths else 0
-                bwd_len_mean = sum(bwd_lengths) / len(bwd_lengths) if bwd_lengths else 0
-                bwd_len_std = np.std(bwd_lengths) if len(bwd_lengths) > 1 else 0
-                
-                # Calculate IAT statistics (in microseconds)
-                iat_values = f['iat_values']
-                fwd_iat = f['fwd_iat']
-                bwd_iat = f['bwd_iat']
-                
-                iat_mean = sum(iat_values) / len(iat_values) * 1e6 if iat_values else 0
-                iat_std = np.std(iat_values) * 1e6 if len(iat_values) > 1 else 0
-                
-                flow_iat_mean = iat_mean
-                flow_iat_std = iat_std
-                flow_iat_max = max(iat_values) * 1e6 if iat_values else 0
-                flow_iat_min = min(iat_values) * 1e6 if iat_values else 0
-                
-                fwd_iat_mean = sum(fwd_iat) / len(fwd_iat) * 1e6 if fwd_iat else 0
-                fwd_iat_std = np.std(fwd_iat) * 1e6 if len(fwd_iat) > 1 else 0
-                fwd_iat_max = max(fwd_iat) * 1e6 if fwd_iat else 0
-                fwd_iat_min = min(fwd_iat) * 1e6 if fwd_iat else 0
-                
-                bwd_iat_mean = sum(bwd_iat) / len(bwd_iat) * 1e6 if bwd_iat else 0
-                bwd_iat_std = np.std(bwd_iat) * 1e6 if len(bwd_iat) > 1 else 0
-                bwd_iat_max = max(bwd_iat) * 1e6 if bwd_iat else 0
-                bwd_iat_min = min(bwd_iat) * 1e6 if bwd_iat else 0
-                
-                # Calculate rates
-                total_pkts = f['fwd_pkts'] + f['bwd_pkts']
-                total_bytes = f['fwd_bytes'] + f['bwd_bytes']
-                flow_packets_s = total_pkts / duration if duration > 0 else 0
-                flow_bytes_s = total_bytes / duration if duration > 0 else 0
-                
-                row = {
-                    # Network context (for report IP attribution)
-                    'src_ip': f.get('src_ip', ''),
-                    'dst_ip': f.get('dst_ip', ''),
-                    'src_port': f.get('src_port', 0),
-                    # Core flow info
-                    'flow duration': duration_us,
-                    'total fwd packets': f['fwd_pkts'],
-                    'total backward packets': f['bwd_pkts'],
-                    'total length of fwd packets': f['fwd_bytes'],
-                    'total length of bwd packets': f['bwd_bytes'],
-                    'protocol': f['protocol'],
-                    'destination port': f['dst_port'],
-                    
-                    # TCP Flags (ALL 8 flags now tracked)
-                    'syn flag count': f['flags']['SYN'],
-                    'ack flag count': f['flags']['ACK'],
-                    'fin flag count': f['flags']['FIN'],
-                    'rst flag count': f['flags']['RST'],
-                    'psh flag count': f['flags']['PSH'],
-                    'urg flag count': f['flags']['URG'],
-                    'cwr flag count': f['flags']['CWR'],
-                    'ece flag count': f['flags']['ECE'],
-                    
-                    # Packet Length Statistics
-                    'fwd packet length max': fwd_len_max,
-                    'fwd packet length min': fwd_len_min,
-                    'fwd packet length mean': fwd_len_mean,
-                    'fwd packet length std': fwd_len_std,
-                    'bwd packet length max': bwd_len_max,
-                    'bwd packet length min': bwd_len_min,
-                    'bwd packet length mean': bwd_len_mean,
-                    'bwd packet length std': bwd_len_std,
-                    
-                    # Flow IAT Statistics
-                    'flow iat mean': flow_iat_mean,
-                    'flow iat std': flow_iat_std,
-                    'flow iat max': flow_iat_max,
-                    'flow iat min': flow_iat_min,
-                    
-                    # Forward IAT Statistics
-                    'fwd iat mean': fwd_iat_mean,
-                    'fwd iat std': fwd_iat_std,
-                    'fwd iat max': fwd_iat_max,
-                    'fwd iat min': fwd_iat_min,
-                    
-                    # Backward IAT Statistics
-                    'bwd iat mean': bwd_iat_mean,
-                    'bwd iat std': bwd_iat_std,
-                    'bwd iat max': bwd_iat_max,
-                    'bwd iat min': bwd_iat_min,
-                    
-                    # Rates
-                    'flow packets/s': flow_packets_s,
-                    'flow bytes/s': flow_bytes_s,
-                    
-                    # Additional stats
-                    'avg packet size': total_bytes / total_pkts if total_pkts > 0 else 0,
-                    'packet rate': total_pkts / duration if duration > 0 else 0,
-                    'byte rate': total_bytes / duration if duration > 0 else 0,
-                    'down/up ratio': f['fwd_pkts'] / max(f['bwd_pkts'], 1),
-                }
-                features_list.append(row)
-            
-            # DIAGNOSTIC: Log feature count
-            pcap_features = set(row.keys()) if features_list else set()
-            logger.warning(f"[DIAGNOSTIC] PCAP extracted features count: {len(pcap_features)}")
-            logger.warning(f"[DIAGNOSTIC] PCAP features: {sorted(pcap_features)}")
-            
-            return pd.DataFrame(features_list)
-            
-        except Exception as e:
-            logger.error(f"PCAP Error: {e}")
-            raise ValueError(f"PCAP processing failed: {e}") from e
+        finished_flows.extend(flows.values())
+        if not finished_flows:
+            raise ValueError("PCAP не містить валідних IP-потоків для побудови NIDS ознак.")
 
+        rows = [self._flow_to_row(flow) for flow in finished_flows]
+        frame = pd.DataFrame(rows)
+        schema = DATASET_SCHEMAS["CIC-IDS"]
+        missing = [column for column in schema.feature_columns if column not in frame.columns]
+        if missing:
+            raise ValueError(
+                "Внутрішній PCAP-парсер не побудував повний CIC-IDS контракт ознак: "
+                + ", ".join(missing[:8])
+            )
 
+        frame["target_label"] = "Unknown"
+        return frame
+
+    @staticmethod
+    def _new_flow(
+        source_ip: str,
+        destination_ip: str,
+        source_port: int,
+        destination_port: int,
+        protocol: int,
+        timestamp: float,
+    ) -> dict[str, object]:
+        return {
+            "src_ip": source_ip,
+            "dst_ip": destination_ip,
+            "src_port": source_port,
+            "destination_port": destination_port,
+            "protocol": protocol,
+            "start_time": timestamp,
+            "last_time": timestamp,
+            "prev_time": timestamp,
+            "packet_lengths": [],
+            "iat_values": [],
+            "fwd_iat": [],
+            "bwd_iat": [],
+            "fwd_lengths": [],
+            "bwd_lengths": [],
+            "fwd_bytes": 0,
+            "bwd_bytes": 0,
+            "fwd_packets": 0,
+            "bwd_packets": 0,
+            "fwd_header_bytes": 0,
+            "bwd_header_bytes": 0,
+            "fwd_psh_flags": 0,
+            "bwd_psh_flags": 0,
+            "fwd_urg_flags": 0,
+            "bwd_urg_flags": 0,
+            "fin_flag_count": 0,
+            "syn_flag_count": 0,
+            "rst_flag_count": 0,
+            "psh_flag_count": 0,
+            "ack_flag_count": 0,
+            "urg_flag_count": 0,
+            "cwr_flag_count": 0,
+            "ece_flag_count": 0,
+        }
+
+    @staticmethod
+    def _update_flow(
+        flow: dict[str, object],
+        direction: str,
+        timestamp: float,
+        packet_length: int,
+        header_length: int,
+        payload_length: int,
+        flags: str,
+    ) -> None:
+        iat = timestamp - float(flow["prev_time"])
+        flow["prev_time"] = timestamp
+        flow["last_time"] = timestamp
+
+        feature_length = max(payload_length, 0)
+        packet_lengths = flow["packet_lengths"]
+        iat_values = flow["iat_values"]
+        packet_lengths.append(feature_length)
+        iat_values.append(max(iat, 0.0))
+
+        direction_lengths = flow["fwd_lengths"] if direction == "fwd" else flow["bwd_lengths"]
+        direction_iat = flow["fwd_iat"] if direction == "fwd" else flow["bwd_iat"]
+        direction_lengths.append(feature_length)
+        direction_iat.append(max(iat, 0.0))
+
+        if direction == "fwd":
+            flow["fwd_packets"] = int(flow["fwd_packets"]) + 1
+            flow["fwd_bytes"] = int(flow["fwd_bytes"]) + feature_length
+            flow["fwd_header_bytes"] = int(flow["fwd_header_bytes"]) + header_length
+        else:
+            flow["bwd_packets"] = int(flow["bwd_packets"]) + 1
+            flow["bwd_bytes"] = int(flow["bwd_bytes"]) + feature_length
+            flow["bwd_header_bytes"] = int(flow["bwd_header_bytes"]) + header_length
+
+        if "P" in flags:
+            flow["psh_flag_count"] = int(flow["psh_flag_count"]) + 1
+            if direction == "fwd":
+                flow["fwd_psh_flags"] = int(flow["fwd_psh_flags"]) + 1
+            else:
+                flow["bwd_psh_flags"] = int(flow["bwd_psh_flags"]) + 1
+        if "U" in flags:
+            flow["urg_flag_count"] = int(flow["urg_flag_count"]) + 1
+            if direction == "fwd":
+                flow["fwd_urg_flags"] = int(flow["fwd_urg_flags"]) + 1
+            else:
+                flow["bwd_urg_flags"] = int(flow["bwd_urg_flags"]) + 1
+        if "F" in flags:
+            flow["fin_flag_count"] = int(flow["fin_flag_count"]) + 1
+        if "S" in flags:
+            flow["syn_flag_count"] = int(flow["syn_flag_count"]) + 1
+        if "R" in flags:
+            flow["rst_flag_count"] = int(flow["rst_flag_count"]) + 1
+        if "A" in flags:
+            flow["ack_flag_count"] = int(flow["ack_flag_count"]) + 1
+        if "C" in flags:
+            flow["cwr_flag_count"] = int(flow["cwr_flag_count"]) + 1
+        if "E" in flags:
+            flow["ece_flag_count"] = int(flow["ece_flag_count"]) + 1
+
+        if payload_length > 0 and direction == "fwd":
+            flow["subflow_fwd_bytes"] = int(flow.get("subflow_fwd_bytes", 0)) + feature_length
+        elif payload_length > 0:
+            flow["subflow_bwd_bytes"] = int(flow.get("subflow_bwd_bytes", 0)) + feature_length
+
+    @staticmethod
+    def _series_stats(values: list[float]) -> tuple[float, float, float, float]:
+        if not values:
+            return 0.0, 0.0, 0.0, 0.0
+        array = np.asarray(values, dtype=float)
+        return float(array.mean()), float(array.std(ddof=0)), float(array.max()), float(array.min())
+
+    def _flow_to_row(self, flow: dict[str, object]) -> dict[str, object]:
+        packet_lengths = list(flow["packet_lengths"])
+        fwd_lengths = list(flow["fwd_lengths"])
+        bwd_lengths = list(flow["bwd_lengths"])
+        iat_values = list(flow["iat_values"])
+        fwd_iat = list(flow["fwd_iat"])
+        bwd_iat = list(flow["bwd_iat"])
+
+        duration_seconds = max(float(flow["last_time"]) - float(flow["start_time"]), 1e-6)
+        duration_microseconds = duration_seconds * 1_000_000.0
+        total_packets = int(flow["fwd_packets"]) + int(flow["bwd_packets"])
+        total_bytes = int(flow["fwd_bytes"]) + int(flow["bwd_bytes"])
+
+        fwd_mean, fwd_std, fwd_max, fwd_min = self._series_stats(fwd_lengths)
+        bwd_mean, bwd_std, bwd_max, bwd_min = self._series_stats(bwd_lengths)
+        flow_iat_mean, flow_iat_std, flow_iat_max, flow_iat_min = self._series_stats(iat_values)
+        fwd_iat_mean, fwd_iat_std, fwd_iat_max, fwd_iat_min = self._series_stats(fwd_iat)
+        bwd_iat_mean, bwd_iat_std, bwd_iat_max, bwd_iat_min = self._series_stats(bwd_iat)
+        packet_mean, packet_std, packet_max, packet_min = self._series_stats(packet_lengths)
+
+        return {
+            "src_ip": flow["src_ip"],
+            "dst_ip": flow["dst_ip"],
+            "src_port": int(flow["src_port"]),
+            "destination_port": int(flow["destination_port"]),
+            "flow_duration": duration_microseconds,
+            "total_fwd_packets": int(flow["fwd_packets"]),
+            "total_backward_packets": int(flow["bwd_packets"]),
+            "total_length_of_fwd_packets": int(flow["fwd_bytes"]),
+            "total_length_of_bwd_packets": int(flow["bwd_bytes"]),
+            "fwd_packet_length_max": fwd_max,
+            "fwd_packet_length_min": fwd_min,
+            "fwd_packet_length_mean": fwd_mean,
+            "fwd_packet_length_std": fwd_std,
+            "bwd_packet_length_max": bwd_max,
+            "bwd_packet_length_min": bwd_min,
+            "bwd_packet_length_mean": bwd_mean,
+            "bwd_packet_length_std": bwd_std,
+            "flow_bytes_s": total_bytes / duration_seconds,
+            "flow_packets_s": total_packets / duration_seconds,
+            "flow_iat_mean": flow_iat_mean * 1_000_000.0,
+            "flow_iat_std": flow_iat_std * 1_000_000.0,
+            "flow_iat_max": flow_iat_max * 1_000_000.0,
+            "flow_iat_min": flow_iat_min * 1_000_000.0,
+            "fwd_iat_total": float(np.sum(fwd_iat)) * 1_000_000.0,
+            "fwd_iat_mean": fwd_iat_mean * 1_000_000.0,
+            "fwd_iat_std": fwd_iat_std * 1_000_000.0,
+            "fwd_iat_max": fwd_iat_max * 1_000_000.0,
+            "fwd_iat_min": fwd_iat_min * 1_000_000.0,
+            "bwd_iat_total": float(np.sum(bwd_iat)) * 1_000_000.0,
+            "bwd_iat_mean": bwd_iat_mean * 1_000_000.0,
+            "bwd_iat_std": bwd_iat_std * 1_000_000.0,
+            "bwd_iat_max": bwd_iat_max * 1_000_000.0,
+            "bwd_iat_min": bwd_iat_min * 1_000_000.0,
+            "fwd_psh_flags": int(flow["fwd_psh_flags"]),
+            "bwd_psh_flags": int(flow["bwd_psh_flags"]),
+            "fwd_urg_flags": int(flow["fwd_urg_flags"]),
+            "bwd_urg_flags": int(flow["bwd_urg_flags"]),
+            "fwd_packets_s": int(flow["fwd_packets"]) / duration_seconds,
+            "bwd_packets_s": int(flow["bwd_packets"]) / duration_seconds,
+            "min_packet_length": packet_min,
+            "max_packet_length": packet_max,
+            "packet_length_mean": packet_mean,
+            "packet_length_std": packet_std,
+            "packet_length_variance": float(np.var(packet_lengths)) if packet_lengths else 0.0,
+            "fin_flag_count": int(flow["fin_flag_count"]),
+            "syn_flag_count": int(flow["syn_flag_count"]),
+            "rst_flag_count": int(flow["rst_flag_count"]),
+            "psh_flag_count": int(flow["psh_flag_count"]),
+            "ack_flag_count": int(flow["ack_flag_count"]),
+            "urg_flag_count": int(flow["urg_flag_count"]),
+            "cwr_flag_count": int(flow["cwr_flag_count"]),
+            "ece_flag_count": int(flow["ece_flag_count"]),
+            "down_up_ratio": int(flow["total_fwd_packets"]) / max(int(flow["bwd_packets"]), 1)
+            if "total_fwd_packets" in flow
+            else int(flow["fwd_packets"]) / max(int(flow["bwd_packets"]), 1),
+            "average_packet_size": total_bytes / max(total_packets, 1),
+            "avg_fwd_segment_size": fwd_mean,
+            "avg_bwd_segment_size": bwd_mean,
+            "subflow_fwd_packets": int(flow["fwd_packets"]),
+            "subflow_fwd_bytes": int(flow["fwd_bytes"]),
+            "subflow_bwd_packets": int(flow["bwd_packets"]),
+            "subflow_bwd_bytes": int(flow["bwd_bytes"]),
+        }

@@ -1,809 +1,474 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import time
-import gc
+from __future__ import annotations
+
 from pathlib import Path
-from datetime import datetime
 from typing import Any
+import time
+import uuid
 
-from src.services.scanning_service import ScanningService
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import streamlit as st
 
-from src.ui.utils.model_helpers import (
-    _infer_dataset_family_name,
-    _normalize_compatible_types,
-    _resolve_two_stage_profile_threshold,
-    _clamp_two_stage_threshold,
-    _normalize_two_stage_profile,
-    _threshold_to_sensitivity_level,
-    _sensitivity_level_to_threshold,
-    load_model_manifest,
-    detect_scan_file_family_info,
-    resolve_auto_model,
-    get_manifest_for_model
-)
-
-import logging
-
-logger = logging.getLogger(__name__)
-
-from src.ui.core_state import (
-    clear_session_memory,
-    DEFAULT_SENSITIVITY_LEVEL,
-    TWO_STAGE_PROFILE_RULES,
-    TWO_STAGE_PROFILE_ORDER
-)
-from src.ui.scan_renderer import render_comprehensive_dashboard
-from src.services.threat_catalog import (
-    get_threat_info, get_severity, get_severity_label,
-    get_severity_color, classify_if_anomaly_score, enrich_predictions
-)
-
-from src.ui.utils.scan_diagnostics import compute_scan_readiness_diagnostics
-
-def _normalize_label_token(value: Any) -> str:
-    token = str(value or "").strip().lower()
-    token = token.replace(" ", "").replace("_", "").replace("-", "")
-    return token
+from src.core.data_loader import DataLoader
+from src.core.domain_schemas import get_schema, is_benign_label, normalize_column_name
+from src.core.model_engine import ModelEngine
 
 
-def _is_benign_prediction(value: Any) -> bool:
-    token = _normalize_label_token(value)
-    if token in {"", "0", "00", "benign", "normal", "ok", "норма", "безпечно"}:
-        return True
-    if "benign" in token or "norm" in token:
-        return True
-    if "норм" in token or "безпеч" in token:
-        return True
-    return False
+SUPPORTED_EXTENSIONS = {".csv", ".pcap", ".pcapng", ".cap"}
 
 
-def _resolve_scan_row_cap(file_ext: str, file_size_bytes: int) -> tuple[int | None, str | None]:
-    if file_ext not in TABULAR_EXTENSIONS:
-        return None, None
+def render_scanning_tab(services: dict[str, Any], root_dir: Path) -> None:
+    _init_scanning_state()
+    loader = DataLoader()
+    models_dir = root_dir / "models"
+    upload_dir = root_dir / "datasets" / "User_Uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
 
-    if file_size_bytes >= 250 * 1024 * 1024:
-        return 150000, "Файл дуже великий: інтерактивний скан обмежено до 150,000 рядків для стабільності UI."
-    if file_size_bytes >= 120 * 1024 * 1024:
-        return 180000, "Файл великий: інтерактивний скан обмежено до 180,000 рядків для стабільності UI."
-    if file_size_bytes >= 60 * 1024 * 1024:
-        return 220000, "Використано безпечний ліміт 220,000 рядків, щоб уникнути зависань браузера."
-    return None, None
+    st.subheader("Контрольоване сканування")
+    st.caption("Після вибору файлу список моделей автоматично звужується до сумісного домену та типу входу.")
 
+    file_options = _build_scan_file_options(root_dir)
 
-def _select_result_columns(source_df: pd.DataFrame, feature_columns: list[str], total_rows: int) -> list[str]:
-    priority_candidates = [
-        "timestamp", "time", "datetime", "date", "flow_start_time",
-        "src_ip", "source_ip", "src", "srcaddr",
-        "dst_ip", "destination_ip", "dst", "dstaddr",
-        "src_port", "source_port", "sport",
-        "dst_port", "destination_port", "dport", "dest_port", "port",
-        "protocol", "proto", "service",
-        "duration", "flow_duration",
-        "packet_rate", "byte_rate", "flow_packets/s", "flow_bytes/s",
-        "packets_fwd", "packets_bwd", "bytes_fwd", "bytes_bwd",
-        "tcp_syn_count", "tcp_ack_count", "tcp_rst_count",
-    ]
-    selected: list[str] = []
-    existing_cols = set(source_df.columns)
-    for col in priority_candidates:
-        if col in existing_cols and col not in selected:
-            selected.append(col)
-
-    numeric_budget = 28
-    if total_rows > 200000:
-        numeric_budget = 16
-    if total_rows > 400000:
-        numeric_budget = 10
-
-    for col in feature_columns:
-        if len(selected) >= (len(priority_candidates) + numeric_budget):
-            break
-        if col in existing_cols and col not in selected and pd.api.types.is_numeric_dtype(source_df[col]):
-            selected.append(col)
-
-    if not selected:
-        return list(source_df.columns[:40])
-    return selected
-
-def _build_ui_result_sample(result_df: pd.DataFrame, anomaly_mask: pd.Series, max_rows: int = 100000) -> tuple[pd.DataFrame, bool]:
-    """
-    Повертає безпечну вибірку для UI, але зберігає пропорцію аномалій.
-    Це зменшує RAM та "фрізи" браузера на великих сканах.
-    """
-    if len(result_df) <= max_rows:
-        return result_df, False
-
-    anomaly_df = result_df[anomaly_mask]
-    normal_df = result_df[~anomaly_mask]
-
-    anomaly_quota = min(len(anomaly_df), max(1000, int(max_rows * 0.40)))
-    normal_quota = max_rows - anomaly_quota
-
-    anomaly_sample = (
-        anomaly_df.sample(n=anomaly_quota, random_state=42)
-        if len(anomaly_df) > anomaly_quota else anomaly_df
-    )
-    normal_sample = (
-        normal_df.sample(n=normal_quota, random_state=42)
-        if len(normal_df) > normal_quota else normal_df
-    )
-
-    sampled = pd.concat([anomaly_sample, normal_sample], axis=0).sample(frac=1.0, random_state=42)
-    return sampled, True
-
-
-def render_scanning_tab(services: dict[str, Any], ROOT_DIR: Path, ALGORITHM_WIKI: dict, BENIGN_LABEL_TOKENS: list, PCAP_EXTENSIONS: set, TABULAR_EXTENSIONS: set, SUPPORTED_SCAN_EXTENSIONS: set, DEFAULT_SENSITIVITY_THRESHOLD: float, DEFAULT_IF_CONTAMINATION: float, DEFAULT_IF_TARGET_FP_RATE: float, DEFAULT_TWO_STAGE_PROFILE: str) -> None:
-
-    model_files = sorted(
-        (ROOT_DIR / 'models').glob('*.joblib'),
-        key=lambda p: (
-            p.stat().st_mtime_ns,
-            p.name.lower()
-        ),
-        reverse=True
-    )
-    model_file_map = {f.name: f for f in model_files}
-    if 'scan_in_progress' not in st.session_state:
-        st.session_state['scan_in_progress'] = False
-
-
-    if not model_files:
-        st.warning("Спочатку створіть модель. Для сканування трафіку необхідна навчена модель. Перейдіть до розділу 'Тренування' та створіть модель на основі датасету.")
-        return
-    
-    # Initialize wizard step control
-    if 'scan_wizard_step' not in st.session_state:
-        st.session_state['scan_wizard_step'] = 1
-    
-    def go_to_step(step: int):
-        st.session_state['scan_wizard_step'] = step
-        st.rerun()
-    
-    current_step = st.session_state['scan_wizard_step']
-    
-    # Show wizard progress
-    st.markdown(f"""
-    <div style="margin-bottom: 1rem;">
-        <div style="display: flex; gap: 0.5rem; margin-bottom: 0.5rem;">
-            <div style="flex: 1; padding: 0.5rem; text-align: center; background: {'#4CAF50' if current_step >= 1 else '#e0e0e0'}; color: {'white' if current_step >= 1 else '#666'}; border-radius: 4px; font-weight: bold;">1. Файл</div>
-            <div style="flex: 1; padding: 0.5rem; text-align: center; background: {'#4CAF50' if current_step >= 2 else '#e0e0e0'}; color: {'white' if current_step >= 2 else '#666'}; border-radius: 4px; font-weight: {'bold' if current_step == 2 else 'normal'};">2. Модель</div>
-            <div style="flex: 1; padding: 0.5rem; text-align: center; background: {'#4CAF50' if current_step >= 3 else '#e0e0e0'}; color: {'white' if current_step >= 3 else '#666'}; border-radius: 4px; font-weight: {'bold' if current_step == 3 else 'normal'};">3. Діагностика</div>
-            <div style="flex: 1; padding: 0.5rem; text-align: center; background: {'#4CAF50' if current_step >= 4 else '#e0e0e0'}; color: {'white' if current_step >= 4 else '#666'}; border-radius: 4px; font-weight: {'bold' if current_step == 4 else 'normal'};">4. Результати</div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # --- WIZARD STEP 1: Select File ---
-    step1_container = st.container()
-    with step1_container:
-        st.markdown("""
-        <div class="section-card">
-            <div class="section-title">Крок 1: Вибір файлу для аналізу</div>
-            <p class="text-muted">
-                Оберіть файл з бібліотеки або завантажте новий (CSV, NF, PCAP)
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
-
-        user_dir = ROOT_DIR / 'datasets' / 'User_Uploads'
-        scans_dir = ROOT_DIR / 'datasets' / 'Processed_Scans'
-        user_dir.mkdir(parents=True, exist_ok=True)
-        scans_dir.mkdir(parents=True, exist_ok=True)
-        processed_has_files = any(
-            f.suffix.lower() in SUPPORTED_SCAN_EXTENSIONS
-            for f in scans_dir.glob('*.*')
+    with st.container(border=True):
+        st.markdown("**Крок 1. Оберіть файл для сканування**")
+        selected_existing_label = st.selectbox(
+            "Файли з робочих директорій",
+            options=[""] + list(file_options.keys()),
+            format_func=lambda label: "Оберіть файл" if label == "" else label,
+            key="scan_selected_existing_label",
+        )
+        uploaded_file = st.file_uploader(
+            "Або завантажте CSV / PCAP",
+            type=["csv", "pcap", "pcapng", "cap"],
+            accept_multiple_files=False,
+            key="scan_uploaded_file",
         )
 
-        source_library_label = "Бібліотека (User_Uploads)"
-        source_upload_label = "Завантажити новий"
-        processed_label = "Архів сканувань (Processed_Scans)"
-        scan_source_options = [source_library_label, source_upload_label]
-        if processed_has_files:
-            scan_source_options.insert(1, processed_label)
-
-        if (
-            "scan_source_mode" not in st.session_state
-            or st.session_state["scan_source_mode"] not in scan_source_options
-        ):
-            st.session_state["scan_source_mode"] = scan_source_options[0]
-
-        scan_source = st.radio(
-            "Джерело файлу для сканування:",
-            scan_source_options,
-            horizontal=True,
-            key="scan_source_mode",
-            help=(
-                "Бібліотека — ваші завантажені файли. "
-                "Архів сканувань — файли з попередніх запусків. "
-                "Завантажити новий — додати файл прямо зараз."
-            ),
+        selected_path = _resolve_selected_scan_path(
+            selected_existing_label=selected_existing_label,
+            file_options=file_options,
+            uploaded_file=uploaded_file,
+            upload_dir=upload_dir,
         )
 
-        if scan_source == processed_label:
-            st.caption("Архів сканувань: файли, які були збережені після попередніх запусків.")
-
-        dataset_path = None
-
-        if scan_source == source_upload_label:
-            uploaded_file = st.file_uploader(
-                "Файл трафіку",
-                type=['csv', 'nf', 'nfdump', 'pcap', 'pcapng', 'cap'],
-                label_visibility="collapsed"
-            )
-            if uploaded_file:
-                dataset_path = ROOT_DIR / 'datasets' / 'User_Uploads' / uploaded_file.name
-                upload_key = f"{uploaded_file.name}_{uploaded_file.size}"
-                previous_key = st.session_state.get('last_scan_upload_key')
-                if previous_key != upload_key or not dataset_path.exists():
-                    with open(dataset_path, "wb") as f:
-                        f.write(uploaded_file.getbuffer())
-                    st.session_state['last_scan_upload_key'] = upload_key
-                    st.session_state['wizard_uploaded_file_path'] = str(dataset_path)
-
-        elif scan_source == source_library_label:
-            u_files = [
-                f for f in user_dir.glob('*.*')
-                if f.suffix.lower() in SUPPORTED_SCAN_EXTENSIONS
-            ]
-            if u_files:
-                selected_filename = st.selectbox("Оберіть файл:", [f.name for f in u_files], key="wizard_selected_file")
-                dataset_path = user_dir / selected_filename
-            else:
-                st.info("У User_Uploads немає сумісних файлів (CSV/NF/PCAP).")
-
-        elif scan_source == processed_label:
-            s_files = [
-                f for f in scans_dir.glob('*.*')
-                if f.suffix.lower() in SUPPORTED_SCAN_EXTENSIONS
-            ]
-            if s_files:
-                selected_filename = st.selectbox("Оберіть файл:", [f.name for f in s_files], key="wizard_selected_file")
-                dataset_path = scans_dir / selected_filename
-            else:
-                st.info("У Processed_Scans немає сумісних файлів (CSV/NF/PCAP).")
-
-        col_step1_next, _ = st.columns([1, 3])
-        with col_step1_next:
-            if st.button("Далі →", type="primary", key="scan_step1_next"):
-                if dataset_path:
-                    st.session_state['wizard_dataset_path'] = str(dataset_path)
-                    st.session_state['wizard_scan_source'] = scan_source
-                    go_to_step(2)
-                else:
-                    st.warning("Спочатку оберіть або завантажте файл")
-
-    if current_step < 2:
-        return  # Block access to later steps
-
-    user_dir = ROOT_DIR / 'datasets' / 'User_Uploads'
-    scans_dir = ROOT_DIR / 'datasets' / 'Processed_Scans'
-    # Гарантуємо існування директорій (glob() падає якщо директорії немає)
-    user_dir.mkdir(parents=True, exist_ok=True)
-    scans_dir.mkdir(parents=True, exist_ok=True)
-    processed_has_files = any(
-        f.suffix.lower() in SUPPORTED_SCAN_EXTENSIONS
-        for f in scans_dir.glob('*.*')
-    )
-
-    # --- WIZARD STEP 2: Model Selection (based on selected file) ---
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # Get file info from step 1
-    dataset_path_str = st.session_state.get('wizard_dataset_path')
-    dataset_path = Path(dataset_path_str) if dataset_path_str else None
-    
-    if not dataset_path or not dataset_path.exists():
-        st.error("Файл не знайдено. Поверніться до кроку 1.")
-        if st.button("← Назад до вибору файлу"):
-            go_to_step(1)
-        return
-    
-    # Show selected file info
-    st.markdown(f"""
-    <div style="padding: 0.75rem; background: #f0f0f0; border-radius: 4px; margin-bottom: 1rem;">
-        <strong>Вибраний файл:</strong> {dataset_path.name}<br>
-        <small>Розмір: {dataset_path.stat().st_size / 1024 / 1024:.1f} MB</small>
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown("""
-    <div class="section-card">
-        <div class="section-title">Крок 2: Підтвердження моделі</div>
-        <p class="text-muted">
-            Система автоматично підібрала оптимальну модель для вашого файлу
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    col1, col2 = st.columns([2, 1])
-
-    with col1:
-        # Auto-detect best model based on file
-        auto_detected_model, auto_reason = resolve_auto_model(dataset_path, model_files)
-        
-        auto_select_model = st.checkbox(
-            "Автовибір найкращої моделі",
-            value=True,
-            key="wizard_step2_auto_select_model",
-            help=f"Система обрала: {auto_detected_model or 'немає сумісної моделі'}"
-        )
-
-        if auto_select_model:
-            if auto_detected_model:
-                st.success(f"Автовибір: **{auto_detected_model}**")
-                if auto_reason == 'pcap_if':
-                    st.caption("Isolation Forest оптимальна для PCAP-файлів")
-                elif auto_reason == 'family_match':
-                    st.caption("Модель відповідає сімейству даних")
-            else:
-                st.error("Не знайдено сумісної моделі для цього файлу")
-            selected_model = None
-        else:
-            selected_model = st.selectbox(
-                "Модель для аналізу:",
-                options=[f.name for f in model_files],
-                key="wizard_selected_model",
-                help="Оберіть модель, яку ви створили раніше"
-            )
-
-    with col2:
-        gemini_key = services['settings'].get("gemini_api_key", "")
-        if gemini_key:
-            st.success("Gemini API підключено")
-        else:
-            st.warning("Gemini API не налаштовано")
-            st.caption("Додайте ключ на головній сторінці для AI-аналізу")
-    
-    # --- WIZARD STEP 3: Diagnostics & Configuration ---
-    if dataset_path:
-        file_size = dataset_path.stat().st_size
-        current_file_key = f"scan_file_{dataset_path.resolve()}_{file_size}"
-        current_model_key = "__auto__" if auto_select_model else (selected_model or "__none__")
-        current_context_key = f"{scan_source}|{current_file_key}|{current_model_key}"
-
-        previous_context_key = st.session_state.get('scan_context_key')
-        if previous_context_key is None:
-            st.session_state['scan_context_key'] = current_context_key
-        elif previous_context_key != current_context_key:
-            print("[LOG] Scan context changed (file/model). Clearing previous scan data...")
-            clear_session_memory()
-            st.session_state['scan_context_key'] = current_context_key
-
-        st.session_state.scan_file_uploaded = current_file_key
-        # Show sensitivity control only when selected model supports Two-Stage thresholding.
-        preview_model_name = selected_model
-        if auto_select_model:
-            preview_model_name, _ = resolve_auto_model(dataset_path, model_files)
-
-        preview_manifest = get_manifest_for_model(preview_model_name, model_file_map) if preview_model_name else {
-            'two_stage_mode': False,
-            'is_isolation_forest': False,
-            'two_stage_threshold_default': float(DEFAULT_SENSITIVITY_THRESHOLD),
-            'two_stage_sensitivity_default': int(np.clip(DEFAULT_SENSITIVITY_LEVEL, 1, 99)),
-            'two_stage_profile_default': DEFAULT_TWO_STAGE_PROFILE,
-            'two_stage_threshold_strict': _resolve_two_stage_profile_threshold(
-                float(DEFAULT_SENSITIVITY_THRESHOLD),
-                "strict"
-            )
-        }
-
-        sensitivity_level = int(np.clip(DEFAULT_SENSITIVITY_LEVEL, 1, 99))
-        selected_two_stage_threshold = float(DEFAULT_SENSITIVITY_THRESHOLD)
-        selected_two_stage_profile_key = DEFAULT_TWO_STAGE_PROFILE
-        selected_two_stage_profile_label = TWO_STAGE_PROFILE_RULES[selected_two_stage_profile_key]['label']
-        if preview_model_name:
-            if preview_manifest.get('two_stage_mode'):
-                model_mode = 'Two-Stage'
-            elif preview_manifest.get('is_isolation_forest'):
-                model_mode = 'Isolation Forest'
-            else:
-                model_mode = 'Classification'
-            st.caption(f"Модель для запуску: {preview_model_name} ({model_mode})")
-        else:
-            st.warning("Для цього типу файлу не знайдено сумісної моделі. Навчіть або оберіть іншу модель.")
-
-        if 'kdd' in dataset_path.name.lower() or 'nsl' in dataset_path.name.lower():
-            st.info(
-                "NSL-KDD: тестові файли часто містять нові типи атак, яких не було у тренуванні. "
-                "Це нормально. Ключовий показник для цього набору — факт виявлення атак (ризик/кількість), "
-                "а назва типу атаки у звіті може бути найближчим відомим класом моделі."
-            )
-
-        if preview_manifest.get('two_stage_mode', False):
-            st.write("")
-            default_threshold = _clamp_two_stage_threshold(
-                float(preview_manifest.get('two_stage_threshold_default', DEFAULT_SENSITIVITY_THRESHOLD))
-            )
-            strict_threshold = _clamp_two_stage_threshold(
-                float(
-                    preview_manifest.get(
-                        'two_stage_threshold_strict',
-                        _resolve_two_stage_profile_threshold(default_threshold, "strict")
-                    )
-                )
-            )
-            # UI-дефолт для запуску завжди "Збалансований":
-            # це безпечніший старт для більшості користувачів.
-            # Рекомендацію "strict" показуємо окремо в самодіагностиці.
-            default_profile_key = _normalize_two_stage_profile(DEFAULT_TWO_STAGE_PROFILE)
-            profile_labels = [TWO_STAGE_PROFILE_RULES[key]['label'] for key in TWO_STAGE_PROFILE_ORDER]
-            profile_label_to_key = {
-                TWO_STAGE_PROFILE_RULES[key]['label']: key for key in TWO_STAGE_PROFILE_ORDER
-            }
-            profile_index = TWO_STAGE_PROFILE_ORDER.index(default_profile_key)
-            selected_two_stage_profile_label = st.radio(
-                "Профіль виявлення загроз",
-                options=profile_labels,
-                index=profile_index,
-                horizontal=True,
-                help=(
-                    "Збалансований - базовий режим із найкращим балансом між пропусками та зайвими тривогами. "
-                    "Строгий - зменшує хибні спрацювання, але може пропускати слабкі атаки."
-                )
-            )
-            selected_two_stage_profile_key = profile_label_to_key[selected_two_stage_profile_label]
-
-            if selected_two_stage_profile_key == "strict":
-                selected_two_stage_threshold = strict_threshold
-            else:
-                selected_two_stage_threshold = default_threshold
-
-            base_sensitivity_level = _threshold_to_sensitivity_level(selected_two_stage_threshold)
-            manual_sensitivity_enabled = st.checkbox(
-                "Ручне керування чутливістю",
-                value=False,
-                help="Увімкніть, щоб вручну задати чутливість саме для поточного запуску."
-            )
-            if manual_sensitivity_enabled:
-                sensitivity_level = st.slider(
-                    "Чутливість виявлення (1-99)",
-                    min_value=1,
-                    max_value=99,
-                    value=int(base_sensitivity_level),
-                    step=1,
-                    help=(
-                        "Більше значення = агресивніше виявлення (модель частіше позначає трафік як атаку, "
-                        "зростає Recall і кількість тривог). Менше значення = обережніша детекція "
-                        "з потенційно меншим числом хибних спрацювань."
-                    )
-                )
-                selected_two_stage_threshold = _sensitivity_level_to_threshold(sensitivity_level)
-                selected_two_stage_profile_label = f"{selected_two_stage_profile_label} + ручне"
-            else:
-                sensitivity_level = base_sensitivity_level
-
-            active_profile_label = TWO_STAGE_PROFILE_RULES[selected_two_stage_profile_key]['label']
-            if manual_sensitivity_enabled:
-                st.caption(
-                    f"Поточний режим: {active_profile_label}. "
-                    f"Ручна чутливість: {sensitivity_level}/99 (чим вище, тим більше трафіку вважається підозрілим)."
-                )
-            else:
-                st.caption(
-                    f"Поточний режим: {active_profile_label}. "
-                    "Чутливість автоматично взята з навченої моделі, "
-                    "орієнтованої на баланс між пропусками атак і хибними тривогами."
-                )
-            st.info(
-                f"""
-**Як обрати профіль:**
-- **{TWO_STAGE_PROFILE_RULES['balanced']['label']}** — для щоденного використання (баланс FP/FN).
-- **{TWO_STAGE_PROFILE_RULES['strict']['label']}** — коли важливо зменшити хибні спрацювання.
-- Якщо сумніваєтесь, залишайте **Збалансований**.
-
-**Ручна чутливість:**
-- Вище значення: більше виявлень, але можливе зростання FP.
-- Нижче значення: обережніша детекція, але можливий ріст FN.
-                """
+        inspection = None
+        if selected_path:
+            inspection = loader.inspect_file(selected_path)
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Файл": selected_path.name,
+                            "Формат": inspection.input_type.upper(),
+                            "Датасет": inspection.dataset_type,
+                            "Режим": inspection.analysis_mode,
+                            "Впевненість детектора": f"{inspection.confidence:.2f}",
+                        }
+                    ]
+                ),
+                use_container_width=True,
+                hide_index=True,
             )
         else:
-            st.caption("Параметр чутливості приховано: він працює лише для Two-Stage моделей.")
+            st.info("Оберіть файл або завантажте новий.")
 
-        # --- MODEL READINESS DIAGNOSTICS ---
-        file_ext_preview = dataset_path.suffix.lower()
-        scan_blocked = preview_model_name is None
+    engine = ModelEngine(models_dir=str(models_dir))
+    model_manifests = engine.list_models()
+    compatible_models = _filter_models(model_manifests, inspection)
 
-        # Fast compatibility gate: auto-reroute to compatible model when possible.
-        if preview_model_name:
-            preview_compatible = set(
-                _normalize_compatible_types(preview_manifest.get('compatible_file_types', sorted(TABULAR_EXTENSIONS)))
+    with st.container(border=True):
+        st.markdown("**Крок 2. Оберіть модель**")
+        schema_error = None
+        recommended_threshold_value = 0.30
+        if not inspection:
+            st.info("Спершу оберіть файл.")
+            selected_model_name = None
+            model_metadata = None
+        elif not compatible_models:
+            st.warning("Для цього файлу не знайдено сумісних моделей. Спочатку навчіть потрібний домен у вкладці Тренування.")
+            selected_model_name = None
+            model_metadata = None
+        else:
+            compatible_names = [manifest["name"] for manifest in compatible_models]
+            current_model_name = st.session_state.get("scan_selected_model_name")
+            if current_model_name not in compatible_names:
+                current_model_name = compatible_names[0]
+                st.session_state["scan_selected_model_name"] = current_model_name
+
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Модель": manifest["name"],
+                            "Алгоритм": manifest["algorithm"],
+                            "Датасет": manifest["dataset_type"],
+                            "Вхід": ", ".join(manifest["compatible_input_types"]),
+                            "Recall": _extract_metric(manifest, "recall"),
+                            "F1": _extract_metric(manifest, "f1"),
+                        }
+                        for manifest in compatible_models
+                    ]
+                ),
+                use_container_width=True,
+                hide_index=True,
             )
-            if file_ext_preview not in preview_compatible:
-                if (
-                    file_ext_preview in PCAP_EXTENSIONS
-                    and not bool(preview_manifest.get('is_isolation_forest'))
-                ):
-                    scan_blocked = True
-                    st.error(
-                        "Для PCAP-файлів доступна лише модель Isolation Forest. "
-                        "Оберіть IF-модель або навчіть Isolation Forest у вкладці Тренування."
-                    )
-                else:
-                    fallback_preview_model, _ = resolve_auto_model(dataset_path, model_files)
-                    if fallback_preview_model and fallback_preview_model != preview_model_name:
-                        st.warning(
-                            f"Несумісна пара `{preview_model_name}` + `{file_ext_preview}`. "
-                            f"Автоматично обрано сумісну модель `{fallback_preview_model}`."
-                        )
-                        preview_model_name = fallback_preview_model
-                        preview_manifest = get_manifest_for_model(preview_model_name, model_file_map)
-                        scan_blocked = False
-                    else:
-                        scan_blocked = True
-                        st.error(
-                            f"Для файлу `{file_ext_preview}` не знайдено жодної сумісної моделі. "
-                            "Навчіть модель для цього типу даних у вкладці Тренування."
-                        )
+            selected_model_name = st.selectbox(
+                "Сумісні моделі",
+                options=compatible_names,
+                index=compatible_names.index(current_model_name),
+                key="scan_selected_model_name",
+            )
+            selected_manifest = next(
+                (manifest for manifest in compatible_models if manifest["name"] == selected_model_name),
+                compatible_models[0],
+            )
+            model_metadata = selected_manifest["metadata"]
+            recommended_threshold_value, threshold_caption = _resolve_recommended_threshold(selected_manifest, inspection)
+            st.caption(threshold_caption)
 
-        if preview_model_name and dataset_path.exists() and not scan_blocked:
-            preview_model_path = model_file_map.get(preview_model_name)
-            if preview_model_path and preview_model_path.exists():
-                model_stat = preview_model_path.stat()
-                file_stat = dataset_path.stat()
-                readiness = compute_scan_readiness_diagnostics(
-                    preview_model_name,
-                    model_stat.st_mtime,
-                    model_stat.st_size,
-                    str(dataset_path),
-                    file_stat.st_mtime,
-                    file_stat.st_size
-                )
-
-                st.markdown("""
-                <div class="section-card">
-                    <div class="section-title">Самодіагностика перед запуском</div>
-                </div>
-                """, unsafe_allow_html=True)
-
-                status_map = {
-                    'ready': ("Готова", "Низький"),
-                    'caution': ("З обмеженнями", "Середній"),
-                    'risk': ("Ризик", "Високий"),
-                }
-                status_label, risk_label = status_map.get(readiness.get('status', 'risk'), ("Ризик", "Високий"))
-
-                checks = readiness.get('checks', {})
-                st.session_state['scan_readiness_checks'] = dict(checks)
-                feature_coverage = float(checks.get('feature_coverage', 0.0))
-                d1, d2, d3, d4 = st.columns(4)
-                d1.metric("Стан", status_label)
-                d2.metric("Сумісність ознак", f"{feature_coverage:.0%}")
-                d3.metric("Сумісність формату", f"{int(checks.get('format_score', readiness.get('score', 0)))}/100")
-                d4.metric("Прогноз якості детекції", f"{int(checks.get('quality_score', readiness.get('score', 0)))}/100")
-
-                st.caption(
-                    "Сумісність формату = чи модель технічно може обробити файл (формат, ознаки, препроцесор). "
-                    "Прогноз якості детекції = оцінка ризику FP/FN та OOD на тестовій preview-вибірці. "
-                    "Це орієнтир, а не 100% гарантія якості в кожному окремому файлі. "
-                    f"Режим моделі: {str(readiness.get('model_mode', 'Unknown'))}. "
-                    f"Оцінка ризику: {risk_label}."
-                )
-
-                if 'feature_coverage' in checks:
-                    st.write(f"• Відсутніх ознак: **{checks.get('missing_features', 0)}**")
-                if 'preview_anomaly_rate' in checks:
-                    preview_rate = float(checks.get('preview_anomaly_rate', 0.0))
-                    preview_rows = int(checks.get('preview_rows', 0))
-                    if preview_rate == 0.0:
-                        preview_rate_text = "0.00%"
-                    elif preview_rate < 0.001:
-                        preview_rate_text = f"{preview_rate * 100:.3f}%"
-                    else:
-                        preview_rate_text = f"{preview_rate * 100:.2f}%"
-                    rows_text = f" на вибірці {preview_rows:,} рядків" if preview_rows > 0 else ""
-                    st.write(f"• Оціночна частка аномалій{rows_text}: **{preview_rate_text}**")
-                if 'distribution_drift_score' in checks:
-                    drift_score = float(checks.get('distribution_drift_score', 0.0))
-                    drift_cov = float(checks.get('distribution_profile_coverage', 0.0))
-                    st.write(
-                        f"• OOD-дрейф розподілу: **{drift_score:.2f}** "
-                        f"(покриття профілю: {drift_cov:.0%})"
-                    )
-                if 'two_stage_threshold' in checks:
-                    profile_default_preview = _normalize_two_stage_profile(
-                        checks.get('two_stage_profile_default', DEFAULT_TWO_STAGE_PROFILE)
-                    )
-                    profile_default_label = TWO_STAGE_PROFILE_RULES[profile_default_preview]['label']
-                    st.write(
-                        f"• Рекомендований профіль моделі: **{profile_default_label}**. "
-                        "Поріг для цього профілю береться з навченої моделі."
-                    )
-
-                issues = readiness.get('issues', [])
-                if issues:
-                    for issue in issues[:4]:
-                        st.warning(issue)
-
-                if readiness.get('blocking', False):
-                    fallback_preview_model, _ = resolve_auto_model(dataset_path, model_files)
-                    if fallback_preview_model and fallback_preview_model != preview_model_name:
-                        st.warning(
-                            f"Самодіагностика виявила ризик для `{preview_model_name}`. "
-                            f"Для запуску буде використано `{fallback_preview_model}`."
-                        )
-                        preview_model_name = fallback_preview_model
-                        preview_manifest = get_manifest_for_model(preview_model_name, model_file_map)
-                        scan_blocked = False
-                    else:
-                        st.warning(
-                            "Самодіагностика виявила високий ризик якості детекції. "
-                            "Сканування буде виконано, але результат позначиться як низьконадійний."
-                        )
-
-        # TASK 3: Force Scan Override with honest OOD reporting
-        # Calculate exact zero-padding percentage for honest reporting
-        file_ext_preview = dataset_path.suffix.lower()
-        
-        # Get feature coverage from diagnostics
-        checks = st.session_state.get('scan_readiness_checks', {})
-        feature_coverage = float(checks.get('feature_coverage', 0.0))
-        zero_padding_pct = (1.0 - feature_coverage) * 100.0
-        
-        # Get family information
-        model_family = preview_manifest.get('trained_families', []) if preview_manifest else []
-        is_model_if = bool(preview_manifest.get('is_isolation_forest', False))
-        file_family = _infer_dataset_family_name(dataset_path.name)
-        
-        # OOD mismatch detection
-        ood_family_mismatch = (
-            file_family and model_family 
-            and len(model_family) > 0 
-            and file_family not in model_family
-            and not is_model_if
-        )
-        
-        # PCAP domain risk detection
-        pcap_domain_risk = (
-            file_ext_preview in PCAP_EXTENSIONS
-            and not is_model_if
-            and (not model_family or model_family != ["CIC-IDS"])
-        )
-        
-        # Block scan with harsh error about mathematical hallucinations
-        if ood_family_mismatch or pcap_domain_risk:
-            scan_blocked = True
-            
-            if ood_family_mismatch:
-                mismatch_text = (
-                    f"Модель навчена на домені {model_family}, а файл належить до {file_family}. "
-                    f"{zero_padding_pct:.1f}% ознак відсутні і будуть заповнені нулями. "
-                    f"Це гарантовано призведе до математичних галюцинацій (хибних аномалій)."
-                )
+            if inspection.input_type == "csv":
+                schema_error = _validate_csv_against_model(selected_path, model_metadata)
+            if schema_error:
+                st.error(schema_error)
             else:
-                mismatch_text = (
-                    f"PCAP-файл сканується моделлю {model_family or 'невідомого домену'}. "
-                    f"{zero_padding_pct:.1f}% ознак відсутні і будуть заповнені нулями. "
-                    f"Це гарантовано призведе до математичних галюцинацій (хибних аномалій)."
-                )
-            
-            st.error(f"Помилка сумісності: {mismatch_text}")
-            
-            force_scan_override = st.checkbox(
-                "Я експерт. Ігнорувати несумісність доменів (Force Scan)",
-                key="force_scan_override"
+                st.success("Модель сумісна з поточним файлом.")
+
+        if selected_model_name and st.session_state.get("scan_last_model_name") != selected_model_name:
+            st.session_state["scan_sensitivity"] = float(recommended_threshold_value)
+            st.session_state["scan_last_model_name"] = selected_model_name
+
+    current_signature = _build_scan_signature(selected_path, selected_model_name)
+    if st.session_state.get("scan_result_signature") != current_signature:
+        st.session_state["scan_result"] = None
+
+    with st.container(border=True):
+        st.markdown("**Крок 3. Запустіть сканування**")
+        scan_limit_col, note_col = st.columns([1, 2])
+        with scan_limit_col:
+            row_limit = st.number_input(
+                "Ліміт рядків / пакетів",
+                min_value=1000,
+                max_value=250000,
+                value=50000,
+                step=1000,
+                key="scan_row_limit",
             )
-            
-            if force_scan_override:
-                scan_blocked = False
-                st.warning(
-                    "УВАГА: Force Scan увімкнено. Результати можуть бути ненадійними через несумісність ознак."
-                )
+            sensitivity = st.slider(
+                "Чутливість (Поріг виявлення)",
+                min_value=0.01,
+                max_value=0.99,
+                step=0.01,
+                key="scan_sensitivity",
+                help="Менше значення = жорсткіша детекція (виловлює більше аномалій).",
+            )
+        with note_col:
+            st.caption("Для великих файлів застосовується ліміт, щоб Streamlit залишався стабільним під час інтерактивної перевірки.")
 
-        if st.button(
-            "Розпочати аналіз",
-            type="primary",
-            width="stretch",
-            disabled=scan_blocked or bool(st.session_state.get('scan_in_progress', False))
-        ):
-            # Очищення пам'яті від попереднього аналізу
-            clear_session_memory()
-            st.session_state['scan_in_progress'] = True
-
-            progress = st.progress(0)
-            status = st.empty()
-
+        can_scan = bool(selected_path and inspection and selected_model_name and model_metadata and not schema_error)
+        if st.button("Запустити сканування", use_container_width=True, type="primary", disabled=not can_scan):
             try:
-                # Initialize ScanningService
-                scanning_service = ScanningService(
-                    models_dir=ROOT_DIR / 'models',
-                    default_if_target_fp_rate=DEFAULT_IF_TARGET_FP_RATE,
-                    default_sensitivity_threshold=DEFAULT_SENSITIVITY_THRESHOLD
+                started_at = time.perf_counter()
+                result = _run_scan(
+                    loader=loader,
+                    models_dir=models_dir,
+                    selected_path=selected_path,
+                    inspection=inspection,
+                    selected_model_name=selected_model_name,
+                    row_limit=int(row_limit),
+                    sensitivity=float(sensitivity),
                 )
-                
-                # Progress callback for UI updates
-                def _progress_callback(pct, msg=""):
-                    if msg:
-                        st.info(msg)
-                    progress.progress(pct)
-                
-                # Execute scan via service
-                scan_result = scanning_service.scan(
-                    dataset_path=dataset_path,
-                    selected_model=selected_model,
-                    auto_select_model=auto_select_model,
-                    model_files=model_files,
-                    pcap_extensions=PCAP_EXTENSIONS,
-                    tabular_extensions=TABULAR_EXTENSIONS,
-                    selected_two_stage_threshold=selected_two_stage_threshold,
-                    selected_two_stage_profile_label=selected_two_stage_profile_label,
-                    sensitivity_level=sensitivity_level,
-                    progress_callback=_progress_callback
+                result["duration_seconds"] = time.perf_counter() - started_at
+                services["db"].save_scan(
+                    filename=selected_path.name,
+                    total=result["total_records"],
+                    anomalies=result["anomalies_count"],
+                    risk_score=result["risk_score"],
+                    model_name=selected_model_name,
+                    duration=result["duration_seconds"],
                 )
-                
-                if not scan_result.success:
-                    st.error(scan_result.error)
-                    st.stop()
-                
-                # Display auto-selection messages
-                if auto_select_model or selected_model is None:
-                    file_ext = dataset_path.suffix.lower()
-                    selected_model = scan_result.metrics.get('model_name', 'Unknown')
-                    auto_reason = scan_result.metrics.get('auto_reason', 'unknown')
-                    
-                    if auto_reason == 'pcap_if':
-                        st.success(f"Автовибір для PCAP: **{selected_model}** (Isolation Forest)")
-                    elif auto_reason == 'family_match_two_stage':
-                        st.success(f"Автовибір за сімейством: **{selected_model}** (Two-Stage)")
-                    elif auto_reason == 'family_match':
-                        st.success(f"Автовибір за сімейством: **{selected_model}**")
-                    elif auto_reason == 'tabular_two_stage':
-                        st.success(f"Автовибір для CSV/NF: **{selected_model}** (Two-Stage)")
-                    else:
-                        st.success(f"Автовибір: **{selected_model}**")
-                
-                # Display warnings if any
-                if scan_result.metrics.get('warning'):
-                    st.warning(scan_result.metrics['warning'])
-                
-                # Store results in session state
-                st.session_state['scan_done'] = True
-                st.session_state['scan_results'] = scan_result.result_df
-                st.session_state['scan_anomalies'] = scan_result.anomalies_df
-                st.session_state['scan_metrics'] = scan_result.metrics
-                st.session_state['anomaly_scores'] = scan_result.anomaly_scores
-                
-                # Save to DB
-                services['db'].save_scan(
-                    filename=dataset_path.name,
-                    total=scan_result.metrics.get('total', 0),
-                    anomalies=scan_result.metrics.get('anomalies_count', 0),
-                    risk_score=scan_result.metrics.get('risk_score', 0.0),
-                    model_name=selected_model,
-                    duration=0.0,
-                    details={'top_threats': {}}
-                )
-                
-                # Clear previously generated reports for new scan
-                if 'heavy_reports' in st.session_state:
-                    del st.session_state['heavy_reports']
+                st.session_state.scan_result = result
+                st.session_state.scan_result_signature = current_signature
+                st.success("Сканування завершено.")
+            except Exception as exc:
+                st.session_state.scan_result = None
+                st.session_state.scan_result_signature = None
+                st.error(str(exc))
 
-            except Exception as e:
-                logger.exception("Scan analysis failed")
-                st.error("Під час аналізу сталася помилка. Деталі записано в журнал застосунку.")
-            finally:
-                st.session_state['scan_in_progress'] = False
-
-            # Clean memory
-            gc.collect()
-
-        # --- RENDER RESULTS (PERSISTENT) ---
-        scan_dashboard_slot = st.container()
-        if st.session_state.get('scan_done', False):
-            # Render dashboard in a dedicated container to avoid UI duplication artifacts on reruns.
-            with scan_dashboard_slot:
-                render_comprehensive_dashboard(
-                    result_df=st.session_state['scan_results'],
-                    anomalies=st.session_state['scan_anomalies'],
-                    metrics=st.session_state['scan_metrics'],
-                    services=services,
-                    gemini_key=gemini_key
-                )
+    if st.session_state.scan_result:
+        _render_scan_result(st.session_state.scan_result)
 
 
+def _init_scanning_state() -> None:
+    st.session_state.setdefault("scan_result", None)
+    st.session_state.setdefault("scan_result_signature", None)
+    st.session_state.setdefault("scan_selected_existing_label", "")
+    st.session_state.setdefault("scan_selected_model_name", None)
+    st.session_state.setdefault("scan_uploaded_cache", {})
+    st.session_state.setdefault("scan_sensitivity", 0.30)
+    st.session_state.setdefault("scan_last_model_name", None)
 
 
+def _build_scan_file_options(root_dir: Path) -> dict[str, Path]:
+    candidates: list[Path] = []
+    for directory in ("datasets/TEST_DATA", "datasets/Processed_Scans", "datasets/User_Uploads"):
+        folder = root_dir / directory
+        if folder.exists():
+            candidates.extend(sorted(path for path in folder.iterdir() if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS))
+
+    options: dict[str, Path] = {}
+    for path in candidates:
+        label = f"{path.parent.name} / {path.name}"
+        options[label] = path
+    return options
 
 
+def _resolve_selected_scan_path(
+    selected_existing_label: str,
+    file_options: dict[str, Path],
+    uploaded_file: Any,
+    upload_dir: Path,
+) -> Path | None:
+    if uploaded_file is not None:
+        cache: dict[str, str] = st.session_state["scan_uploaded_cache"]
+        cache_key = f"{uploaded_file.name}:{uploaded_file.size}"
+        cached_path = cache.get(cache_key)
+        if cached_path and Path(cached_path).exists():
+            return Path(cached_path)
+
+        destination = upload_dir / f"scan_{uuid.uuid4().hex[:8]}_{uploaded_file.name.replace(' ', '_')}"
+        destination.write_bytes(uploaded_file.getbuffer())
+        cache[cache_key] = str(destination)
+        return destination
+    if selected_existing_label:
+        return file_options[selected_existing_label]
+    return None
 
 
+def _filter_models(model_manifests: list[dict[str, Any]], inspection: Any) -> list[dict[str, Any]]:
+    if inspection is None:
+        return []
+
+    compatible: list[dict[str, Any]] = []
+    required_input_type = inspection.input_type
+    for manifest in model_manifests:
+        if manifest["dataset_type"] != inspection.dataset_type:
+            continue
+        if required_input_type not in set(manifest["compatible_input_types"]):
+            continue
+        if (
+            manifest.get("algorithm") == "Isolation Forest"
+            and required_input_type == "pcap"
+            and not bool((manifest.get("metadata") or {}).get("trained_on_pcap_metrics", False))
+        ):
+            continue
+        compatible.append(manifest)
+    return compatible
+
+
+def _resolve_recommended_threshold(manifest: dict[str, Any], inspection: Any) -> tuple[float, str]:
+    metadata = manifest.get("metadata") or {}
+    recommended_threshold = metadata.get("recommended_threshold")
+    threshold_value = float(recommended_threshold) if isinstance(recommended_threshold, (int, float)) else 0.30
+    dataset_type = str(manifest.get("dataset_type", ""))
+    algorithm = str(manifest.get("algorithm", ""))
+
+    if inspection and inspection.input_type == "pcap" and dataset_type == "CIC-IDS":
+        if algorithm == "Random Forest":
+            return 0.20, "Рекомендований поріг для цієї моделі: 0.20 (PCAP override для CIC Random Forest)"
+        if algorithm == "XGBoost":
+            return 0.05, "Рекомендований поріг для цієї моделі: 0.05 (PCAP override для CIC XGBoost)"
+
+    return threshold_value, f"Рекомендований поріг для цієї моделі: {threshold_value:.2f}"
+
+
+def _build_scan_signature(selected_path: Path | None, selected_model_name: str | None) -> str | None:
+    if not selected_path or not selected_model_name:
+        return None
+    return f"{selected_path}:{selected_model_name}"
+
+
+def _extract_metric(manifest: dict[str, Any], metric_name: str) -> str:
+    metrics = manifest.get("metrics") or {}
+    value = metrics.get(metric_name)
+    return f"{value:.3f}" if isinstance(value, (int, float)) else "-"
+
+
+def _validate_csv_against_model(csv_path: Path, metadata: dict[str, Any]) -> str | None:
+    header = pd.read_csv(csv_path, nrows=0)
+    normalized_columns = {normalize_column_name(column) for column in header.columns}
+    dataset_type = metadata.get("dataset_type")
+    if not dataset_type:
+        return "Модель не містить dataset_type у metadata."
+
+    schema = get_schema(dataset_type)
+    expected = set(metadata.get("expected_features", []))
+    allowed_extras = set(schema.target_aliases) | {"target_label"}
+
+    candidate_features = {column for column in normalized_columns if column not in allowed_extras}
+    missing = sorted(expected - candidate_features)
+
+    if missing:
+        message_parts: list[str] = []
+        if missing:
+            message_parts.append("відсутні: " + ", ".join(missing[:8]))
+        return "CSV не збігається зі схемою моделі: " + "; ".join(message_parts) + "."
+
+    return None
+
+
+def _run_scan(
+    loader: DataLoader,
+    models_dir: Path,
+    selected_path: Path,
+    inspection: Any,
+    selected_model_name: str,
+    row_limit: int,
+    sensitivity: float,
+) -> dict[str, Any]:
+    engine = ModelEngine(models_dir=str(models_dir))
+    model, preprocessor, metadata = engine.load_model(selected_model_name)
+    del model
+
+    loaded = loader.load_file(
+        str(selected_path),
+        max_rows=row_limit,
+        preserve_context=True,
+        expected_dataset=inspection.dataset_type,
+    )
+    if not isinstance(loaded, tuple):
+        raise ValueError("Очікувався tuple(DataFrame, context) під час сканування.")
+    dataset, context = loaded
+
+    X = preprocessor.transform(dataset)
+    predictions = engine.predict(X)
+    algorithm = str(metadata.get("algorithm"))
+    is_if = algorithm == "Isolation Forest"
+
+    if is_if:
+        scores = np.maximum(-engine.decision_function(X), 0.0)
+        prediction_labels = np.where(predictions == 1, "Anomaly", "Normal")
+        score_values = scores
+        score_column_name = "anomaly_score"
+        score_metric_label = "Середній anomaly score"
+    else:
+        probabilities = engine.predict_proba(X)
+        if probabilities is not None:
+            classes = list(preprocessor.target_encoder.classes_)
+            # Find exact index of the normal/benign class
+            benign_idx = next((i for i, c in enumerate(classes) if is_benign_label(c)), -1)
+
+            # Calculate attack probability (1.0 minus normal probability)
+            if benign_idx != -1 and probabilities.shape[1] > 1:
+                attack_probs = 1.0 - probabilities[:, benign_idx]
+            elif probabilities.shape[1] > 1:
+                attack_probs = probabilities[:, 1]  # Fallback
+            else:
+                attack_probs = probabilities[:, 0]
+
+            # Apply user sensitivity threshold
+            raw_preds = np.argmax(probabilities, axis=1)
+            if benign_idx != -1:
+                if probabilities.shape[1] > 1:
+                    non_benign_probs = probabilities.copy()
+                    non_benign_probs[:, benign_idx] = -np.inf
+                    non_benign_choice = np.argmax(non_benign_probs, axis=1)
+                    raw_preds = np.where(attack_probs >= sensitivity, non_benign_choice, benign_idx)
+                else:
+                    raw_preds = (attack_probs >= sensitivity).astype(int)
+
+            prediction_labels = preprocessor.decode_labels(raw_preds)
+            score_values = attack_probs
+        else:
+            predictions = engine.predict(X)
+            prediction_labels = preprocessor.decode_labels(predictions)
+            score_values = np.zeros(len(predictions))
+
+        score_column_name = "confidence"
+        score_metric_label = "Середня ймовірність атаки"
+
+    anomalies_mask = pd.Series([not is_benign_label(value) for value in prediction_labels], index=X.index)
+    total_records = int(len(X))
+    anomalies_count = int(anomalies_mask.sum())
+    risk_score = round((anomalies_count / max(total_records, 1)) * 100, 2)
+
+    preview_columns = [column for column in ("src_ip", "dst_ip", "src_port", "destination_port") if column in context.columns]
+    if not preview_columns:
+        preview_columns = list(dataset.columns[: min(6, len(dataset.columns))])
+
+    result_frame = dataset.loc[:, [column for column in preview_columns if column in dataset.columns]].copy()
+    if preview_columns and set(preview_columns).issubset(set(context.columns)):
+        result_frame = context.loc[:, preview_columns].copy()
+    if "target_label" in dataset.columns:
+        result_frame["target_label"] = dataset["target_label"]
+    result_frame["prediction"] = pd.Series(prediction_labels, index=X.index)
+    result_frame[score_column_name] = pd.Series(score_values, index=X.index)
+    result_frame["is_alert"] = anomalies_mask
+
+    distribution = (
+        pd.Series(prediction_labels)
+        .value_counts()
+        .rename_axis("prediction")
+        .reset_index(name="count")
+        .sort_values("count", ascending=False)
+    )
+
+    return {
+        "file_name": selected_path.name,
+        "dataset_type": inspection.dataset_type,
+        "analysis_mode": inspection.analysis_mode,
+        "algorithm": algorithm,
+        "model_name": selected_model_name,
+        "total_records": total_records,
+        "anomalies_count": anomalies_count,
+        "risk_score": risk_score,
+        "avg_score": float(np.mean(score_values)) if len(score_values) else 0.0,
+        "score_metric_label": score_metric_label,
+        "score_column_name": score_column_name,
+        "result_frame": result_frame.head(300).reset_index(drop=True),
+        "distribution": distribution,
+    }
+
+
+def _render_scan_result(result: dict[str, Any]) -> None:
+    st.divider()
+    st.subheader("Результати сканування")
+    st.caption(
+        f"Файл: {result['file_name']} | Датасет: {result['dataset_type']} | "
+        f"Модель: {result['model_name']} | Алгоритм: {result['algorithm']}"
+    )
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Записів", f"{result['total_records']:,}")
+    metric_cols[1].metric("Алертів", f"{result['anomalies_count']:,}")
+    metric_cols[2].metric("Risk score", f"{result['risk_score']:.2f}%")
+    metric_cols[3].metric(result["score_metric_label"], f"{result['avg_score']:.3f}")
+
+    chart_col1, chart_col2 = st.columns(2)
+    with chart_col1:
+        pie_frame = pd.DataFrame(
+            {
+                "state": ["Normal", "Alert"],
+                "count": [
+                    max(result["total_records"] - result["anomalies_count"], 0),
+                    result["anomalies_count"],
+                ],
+            }
+        )
+        st.plotly_chart(
+            px.pie(pie_frame, names="state", values="count", title="Нормальні записи vs алерти"),
+            use_container_width=True,
+        )
+    with chart_col2:
+        st.plotly_chart(
+            px.bar(
+                result["distribution"],
+                x="prediction",
+                y="count",
+                title="Розподіл прогнозів",
+            ),
+            use_container_width=True,
+        )
+
+    with st.expander("Sample результатів", expanded=True):
+        st.dataframe(result["result_frame"], use_container_width=True, hide_index=True)

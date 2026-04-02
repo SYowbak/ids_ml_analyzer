@@ -1,110 +1,101 @@
+from __future__ import annotations
 
-import logging
-import re
-from typing import Any, Dict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
-logger = logging.getLogger(__name__)
+from src.core.domain_schemas import DATASET_SCHEMAS, normalize_columns
+
+
+@dataclass(frozen=True)
+class DetectionResult:
+    dataset_type: str
+    analysis_mode: str
+    confidence: float
+    matched_markers: tuple[str, ...]
+    scores: dict[str, float]
 
 
 class DatasetDetector:
     """
-    Визначення сімейства датасету за колонками.
-    Повертає dataset + confidence + ambiguous для безпечного авто-вибору моделі.
+    Визначає домен датасету виключно за заголовками колонок.
+
+    Підтримуються лише три домени:
+    - CIC-IDS
+    - NSL-KDD
+    - UNSW-NB15
     """
 
-    SIGNATURES = {
-        "CIC-IDS": [
-            "flow duration",
-            "total fwd packets",
-            "total backward packets",
-            "fwd packet length max",
-            "fwd packet length min",
-            "flow iat mean",
-            "syn flag count",
-        ],
-        "NSL-KDD": [
-            "duration",
-            "protocol_type",
-            "service",
-            "flag",
-            "src_bytes",
-            "dst_bytes",
-            "logged_in",
-            "serror_rate",
-        ],
-        "UNSW-NB15": [
-            "dur",
-            "proto",
-            "service",
-            "state",
-            "spkts",
-            "dpkts",
-            "sbytes",
-            "dbytes",
-            "attack_cat",
-        ],
-    }
+    def detect(self, df: pd.DataFrame | list[str] | tuple[str, ...]) -> str:
+        return self.detect_with_confidence(df).dataset_type
 
-    STRONG_MARKERS = {
-        "CIC-IDS": {"flowduration", "totfwdpkts", "totlenfwdpkts", "flowiatmean"},
-        "NSL-KDD": {"protocol_type", "src_bytes", "dst_bytes", "serror_rate", "dst_host_srv_count"},
-        "UNSW-NB15": {"ct_srv_src", "ct_state_ttl", "ct_dst_ltm", "attack_cat", "sttl", "dttl"},
-    }
+    def detect_with_confidence(self, df: pd.DataFrame | list[str] | tuple[str, ...]) -> DetectionResult:
+        if isinstance(df, pd.DataFrame):
+            columns = list(df.columns)
+        else:
+            columns = list(df)
 
-    @staticmethod
-    def _norm(name: Any) -> str:
-        text = str(name).strip().lower()
-        return re.sub(r"[^a-z0-9]+", "", text)
+        normalized = set(normalize_columns(columns))
+        if not normalized:
+            return DetectionResult(
+                dataset_type="Unknown",
+                analysis_mode="Unknown",
+                confidence=0.0,
+                matched_markers=(),
+                scores={},
+            )
 
-    def detect(self, df: pd.DataFrame) -> str:
-        info = self.detect_with_confidence(df)
-        return str(info.get("dataset", "Generic"))
-
-    def detect_with_confidence(self, df: pd.DataFrame) -> Dict[str, Any]:
-        if df is None or len(df.columns) == 0:
-            return {"dataset": "Generic", "confidence": 0.0, "ambiguous": False, "all_scores": {}}
-
-        raw_cols = [str(c).strip().lower() for c in df.columns]
-        norm_cols = {self._norm(c) for c in df.columns}
         scores: dict[str, float] = {}
+        matched_markers: dict[str, tuple[str, ...]] = {}
 
-        for dataset, signature in self.SIGNATURES.items():
-            sig_norm = {self._norm(s) for s in signature}
-            sig_hits = sum(1 for s in sig_norm if s in norm_cols)
-            sig_score = (sig_hits / len(sig_norm)) if sig_norm else 0.0
+        for dataset_type, schema in DATASET_SCHEMAS.items():
+            markers = tuple(marker for marker in schema.detection_markers if marker in normalized)
+            matched_markers[dataset_type] = markers
+            scores[dataset_type] = len(markers) / max(len(schema.detection_markers), 1)
 
-            strong = self.STRONG_MARKERS.get(dataset, set())
-            strong_hits = sum(1 for s in strong if self._norm(s) in norm_cols)
-            strong_score = (strong_hits / len(strong)) if strong else 0.0
+        best_dataset = max(scores, key=scores.get)
+        best_score = float(scores[best_dataset])
 
-            label_bonus = 0.0
-            if dataset == "NSL-KDD" and ("class" in raw_cols or "label" in raw_cols):
-                label_bonus = 0.03
-            elif dataset == "UNSW-NB15" and "attack_cat" in raw_cols:
-                label_bonus = 0.05
+        if best_score < 0.6:
+            return DetectionResult(
+                dataset_type="Unknown",
+                analysis_mode="Unknown",
+                confidence=best_score,
+                matched_markers=matched_markers.get(best_dataset, ()),
+                scores=scores,
+            )
 
-            total = (sig_score * 0.75) + (strong_score * 0.25) + label_bonus
-            scores[dataset] = float(min(1.0, total))
+        return DetectionResult(
+            dataset_type=best_dataset,
+            analysis_mode=DATASET_SCHEMAS[best_dataset].analysis_mode,
+            confidence=best_score,
+            matched_markers=matched_markers[best_dataset],
+            scores=scores,
+        )
 
-        sorted_scores = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-        if not sorted_scores:
-            return {"dataset": "Generic", "confidence": 0.0, "ambiguous": False, "all_scores": {}}
+    def detect_path(self, file_path: str | Path) -> DetectionResult:
+        path = Path(file_path)
+        extension = path.suffix.lower()
+        if extension in {".pcap", ".pcapng", ".cap"}:
+            schema = DATASET_SCHEMAS["CIC-IDS"]
+            return DetectionResult(
+                dataset_type=schema.dataset_type,
+                analysis_mode=schema.analysis_mode,
+                confidence=1.0,
+                matched_markers=(),
+                scores={"CIC-IDS": 1.0},
+            )
 
-        best_dataset, best_score = sorted_scores[0]
-        second_score = sorted_scores[1][1] if len(sorted_scores) > 1 else 0.0
+        if extension != ".csv":
+            return DetectionResult(
+                dataset_type="Unknown",
+                analysis_mode="Unknown",
+                confidence=0.0,
+                matched_markers=(),
+                scores={},
+            )
 
-        # Ambiguous only when both candidates are reasonably close and non-trivial.
-        ambiguous = bool(best_score >= 0.45 and second_score >= 0.40 and (best_score - second_score) <= 0.10)
-
-        if best_score < 0.35:
-            best_dataset = "Generic"
-
-        return {
-            "dataset": best_dataset,
-            "confidence": float(best_score),
-            "ambiguous": ambiguous,
-            "all_scores": {k: float(v) for k, v in scores.items()},
-            "second_best_score": float(second_score),
-        }
+        header = pd.read_csv(path, nrows=0)
+        return self.detect_with_confidence(list(header.columns))
