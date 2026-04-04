@@ -642,6 +642,3 @@ class GeminiService:
 Рекомендація: перевірте API ключ Gemini та повторіть запит.
 """
 
-
-if __name__ == "__main__":
-    print("GeminiService loaded successfully.")

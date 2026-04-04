@@ -1102,6 +1102,3 @@ class Visualizer:
         )
         return fig
 
-
-if __name__ == "__main__":
-    print("Visualizer loaded successfully.")

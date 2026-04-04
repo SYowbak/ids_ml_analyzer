@@ -93,13 +93,6 @@ def _style_dataframe(df: pd.DataFrame):
     except Exception:
         return df
 
-
-def _style_dataframe(df: pd.DataFrame):
-    if df is None or len(df) == 0: return df
-    try:
-        return df.style.set_properties(**{'background-color': '#ffffff', 'color': '#111111', 'border-color': '#e0e0e0'})
-    except Exception: return df
-
 def _first_existing_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
     if df is None or len(df.columns) == 0:
         return None
@@ -482,7 +475,7 @@ def render_comprehensive_dashboard(
         """
         <div class="card">
             <div class="card-header">
-                <div class="card-icon" style="background: #3b82f615; color: #3b82f6;">📊</div>
+                <div class="card-icon" style="background: #3b82f615; color: #3b82f6;">I</div>
                 <div>
                     <div class="card-title">Склад трафіку</div>
                     <div class="card-subtitle">Розподіл нормального та підозрілого трафіку</div>
@@ -510,7 +503,7 @@ def render_comprehensive_dashboard(
         """
         <div class="card">
             <div class="card-header">
-                <div class="card-icon" style="background: #f59e0b15; color: #f59e0b;">📈</div>
+                <div class="card-icon" style="background: #f59e0b15; color: #f59e0b;">II</div>
                 <div>
                     <div class="card-title">Часова лінія атак</div>
                     <div class="card-subtitle">Активність загроз у часі</div>
@@ -590,7 +583,7 @@ def render_comprehensive_dashboard(
             """
             <div class="card">
                 <div class="card-header">
-                    <div class="card-icon" style="background: #8b5cf615; color: #8b5cf6;">🔍</div>
+                    <div class="card-icon" style="background: #8b5cf615; color: #8b5cf6;">III</div>
                     <div>
                         <div class="card-title">Деталі виявлених загроз</div>
                         <div class="card-subtitle">Інформація про загрози та рекомендації</div>
@@ -863,7 +856,7 @@ def render_comprehensive_dashboard(
                     data=csv_bytes,
                     file_name=f"scan_results_{metrics.get('filename', 'export')}.csv",
                     mime="text/csv",
-                    use_container_width=True,
+                    width="stretch",
                     key="export_csv_btn",
                 )
             except Exception as _e:
@@ -881,7 +874,7 @@ def render_comprehensive_dashboard(
                     data=xlsx_bytes,
                     file_name=f"scan_report_{metrics.get('filename', 'export')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
+                    width="stretch",
                     key="export_excel_btn",
                 )
             except Exception as _e:
@@ -901,7 +894,7 @@ def render_comprehensive_dashboard(
                     data=pdf_bytes,
                     file_name=f"scan_report_{metrics.get('filename', 'export')}.pdf",
                     mime="application/pdf",
-                    use_container_width=True,
+                    width="stretch",
                     key="export_pdf_btn",
                 )
             except Exception as _e:
@@ -989,3 +982,4 @@ def render_comprehensive_dashboard(
                     st.caption(
                         "Оберіть формат: короткий звіт для керівництва або детальний технічний аналіз для SOC."
                     )
+

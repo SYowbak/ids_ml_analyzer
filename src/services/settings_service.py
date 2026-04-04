@@ -1,8 +1,11 @@
 
 import json
-import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 class SettingsService:
     """
@@ -23,7 +26,7 @@ class SettingsService:
             with open(self.config_path, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception as e:
-            print(f"Помилка завантаження налаштувань: {e}")
+            logger.warning("Помилка завантаження налаштувань: %s", e)
             return {}
 
     def _save_to_disk(self):
@@ -32,7 +35,7 @@ class SettingsService:
             with open(self.config_path, 'w', encoding='utf-8') as f:
                 json.dump(self._settings, f, indent=4, ensure_ascii=False)
         except Exception as e:
-            print(f"Помилка збереження налаштувань: {e}")
+            logger.error("Помилка збереження налаштувань: %s", e)
 
     def get(self, key: str, default: Any = None) -> Any:
         """Отримати значення налаштування."""

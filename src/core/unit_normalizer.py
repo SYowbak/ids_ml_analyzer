@@ -1,6 +1,10 @@
 
 import pandas as pd
 import numpy as np
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 
 class UnitNormalizer:
@@ -106,7 +110,7 @@ class UnitNormalizer:
                             df[name] = total_bytes / total_pkts.replace(0, 1.0)
                             
                 except Exception as e:
-                    print(f"[WARN] Error computing derived feature {name}: {e}")
+                    logger.warning("Error computing derived feature %s: %s", name, e)
                     df[name] = 0.0 # Default fallback
                     
         return df

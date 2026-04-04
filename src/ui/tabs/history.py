@@ -32,6 +32,7 @@ def render_history_tab(services: dict[str, Any], root_dir: Path) -> None:
                 "model_name": "Модель",
             }
         ),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
+

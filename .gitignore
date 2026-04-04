@@ -16,8 +16,11 @@ env/
 datasets/
 
 # Trained models (binary, large)
-models/*.joblib
-models/*.pkl
+models/
+**/*.joblib
+**/*.ubj
+**/*.pkl
+reports/verification/models/
 
 # Database
 *.db

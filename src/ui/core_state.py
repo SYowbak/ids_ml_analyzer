@@ -1,10 +1,14 @@
 import streamlit as st
 import gc
 import sys
+import logging
 from pathlib import Path
 from src.services.database import DatabaseService
 from src.services.report_generator import ReportGenerator
 from src.services.settings_service import SettingsService
+
+
+logger = logging.getLogger(__name__)
 
 # Налаштування шляхів
 ROOT_DIR = Path(__file__).parent.parent.parent
@@ -104,11 +108,15 @@ def setup_navigation():
         st.session_state.previous_tab = st.session_state.active_tab
 
     if st.session_state.previous_tab != st.session_state.active_tab:
-        print(f"[LOG] Switching from {st.session_state.previous_tab} to {st.session_state.active_tab}. Clearing memory...")
+        logger.info(
+            "Switching from %s to %s. Clearing memory...",
+            st.session_state.previous_tab,
+            st.session_state.active_tab,
+        )
         clear_session_memory()
         st.session_state.previous_tab = st.session_state.active_tab
         gc.collect()
-        print(f"[LOG] Memory cleared.")
+        logger.info("Memory cleared.")
 
 ALGORITHM_WIKI = {
     "Random Forest": {

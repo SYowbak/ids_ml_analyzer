@@ -609,6 +609,3 @@ class ReportGenerator:
         
         return elements
 
-
-if __name__ == "__main__":
-    print("ReportGenerator loaded successfully.")

@@ -21,23 +21,23 @@ def render_home_tab(services: dict[str, Any], root_dir: Path) -> None:
         st.metric("Виконані сканування", scans_count)
 
     with st.container(border=True):
-        st.subheader("Dual-Mode IDS")
+        st.subheader("Дворежимний IDS")
         mode_col1, mode_col2 = st.columns(2)
         with mode_col1:
             st.markdown(
                 """
-                **Mode A: Network Traffic (NIDS)**
+                **Режим A: мережевий трафік (NIDS)**
 
                 - Домен: `CIC-IDS`
                 - Вхід: `PCAP` або `CIC-IDS CSV`
                 - Алгоритми: `Random Forest`, `XGBoost`, `Isolation Forest`
-                - `PCAP` доступний лише для CIC-сумісних моделей; `Isolation Forest` показується для `PCAP` тільки якщо його навчали на PCAP-derived flow metrics
+                - `PCAP` доступний лише для CIC-сумісних моделей; `Isolation Forest` показується для `PCAP` тільки якщо модель навчали на flow-ознаках з мережевого трафіку
                 """
             )
         with mode_col2:
             st.markdown(
                 """
-                **Mode B: SIEM / Log Analysis**
+                **Режим B: SIEM / аналіз журналів**
 
                 - Домен: `NSL-KDD` або `UNSW-NB15`
                 - Вхід: лише `CSV`
@@ -54,7 +54,7 @@ def render_home_tab(services: dict[str, Any], root_dir: Path) -> None:
         )
 
     with st.container(border=True):
-        st.subheader("Gemini API Key")
+        st.subheader("Ключ Gemini API")
         new_key = st.text_input(
             "Локально збережений ключ",
             value=current_key,
@@ -63,11 +63,11 @@ def render_home_tab(services: dict[str, Any], root_dir: Path) -> None:
         )
         save_col, info_col = st.columns([1, 2])
         with save_col:
-            if st.button("Зберегти ключ", use_container_width=True):
+            if st.button("Зберегти ключ", width="stretch"):
                 services["settings"].set("gemini_api_key", new_key.strip())
                 st.success("Ключ збережено.")
         with info_col:
             if current_key:
-                st.caption("Ключ уже збережений локально.")
+                st.caption("Ключ вже збережено локально.")
             else:
-                st.caption("AI-пояснення залишаться вимкненими, доки ключ не буде доданий.")
+                st.caption("AI-пояснення будуть вимкнені, доки ключ не буде додано.")

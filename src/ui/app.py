@@ -34,7 +34,7 @@ def init_services() -> dict[str, object]:
 services = init_services()
 
 st.title("IDS ML Analyzer")
-st.caption("Строгий dual-mode підхід: окремий NIDS для CIC-IDS та окремий SIEM-потік для NSL-KDD / UNSW-NB15.")
+st.caption("Строгий підхід: окремий NIDS для CIC-IDS і окремий потік SIEM для NSL-KDD / UNSW-NB15.")
 
 home_tab, training_tab, scanning_tab, history_tab = st.tabs(
     ["Головна", "Тренування", "Сканування", "Історія"]
