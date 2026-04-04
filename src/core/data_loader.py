@@ -4,6 +4,20 @@ IDS ML Analyzer — Data Loader
 Memory-Efficient Data Loading Architecture
 -------------------------------------------
 
+.. warning:: BREAKING CHANGE (v2)
+
+   The PCAP duration floor was raised from 1µs to 1ms to prevent
+   synthetic extreme flow rates (e.g., 1.5 GBps for single-SYN flows)
+   that caused Isolation Forest false positives.
+
+   **Impact**: Isolation Forest models trained with the old 1µs floor
+   will produce DIFFERENT anomaly scores on the same PCAP files.
+   Re-train IF models after upgrading to this version.
+
+   Additionally, ``flow_bytes_s`` and ``flow_packets_s`` are now
+   clipped at ``_MAX_RATE_BYTES_PER_SEC`` (10 Gbps / 8 = 1.25 GB/s)
+   to reject physically impossible rates from very short flows.
+
 PCAP Loading Optimizations
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 1. __slots__-based FlowRecord vs dict:
@@ -82,6 +96,17 @@ _FLOW_TIMEOUT_SECONDS = 120.0
 # When exceeded, the oldest 20% of flows are forcibly evicted.
 _MAX_ACTIVE_FLOWS = 200_000
 _EVICT_FRACTION = 0.20
+
+# Duration floor for PCAP flow feature computation.
+# Old value (1e-6 = 1µs) created synthetic 1.5 GBps rates for single-packet
+# flows, triggering Isolation Forest false positives. Raised to 1ms.
+_DURATION_FLOOR_SECONDS = 1e-3  # 1 millisecond
+
+# Maximum physically plausible rate for network traffic features.
+# 10 Gbps / 8 = 1.25 GB/s. Rates exceeding this are clipped.
+# This bounds flow_bytes_s and flow_packets_s to prevent IF false positives
+# from extremely short flows producing astronomically high rates.
+_MAX_RATE_BYTES_PER_SEC = 1.25e9  # 10 Gbps in bytes/s
 
 
 # ---------------------------------------------------------------------------
@@ -805,12 +830,24 @@ class DataLoader:
 
     @staticmethod
     def _flow_record_to_row(flow: _FlowRecord) -> dict[str, object]:
-        """
-        Convert a _FlowRecord to a CIC-IDS feature dict.
+        """Convert a _FlowRecord to a CIC-IDS feature dict.
 
         All stats are read from _OnlineStat (no list.copy() needed → no allocation).
+
+        Rate computation notes:
+            - Duration is floored at ``_DURATION_FLOOR_SECONDS`` (1ms) to
+              avoid division-by-near-zero for single-packet flows.
+            - ``flow_bytes_s``, ``flow_packets_s``, ``fwd_packets_s``,
+              ``bwd_packets_s`` are clipped at ``_MAX_RATE_BYTES_PER_SEC``
+              to reject physically impossible values.
+
+        .. warning::
+            The old 1µs floor produced synthetic rates up to 1.5 GBps for
+            benign single-SYN flows, which triggered Isolation Forest
+            false positives. Models trained with the old floor will yield
+            different scores. Retrain IF models after this change.
         """
-        duration_s = max(flow.last_time - flow.start_time, 1e-6)
+        duration_s = max(flow.last_time - flow.start_time, _DURATION_FLOOR_SECONDS)
         duration_us = duration_s * 1_000_000.0
 
         total_pkts = flow.fwd_packets + flow.bwd_packets
@@ -824,6 +861,12 @@ class DataLoader:
         pk_mean,  pk_std,  pk_max,  pk_min  = flow.stat_pkt.as_stats()
 
         us = 1_000_000.0  # Conversion factor: seconds → microseconds
+
+        # Compute rates and clip to physical maximum.
+        flow_bytes_s = min(total_bytes / duration_s, _MAX_RATE_BYTES_PER_SEC)
+        flow_packets_s = min(total_pkts / duration_s, _MAX_RATE_BYTES_PER_SEC)
+        fwd_packets_s = min(flow.fwd_packets / duration_s, _MAX_RATE_BYTES_PER_SEC)
+        bwd_packets_s = min(flow.bwd_packets / duration_s, _MAX_RATE_BYTES_PER_SEC)
 
         return {
             "src_ip":                         flow.src_ip,
@@ -843,8 +886,8 @@ class DataLoader:
             "bwd_packet_length_min":          bwd_min,
             "bwd_packet_length_mean":         bwd_mean,
             "bwd_packet_length_std":          bwd_std,
-            "flow_bytes_s":                   total_bytes / duration_s,
-            "flow_packets_s":                 total_pkts  / duration_s,
+            "flow_bytes_s":                   flow_bytes_s,
+            "flow_packets_s":                 flow_packets_s,
             "flow_iat_mean":                  iat_mean * us,
             "flow_iat_std":                   iat_std  * us,
             "flow_iat_max":                   iat_max  * us,
@@ -863,8 +906,8 @@ class DataLoader:
             "bwd_psh_flags":                  flow.bwd_psh_flags,
             "fwd_urg_flags":                  flow.fwd_urg_flags,
             "bwd_urg_flags":                  flow.bwd_urg_flags,
-            "fwd_packets_s":                  flow.fwd_packets / duration_s,
-            "bwd_packets_s":                  flow.bwd_packets / duration_s,
+            "fwd_packets_s":                  fwd_packets_s,
+            "bwd_packets_s":                  bwd_packets_s,
             "min_packet_length":              pk_min,
             "max_packet_length":              pk_max,
             "packet_length_mean":             pk_mean,
@@ -887,3 +930,4 @@ class DataLoader:
             "subflow_bwd_packets":            flow.bwd_packets,
             "subflow_bwd_bytes":              flow.subflow_bwd_bytes,
         }
+

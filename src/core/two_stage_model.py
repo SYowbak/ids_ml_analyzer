@@ -28,6 +28,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
+from src.core.exceptions import SingleClassDatasetError
+
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, ClassifierMixin, clone
@@ -183,6 +185,19 @@ class TwoStageModel(BaseEstimator, ClassifierMixin):
 
         logger.info("[TwoStageModel] fit() called. Shape=%s, unique_labels=%d",
                     X.shape, y.nunique())
+
+        # ---- Early guard: require at least 2 classes ---------------------
+        unique_classes = np.unique(y)
+        if len(unique_classes) < 2:
+            raise SingleClassDatasetError(
+                found_classes=unique_classes.tolist(),
+                user_hint=(
+                    "Для тренування Two-Stage моделі потрібні щонайменше "
+                    "2 класи (BENIGN + хоча б 1 тип атаки). "
+                    f"Знайдено лише: {unique_classes.tolist()}. "
+                    "Додайте файли з різними класами."
+                ),
+            )
 
         if getattr(self, "is_fitted_", False):
             logger.warning(
@@ -621,8 +636,8 @@ class TwoStageModel(BaseEstimator, ClassifierMixin):
         # Numeric labels: prefer 0.
         unique_vals = np.unique(y)
         if len(unique_vals) < 2:
-            raise ValueError(
-                f"Для тренування потрібні як мінімум 2 класи. Знайдено: {unique_vals}."
+            raise SingleClassDatasetError(
+                found_classes=unique_vals.tolist(),
             )
         if 0 in set(unique_vals.tolist()):
             return 0

@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,144 @@ from src.ui.utils.model_helpers import (
 )
 
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent.parent
+
+
+# ---------------------------------------------------------------------------
+# Threshold Calibration Configuration — replaces 28+ hardcoded magic numbers
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ThresholdCalibrationConfig:
+    """Configuration profile for Two-Stage threshold calibration.
+
+    Each field was previously a magic number in an if/elif branch.
+    Frozen dataclass ensures immutability after construction.
+
+    Attributes:
+        target_fp_rate: Target false-positive rate on benign traffic.
+            Lower values produce stricter thresholds (fewer FP, more FN).
+        precision_floor: Minimum acceptable precision for attack class.
+            Thresholds producing precision below this get penalized.
+        max_attack_rate: Maximum fraction of samples the model should
+            predict as attacks. Prevents overprediction on imbalanced data.
+        fp_penalty_weight: Weight for FP rate exceeding target in the
+            objective function. Higher = more penalty for false positives.
+        over_pred_weight: Weight for attack overprediction penalty.
+            Higher = more penalty for predicting too many attacks.
+        precision_weight: Weight for precision floor violation penalty.
+            Controls how aggressively low precision is penalized.
+        f3_tolerance: F3-score tolerance for stability pool.
+            Thresholds within this delta of best F3 are considered equivalent.
+        precision_tolerance: Precision tolerance for stability pool.
+            Used together with f3_tolerance to define the stable range.
+    """
+
+    target_fp_rate: float
+    precision_floor: float
+    max_attack_rate: float
+    fp_penalty_weight: float
+    over_pred_weight: float
+    precision_weight: float
+    f3_tolerance: float = 0.002
+    precision_tolerance: float = 0.03
+
+
+# Pre-defined calibration profiles, keyed by attack-rate range.
+# Rationale for each tier:
+#   - ultra_rare  (<2%):  very conservative — even 1% FP is 50× the base rate
+#   - rare        (<5%):  still conservative but slightly relaxed
+#   - moderate    (<10%): standard NIDS dataset balance
+#   - common      (≥10%): attack-heavy datasets (e.g., KDD subsets)
+_CALIBRATION_PROFILES: dict[str, ThresholdCalibrationConfig] = {
+    "ultra_rare": ThresholdCalibrationConfig(
+        target_fp_rate=0.005,
+        precision_floor=0.75,
+        max_attack_rate=0.08,
+        fp_penalty_weight=1.0,
+        over_pred_weight=0.7,
+        precision_weight=0.45,
+    ),
+    "rare": ThresholdCalibrationConfig(
+        target_fp_rate=0.01,
+        precision_floor=0.70,
+        max_attack_rate=0.12,
+        fp_penalty_weight=0.75,
+        over_pred_weight=0.55,
+        precision_weight=0.40,
+    ),
+    "moderate": ThresholdCalibrationConfig(
+        target_fp_rate=0.02,
+        precision_floor=0.65,
+        max_attack_rate=0.20,
+        fp_penalty_weight=0.65,
+        over_pred_weight=0.40,
+        precision_weight=0.38,
+    ),
+    "common": ThresholdCalibrationConfig(
+        target_fp_rate=0.04,
+        precision_floor=0.60,
+        max_attack_rate=0.60,
+        fp_penalty_weight=0.55,
+        over_pred_weight=0.25,
+        precision_weight=0.35,
+    ),
+}
+
+
+def _get_calibration_config(
+    attack_rate: float,
+) -> ThresholdCalibrationConfig:
+    """Select the appropriate calibration profile for the given attack rate.
+
+    The ``max_attack_rate`` is adjusted dynamically based on the actual
+    attack prevalence — the static profile value is an upper bound.
+
+    Args:
+        attack_rate: Fraction of attack samples in validation data [0, 1].
+
+    Returns:
+        ThresholdCalibrationConfig with all weights set.
+    """
+    if attack_rate < 0.02:
+        base = _CALIBRATION_PROFILES["ultra_rare"]
+        dynamic_max = min(base.max_attack_rate, (attack_rate * 2.5) + 0.02)
+    elif attack_rate < 0.05:
+        base = _CALIBRATION_PROFILES["rare"]
+        dynamic_max = min(base.max_attack_rate, (attack_rate * 2.0) + 0.03)
+    elif attack_rate < 0.10:
+        base = _CALIBRATION_PROFILES["moderate"]
+        dynamic_max = min(base.max_attack_rate, (attack_rate * 1.8) + 0.04)
+    else:
+        base = _CALIBRATION_PROFILES["common"]
+        target_fp = 0.03 if attack_rate < 0.25 else 0.04
+        dynamic_max = min(base.max_attack_rate, (attack_rate * 1.6) + 0.05)
+        # For common profile, target_fp varies with sub-range.
+        base = ThresholdCalibrationConfig(
+            target_fp_rate=target_fp,
+            precision_floor=base.precision_floor,
+            max_attack_rate=dynamic_max,
+            fp_penalty_weight=base.fp_penalty_weight,
+            over_pred_weight=base.over_pred_weight,
+            precision_weight=base.precision_weight,
+            f3_tolerance=base.f3_tolerance,
+            precision_tolerance=base.precision_tolerance,
+        )
+        return base
+
+    # Build a new config with the dynamic max_attack_rate.
+    dynamic_max = float(np.clip(dynamic_max, 0.01, 0.90))
+    return ThresholdCalibrationConfig(
+        target_fp_rate=base.target_fp_rate,
+        precision_floor=base.precision_floor,
+        max_attack_rate=dynamic_max,
+        fp_penalty_weight=base.fp_penalty_weight,
+        over_pred_weight=base.over_pred_weight,
+        precision_weight=base.precision_weight,
+        f3_tolerance=base.f3_tolerance,
+        precision_tolerance=base.precision_tolerance,
+    )
+
 
 def _to_attack_binary(labels: pd.Series) -> np.ndarray:
     normalized = labels.astype(str).str.strip().str.lower()
@@ -146,36 +285,9 @@ def _calibrate_two_stage_threshold(
         return result
 
     attack_rate = float(np.mean(y_true_attack))
-    # Adaptive FP target and guards for low-prevalence datasets.
-    if attack_rate < 0.02:
-        target_fp_rate = 0.005
-        precision_floor = 0.75
-        max_attack_rate = min(0.08, (attack_rate * 2.5) + 0.02)
-        fp_penalty_weight = 1.0
-        over_pred_weight = 0.7
-        precision_weight = 0.45
-    elif attack_rate < 0.05:
-        target_fp_rate = 0.01
-        precision_floor = 0.70
-        max_attack_rate = min(0.12, (attack_rate * 2.0) + 0.03)
-        fp_penalty_weight = 0.75
-        over_pred_weight = 0.55
-        precision_weight = 0.40
-    elif attack_rate < 0.10:
-        target_fp_rate = 0.02
-        precision_floor = 0.65
-        max_attack_rate = min(0.20, (attack_rate * 1.8) + 0.04)
-        fp_penalty_weight = 0.65
-        over_pred_weight = 0.40
-        precision_weight = 0.38
-    else:
-        target_fp_rate = 0.03 if attack_rate < 0.25 else 0.04
-        precision_floor = 0.60
-        max_attack_rate = min(0.60, (attack_rate * 1.6) + 0.05)
-        fp_penalty_weight = 0.55
-        over_pred_weight = 0.25
-        precision_weight = 0.35
-    max_attack_rate = float(np.clip(max_attack_rate, 0.01, 0.90))
+    # Select calibration profile based on attack prevalence.
+    cfg = _get_calibration_config(attack_rate)
+    max_attack_rate = float(np.clip(cfg.max_attack_rate, 0.01, 0.90))
 
     best = {
         'threshold': fallback_threshold,
@@ -212,14 +324,14 @@ def _calibrate_two_stage_threshold(
         f3 = float((10.0 * precision * recall) / denom_f3) if denom_f3 > 0 else 0.0
 
         # Soft guard against extremely low precision.
-        precision_penalty = max(0.0, precision_floor - precision)
-        fp_penalty = max(0.0, fp_rate - target_fp_rate)
+        precision_penalty = max(0.0, cfg.precision_floor - precision)
+        fp_penalty = max(0.0, fp_rate - cfg.target_fp_rate)
         over_pred_penalty = max(0.0, pred_attack_rate - max_attack_rate)
         objective = (
             f3
-            - (precision_penalty * precision_penalty * precision_weight)
-            - (fp_penalty * fp_penalty_weight)
-            - (over_pred_penalty * over_pred_weight)
+            - (precision_penalty * precision_penalty * cfg.precision_weight)
+            - (fp_penalty * cfg.fp_penalty_weight)
+            - (over_pred_penalty * cfg.over_pred_weight)
         )
         threshold_stats.append(
             {
@@ -261,12 +373,10 @@ def _calibrate_two_stage_threshold(
     # якщо кілька порогів майже рівноцінні за F3, обираємо той, що ближче
     # до дефолтного і зазвичай дає стабільніший баланс FP/FN.
     if threshold_stats:
-        f3_tolerance = 0.002
-        precision_tolerance = 0.03
         stable_pool = [
             item for item in threshold_stats
-            if item['f3_attack'] >= (best['f3_attack'] - f3_tolerance)
-            and item['precision_attack'] >= max(0.0, best['precision_attack'] - precision_tolerance)
+            if item['f3_attack'] >= (best['f3_attack'] - cfg.f3_tolerance)
+            and item['precision_attack'] >= max(0.0, best['precision_attack'] - cfg.precision_tolerance)
         ]
         if stable_pool:
             stable_choice = min(
@@ -288,7 +398,7 @@ def _calibrate_two_stage_threshold(
         attack_probs = probas[:, attack_idx]
         benign_mask = (y_true_attack == 0)
         if benign_mask.any():
-            fp_threshold = float(np.quantile(attack_probs[benign_mask], 1.0 - target_fp_rate))
+            fp_threshold = float(np.quantile(attack_probs[benign_mask], 1.0 - cfg.target_fp_rate))
             fp_threshold = _clamp_two_stage_threshold(fp_threshold)
             if fp_threshold > best['threshold']:
                 best['threshold'] = fp_threshold
@@ -312,9 +422,9 @@ def _calibrate_two_stage_threshold(
         'recall_attack': float(recall_score(y_true_attack, y_pred_attack_final, zero_division=0)),
         'evaluated_points': int(result.get('evaluated_points', 0)),
         'objective': float(best.get('objective', 0.0)),
-        'target_fp_rate': float(target_fp_rate),
+        'target_fp_rate': float(cfg.target_fp_rate),
         'max_attack_rate': float(max_attack_rate),
-        'precision_floor': float(precision_floor),
+        'precision_floor': float(cfg.precision_floor),
     })
     return result
 
