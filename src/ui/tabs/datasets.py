@@ -15,6 +15,7 @@ from src.core.dataset_nature import (
     nature_for_dataset,
 )
 from src.core.domain_schemas import normalize_column_name
+from src.ui.utils.table_helpers import with_row_number
 
 
 DATASET_SEARCH_DIRS = (
@@ -173,18 +174,20 @@ def render_datasets_tab(services: dict[str, Any], root_dir: Path) -> None:
     st.caption(f"Знайдено сумісних датасетів: {len(compatible)}")
     if compatible:
         st.dataframe(
-            pd.DataFrame(
-                [
-                    {
-                        "Файл": row["name"],
-                        "Датасет": row["dataset_type"],
-                        "Режим": row["analysis_mode"],
-                        "Колонки": row["columns_count"],
-                        "Довіра": f"{row['confidence']:.2f}",
-                        "Шлях": row["relative_path"],
-                    }
-                    for row in compatible
-                ]
+            with_row_number(
+                pd.DataFrame(
+                    [
+                        {
+                            "Файл": row["name"],
+                            "Датасет": row["dataset_type"],
+                            "Режим": row["analysis_mode"],
+                            "Колонки": row["columns_count"],
+                            "Довіра": f"{row['confidence']:.2f}",
+                            "Шлях": row["relative_path"],
+                        }
+                        for row in compatible
+                    ]
+                )
             ),
             width="stretch",
             hide_index=True,
@@ -219,14 +222,14 @@ def render_datasets_tab(services: dict[str, Any], root_dir: Path) -> None:
             preview = _read_preview(str(preview_path), rows=10)
 
         st.markdown("**Перші 10 рядків**")
-        st.dataframe(preview, width="stretch", hide_index=True)
+        st.dataframe(with_row_number(preview), width="stretch", hide_index=True)
 
         label_column = _detect_label_column(preview)
         if label_column:
             distribution = preview[label_column].astype(str).value_counts().reset_index()
             distribution.columns = ["Клас", "Кількість"]
             st.markdown("**Розподіл класів (preview)**")
-            st.dataframe(distribution, width="stretch", hide_index=True)
+            st.dataframe(with_row_number(distribution), width="stretch", hide_index=True)
 
         if st.button(
             "Перевірити якість датасету",
@@ -259,7 +262,7 @@ def render_datasets_tab(services: dict[str, Any], root_dir: Path) -> None:
                     )
 
             quality_df = pd.DataFrame(quality_rows)
-            st.dataframe(quality_df, width="stretch", hide_index=True)
+            st.dataframe(with_row_number(quality_df), width="stretch", hide_index=True)
             st.success("Перевірку якості завершено.")
     else:
         st.info("Оберіть хоча б один сумісний датасет для продовження.")

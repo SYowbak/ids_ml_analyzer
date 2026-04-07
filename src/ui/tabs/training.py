@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+import time
 import uuid
 
 import numpy as np
@@ -14,15 +15,18 @@ from sklearn.model_selection import train_test_split
 
 from src.core.data_loader import DataLoader
 from src.core.dataset_nature import (
+    NATURE_CLASSIC_IDS,
+    NATURE_MODERN_NETWORK,
     NATURE_NETWORK_INTRUSION,
     get_nature,
     list_natures,
     nature_for_dataset,
     supported_algorithms_for_nature,
 )
-from src.core.domain_schemas import get_schema, is_benign_label
+from src.core.domain_schemas import get_schema, is_benign_label, normalize_frame_columns, resolve_target_labels
 from src.core.model_engine import ModelEngine
 from src.core.preprocessor import Preprocessor
+from src.ui.utils.table_helpers import with_row_number
 
 
 IMPLEMENTED_ALGORITHMS = {
@@ -31,18 +35,23 @@ IMPLEMENTED_ALGORITHMS = {
     "Isolation Forest",
 }
 
+TRAINING_UI_MODE_BEGINNER = "Простий (рекомендовано)"
+TRAINING_UI_MODE_EXPERT = "Експертний (повний контроль)"
+
 
 def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
     del services
 
     _init_training_state()
+    now_monotonic = float(time.monotonic())
+    training_in_progress = bool(st.session_state.get("training_in_progress", False))
+    training_click_locked = float(st.session_state.get("training_click_guard_until", 0.0) or 0.0) > now_monotonic
     loader = DataLoader()
     models_dir = root_dir / "models"
-    library_dir = root_dir / "datasets" / "Training_Ready"
     upload_dir = root_dir / "datasets" / "User_Uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
 
-    st.subheader("Навчання моделі")
+    st.subheader("Навчання моделі", anchor=False)
     available_natures = list_natures()
     nature_ids = [item.nature_id for item in available_natures]
     selected_nature_id = str(st.session_state.get("selected_nature_id", NATURE_NETWORK_INTRUSION))
@@ -66,36 +75,34 @@ def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
         "Навчання дозволяє об'єднувати тільки сумісні датасети цієї природи."
     )
 
+    nature_purpose_map = {
+        NATURE_NETWORK_INTRUSION: "для виявлення мережевих атак у трафіку (наприклад, сканування або DDoS).",
+        NATURE_CLASSIC_IDS: "для навчального та порівняльного аналізу моделей на класичному IDS-еталоні.",
+        NATURE_MODERN_NETWORK: "для перевірки моделі на сучасному різнотипному мережевому трафіку.",
+    }
+    nature_purpose = nature_purpose_map.get(
+        selected_nature_id,
+        "для навчання моделі на даних цього домену.",
+    )
+
+    st.info(
+        "Що важливо:\n"
+        f"- Сумісні датасети: {', '.join(definition.dataset_display_names)}.\n"
+        "- Тип файлу для навчання: тільки CSV.\n"
+        f"- Призначення цього типу: {nature_purpose}"
+    )
+
     selected_paths_from_datasets_page: list[Path] = []
     for relative_path in st.session_state.get("training_selected_paths", []):
         path = root_dir / str(relative_path)
         if path.exists() and path.suffix.lower() == ".csv":
             selected_paths_from_datasets_page.append(path)
 
-    library_files = sorted(library_dir.glob("*.csv"))
-    compatible_library_files: list[Path] = []
-    for file_path in library_files:
-        try:
-            details = loader.inspect_file(file_path)
-            if nature_for_dataset(details.dataset_type) == selected_nature_id:
-                compatible_library_files.append(file_path)
-        except Exception:
-            continue
-
     with st.container(border=True):
         st.markdown("**Крок 1. Оберіть тренувальні CSV**")
 
-        default_library_names = [path.name for path in selected_paths_from_datasets_page if path.parent == library_dir]
-        selected_library_names = st.multiselect(
-            "Файли з каталогу Training_Ready",
-            options=[file.name for file in compatible_library_files],
-            default=default_library_names,
-            help="Дозволено обирати кілька CSV однієї природи.",
-            key="training_selected_library_names",
-        )
-
         uploaded_files = st.file_uploader(
-            "Або додайте власні CSV",
+            "Завантажте власні CSV",
             type=["csv"],
             accept_multiple_files=True,
             key="training_uploaded_files",
@@ -103,9 +110,10 @@ def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
         )
 
         uploaded_paths = _persist_uploaded_files(uploaded_files, upload_dir, prefix="training")
-        selected_paths = [file for file in compatible_library_files if file.name in selected_library_names] + uploaded_paths
+        selected_paths = list(uploaded_paths)
         if selected_paths_from_datasets_page:
-            selected_paths = list(dict.fromkeys(selected_paths + selected_paths_from_datasets_page))
+            selected_paths.extend(selected_paths_from_datasets_page)
+        selected_paths = list(dict.fromkeys(selected_paths))
 
         inspection_rows, selected_dataset_type, selection_error = _inspect_training_files(
             loader=loader,
@@ -114,7 +122,7 @@ def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
         )
 
         if inspection_rows:
-            st.dataframe(pd.DataFrame(inspection_rows), width="stretch", hide_index=True)
+            st.dataframe(with_row_number(pd.DataFrame(inspection_rows)), width="stretch", hide_index=True)
         else:
             st.info("Оберіть хоча б один CSV для навчання.")
 
@@ -135,47 +143,169 @@ def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
     if not allowed_algorithms:
         allowed_algorithms = ["Random Forest"]
 
+    if st.session_state.get("training_force_expert_mode", False):
+        st.session_state["training_ui_mode"] = TRAINING_UI_MODE_EXPERT
+        st.session_state["training_force_expert_mode"] = False
+
+    training_ui_mode = st.radio(
+        "Режим керування навчанням",
+        options=[TRAINING_UI_MODE_BEGINNER, TRAINING_UI_MODE_EXPERT],
+        index=0 if st.session_state.get("training_ui_mode") != TRAINING_UI_MODE_EXPERT else 1,
+        horizontal=True,
+        key="training_ui_mode",
+        help=(
+            "Простий режим підходить для новачків: безпечні параметри вже підібрані. "
+            "Експертний режим відкриває всі повзунки для тонкого тюнінгу."
+        ),
+    )
+    is_expert_mode = training_ui_mode == TRAINING_UI_MODE_EXPERT
+    if not is_expert_mode:
+        st.info(
+            "Рекомендований шлях для новачка: 1) оберіть файли, 2) натисніть запуск. "
+            "Система сама застосує безпечні параметри."
+        )
+
     mode_auto_tab, mode_manual_tab = st.tabs(["Автоматичний режим", "Ручний режим"])
 
     with mode_auto_tab:
         st.markdown("**Система автоматично обирає та навчає найкращу доступну модель для активної природи.**")
+        if is_expert_mode:
+            auto_max_rows_per_file = st.number_input(
+                "Ліміт рядків з одного CSV (авто)",
+                min_value=0,
+                max_value=250000,
+                value=0,
+                step=1000,
+                help="0 = без обмеження. Інакше застосовується репрезентативний семпл для стабільності UI.",
+                key="training_auto_max_rows_per_file",
+            )
+        else:
+            auto_max_rows_per_file = 0
+            st.caption(
+                "Простий режим: застосовано швидкий безпечний профіль "
+                f"({'без обмеження' if auto_max_rows_per_file <= 0 else auto_max_rows_per_file} рядків/файл, без GridSearch)."
+            )
+        auto_grid_search_enabled = bool(is_expert_mode)
         auto_disabled = not selected_paths or bool(selection_error) or not selected_dataset_type
+        if training_in_progress:
+            auto_start_label = "Навчання виконується..."
+        elif training_click_locked:
+            auto_start_label = "Зачекайте..."
+        else:
+            auto_start_label = "Навчити найкращу модель"
         if st.button(
-            "Навчити найкращу модель",
+            auto_start_label,
             type="primary",
-            disabled=auto_disabled,
+            disabled=auto_disabled or training_in_progress or training_click_locked,
             width="stretch",
-            help="Автоматичний підбір: алгоритм + GridSearch + валідація + збереження.",
+            help=(
+                "У простому режимі: швидке авто-навчання без GridSearch. "
+                "В експертному: авто-порівняння кандидатів із GridSearch."
+            ),
             key="training_auto_start",
         ):
-            auto_algorithm = "XGBoost" if "XGBoost" in allowed_algorithms else allowed_algorithms[0]
-            progress = st.progress(0, text="Підготовка даних...")
-            try:
-                progress.progress(20, text="Валідація датасетів...")
-                progress.progress(40, text=f"Підбір алгоритму: {auto_algorithm}...")
-                with st.spinner("Триває автоматичне навчання..."):
-                    result = _run_training(
-                        loader=loader,
-                        models_dir=models_dir,
-                        selected_paths=selected_paths,
-                        dataset_type=selected_dataset_type,
-                        algorithm=auto_algorithm,
-                        use_grid_search=auto_algorithm != "Isolation Forest",
-                        max_rows_per_file=25000,
-                        test_size=0.2,
-                        algorithm_params={},
+            if not _try_begin_training_run():
+                st.warning("Запуск уже виконується або щойно стартував. Подвійний клік проігноровано.")
+            else:
+                auto_algorithms = _resolve_auto_algorithms(allowed_algorithms)
+                progress = st.progress(0, text="Підготовка даних...")
+                try:
+                    progress.progress(20, text="Валідація датасетів...")
+                    shared_frames: list[pd.DataFrame] | None = None
+                    if (not is_expert_mode) and selected_dataset_type:
+                        progress.progress(28, text="Підготовка спільної вибірки для кандидатів...")
+                        shared_frames = _load_training_frames(
+                            loader=loader,
+                            selected_paths=selected_paths,
+                            dataset_type=selected_dataset_type,
+                            max_rows_per_file=int(auto_max_rows_per_file),
+                        )
+                    progress.progress(35, text="Запуск авто-порівняння алгоритмів...")
+                    candidate_runs: list[dict[str, Any]] = []
+                    failed_runs: list[str] = []
+                    total_candidates = max(1, len(auto_algorithms))
+                    with st.spinner("Триває автоматичне навчання..."):
+                        for index, auto_algorithm in enumerate(auto_algorithms, start=1):
+                            step_progress = int(35 + ((index - 1) / total_candidates) * 50)
+                            progress.progress(
+                                step_progress,
+                                text=f"Навчання кандидата {index}/{total_candidates}: {auto_algorithm}...",
+                            )
+                            try:
+                                candidate_result = _run_training(
+                                    loader=loader,
+                                    models_dir=models_dir,
+                                    selected_paths=selected_paths,
+                                    dataset_type=selected_dataset_type,
+                                    algorithm=auto_algorithm,
+                                    use_grid_search=bool(
+                                        auto_grid_search_enabled and auto_algorithm != "Isolation Forest"
+                                    ),
+                                    max_rows_per_file=int(auto_max_rows_per_file),
+                                    test_size=0.2,
+                                    algorithm_params=(
+                                        _recommended_safe_algorithm_params(
+                                            selected_algorithm=auto_algorithm,
+                                            dataset_type=selected_dataset_type,
+                                            max_rows_per_file=int(auto_max_rows_per_file),
+                                        )
+                                        if not is_expert_mode
+                                        else {}
+                                    ),
+                                    preloaded_frames=shared_frames,
+                                )
+                                candidate_runs.append(
+                                    {
+                                        "algorithm": auto_algorithm,
+                                        "result": candidate_result,
+                                    }
+                                )
+                            except Exception as exc:
+                                failed_runs.append(f"{auto_algorithm}: {exc}")
+
+                    if not candidate_runs:
+                        details = "; ".join(failed_runs[:3]) if failed_runs else "невідома причина"
+                        raise ValueError(f"Авто-режим не зміг навчити жодного кандидата ({details}).")
+
+                    best_candidate = _select_best_auto_candidate(candidate_runs)
+                    result = dict(best_candidate["result"])
+                    result["training_mode"] = "auto"
+                    result["auto_selected_algorithm"] = best_candidate["algorithm"]
+                    result["auto_compared_algorithms"] = [item["algorithm"] for item in candidate_runs]
+                    result["auto_candidate_scores"] = [
+                        {
+                            "algorithm": item["algorithm"],
+                            "accuracy": float(item["result"].get("metrics", {}).get("accuracy", 0.0)),
+                            "precision": float(item["result"].get("metrics", {}).get("precision", 0.0)),
+                            "recall": float(item["result"].get("metrics", {}).get("recall", 0.0)),
+                            "f1": float(item["result"].get("metrics", {}).get("f1", 0.0)),
+                        }
+                        for item in candidate_runs
+                    ]
+                    if failed_runs:
+                        result["auto_failed_algorithms"] = failed_runs
+
+                    progress.progress(95, text="Формування фінального звіту...")
+                    st.session_state.training_result = result
+                    progress.progress(100, text="Готово")
+                    compared = ", ".join(result.get("auto_compared_algorithms", []))
+                    st.success(
+                        "Автоматичне навчання завершено. "
+                        f"Порівняно: {compared}. Обрано: {result.get('auto_selected_algorithm', result.get('algorithm'))}."
                     )
-                progress.progress(95, text="Формування фінального звіту...")
-                result["training_mode"] = "auto"
-                st.session_state.training_result = result
-                progress.progress(100, text="Готово")
-                st.success(f"Автоматичне навчання завершено. Обрано: {auto_algorithm}.")
-            except Exception as exc:
-                st.session_state.training_result = None
-                st.error(str(exc))
+                    if failed_runs:
+                        st.warning("Не вдалося навчити частину кандидатів: " + "; ".join(failed_runs))
+                except Exception as exc:
+                    st.session_state.training_result = None
+                    st.error(str(exc))
+                finally:
+                    _finish_training_run()
 
     with mode_manual_tab:
-        st.markdown("**Ручний режим для повного контролю параметрів навчання.**")
+        if is_expert_mode:
+            st.markdown("**Ручний режим для повного контролю параметрів навчання.**")
+        else:
+            st.markdown("**Спрощений ручний режим: безпечні параметри без складних налаштувань.**")
 
         selected_algorithm = st.selectbox(
             "Алгоритм",
@@ -183,6 +313,83 @@ def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
             help="Показано тільки алгоритми, сумісні з активною природою.",
             key="training_algorithm",
         )
+
+        if not is_expert_mode:
+            max_rows_per_file = 0
+            test_size = 0.2
+            use_grid_search = False
+            algorithm_params = _recommended_safe_algorithm_params(
+                selected_algorithm=selected_algorithm,
+                dataset_type=selected_dataset_type,
+                max_rows_per_file=int(max_rows_per_file),
+            )
+
+            st.caption(
+                "У спрощеному режимі параметри безпеки/стабільності застосовуються автоматично: "
+                f"test_size={test_size:.2f}, grid_search=off, max_rows_per_file="
+                f"{'без обмеження' if max_rows_per_file <= 0 else max_rows_per_file}, "
+                f"params={_format_params_hint(algorithm_params)}"
+            )
+
+            manual_disabled = not selected_paths or bool(selection_error) or not selected_dataset_type
+            if training_in_progress:
+                safe_start_label = "Навчання виконується..."
+            elif training_click_locked:
+                safe_start_label = "Зачекайте..."
+            else:
+                safe_start_label = "Запустити навчання (безпечний режим)"
+            if st.button(
+                safe_start_label,
+                type="primary",
+                disabled=manual_disabled or training_in_progress or training_click_locked,
+                width="stretch",
+                help="Запускає навчання з безпечними рекомендованими параметрами.",
+                key="training_manual_start_safe",
+            ):
+                if not _try_begin_training_run():
+                    st.warning("Запуск уже виконується або щойно стартував. Подвійний клік проігноровано.")
+                else:
+                    progress = st.progress(0, text="Підготовка даних...")
+                    try:
+                        progress.progress(25, text="Побудова train/test вибірок...")
+                        with st.spinner("Триває навчання моделі..."):
+                            result = _run_training(
+                                loader=loader,
+                                models_dir=models_dir,
+                                selected_paths=selected_paths,
+                                dataset_type=selected_dataset_type,
+                                algorithm=selected_algorithm,
+                                use_grid_search=use_grid_search,
+                                max_rows_per_file=int(max_rows_per_file),
+                                test_size=float(test_size),
+                                algorithm_params=algorithm_params,
+                            )
+                        progress.progress(90, text="Підготовка підсумкових метрик...")
+                        result["training_mode"] = "manual_safe"
+                        st.session_state.training_result = result
+                        progress.progress(100, text="Готово")
+                        st.success("Навчання у безпечному режимі завершено успішно.")
+                    except Exception as exc:
+                        st.session_state.training_result = None
+                        st.error(str(exc))
+                    finally:
+                        _finish_training_run()
+
+            if st.button(
+                "Перейти в експертний режим",
+                key="training_switch_to_expert",
+                width="stretch",
+                disabled=training_in_progress,
+                help="Відкриває повний набір повзунків та ручних параметрів.",
+            ):
+                st.session_state["training_force_expert_mode"] = True
+                st.rerun()
+
+            st.caption("Потрібні детальні повзунки? Перейдіть у експертний режим.")
+
+            if st.session_state.training_result:
+                _render_training_result(st.session_state.training_result)
+            return
 
         evaluation_mode = st.selectbox(
             "Режим валідації",
@@ -208,15 +415,42 @@ def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
             key="training_use_grid_search",
         )
 
+        suggested_params = _resolve_manual_suggested_params(
+            selected_algorithm=selected_algorithm,
+            training_result=st.session_state.get("training_result"),
+        )
+        suggested_hint = "best_params" if isinstance((st.session_state.get("training_result") or {}).get("best_params"), dict) else "поточних configured_params"
+        if suggested_params:
+            st.caption(
+                "Доступна підказка параметрів з останнього навчання для цього алгоритму. "
+                f"Джерело: {suggested_hint}."
+            )
+
+        if st.button(
+            "Підставити best_params у повзунки",
+            disabled=not bool(suggested_params) or training_in_progress,
+            width="stretch",
+            help="Заповнює повзунки ручного режиму найкращими параметрами з останнього результату.",
+            key="training_apply_best_params",
+        ):
+            updates = _build_manual_param_updates(selected_algorithm, suggested_params)
+            if not updates:
+                st.info("Для цього алгоритму немає параметрів, які можна підставити у повзунки.")
+            else:
+                for key, value in updates.items():
+                    st.session_state[key] = value
+                st.success("Параметри застосовано до ручного режиму.")
+                st.rerun()
+
         param_col1, param_col2 = st.columns(2)
         with param_col1:
             max_rows_per_file = st.number_input(
                 "Ліміт рядків з одного CSV",
-                min_value=1000,
+                min_value=0,
                 max_value=250000,
-                value=25000,
+                value=0,
                 step=1000,
-                help="Обмежує обсяг для швидшого навчання і стабільності UI.",
+                help="0 = без обмеження. Інакше застосовується репрезентативний семпл для стабільності UI.",
                 key="training_max_rows_per_file",
             )
         with param_col2:
@@ -233,37 +467,48 @@ def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
         algorithm_params = _render_algorithm_parameters(selected_algorithm)
 
         manual_disabled = not selected_paths or bool(selection_error) or not selected_dataset_type
+        if training_in_progress:
+            manual_start_label = "Навчання виконується..."
+        elif training_click_locked:
+            manual_start_label = "Зачекайте..."
+        else:
+            manual_start_label = "Запустити навчання"
         if st.button(
-            "Запустити навчання",
+            manual_start_label,
             type="primary",
-            disabled=manual_disabled,
+            disabled=manual_disabled or training_in_progress or training_click_locked,
             width="stretch",
             help="Запускає навчання з обраними параметрами.",
             key="training_manual_start",
         ):
-            progress = st.progress(0, text="Підготовка даних...")
-            try:
-                progress.progress(25, text="Побудова train/test вибірок...")
-                with st.spinner("Триває навчання моделі..."):
-                    result = _run_training(
-                        loader=loader,
-                        models_dir=models_dir,
-                        selected_paths=selected_paths,
-                        dataset_type=selected_dataset_type,
-                        algorithm=selected_algorithm,
-                        use_grid_search=use_grid_search,
-                        max_rows_per_file=int(max_rows_per_file),
-                        test_size=float(test_size),
-                        algorithm_params=algorithm_params,
-                    )
-                progress.progress(90, text="Підготовка підсумкових метрик...")
-                result["training_mode"] = "manual"
-                st.session_state.training_result = result
-                progress.progress(100, text="Готово")
-                st.success("Ручне навчання завершено успішно.")
-            except Exception as exc:
-                st.session_state.training_result = None
-                st.error(str(exc))
+            if not _try_begin_training_run():
+                st.warning("Запуск уже виконується або щойно стартував. Подвійний клік проігноровано.")
+            else:
+                progress = st.progress(0, text="Підготовка даних...")
+                try:
+                    progress.progress(25, text="Побудова train/test вибірок...")
+                    with st.spinner("Триває навчання моделі..."):
+                        result = _run_training(
+                            loader=loader,
+                            models_dir=models_dir,
+                            selected_paths=selected_paths,
+                            dataset_type=selected_dataset_type,
+                            algorithm=selected_algorithm,
+                            use_grid_search=use_grid_search,
+                            max_rows_per_file=int(max_rows_per_file),
+                            test_size=float(test_size),
+                            algorithm_params=algorithm_params,
+                        )
+                    progress.progress(90, text="Підготовка підсумкових метрик...")
+                    result["training_mode"] = "manual"
+                    st.session_state.training_result = result
+                    progress.progress(100, text="Готово")
+                    st.success("Ручне навчання завершено успішно.")
+                except Exception as exc:
+                    st.session_state.training_result = None
+                    st.error(str(exc))
+                finally:
+                    _finish_training_run()
 
     if st.session_state.training_result:
         _render_training_result(st.session_state.training_result)
@@ -271,8 +516,294 @@ def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
 
 def _init_training_state() -> None:
     st.session_state.setdefault("training_result", None)
-    st.session_state.setdefault("training_selected_library_names", [])
     st.session_state.setdefault("training_uploaded_cache", {})
+    st.session_state.setdefault("training_ui_mode", TRAINING_UI_MODE_BEGINNER)
+    st.session_state.setdefault("training_force_expert_mode", False)
+    st.session_state.setdefault("training_in_progress", False)
+    st.session_state.setdefault("training_last_started_monotonic", 0.0)
+    st.session_state.setdefault("training_click_guard_until", 0.0)
+
+
+def _reset_scan_result_state() -> None:
+    # New training invalidates previous scan view and avoids stale/ghosted UI output.
+    st.session_state["scan_result"] = None
+    st.session_state["scan_result_signature"] = None
+
+
+def _try_begin_training_run(cooldown_seconds: float = 1.2) -> bool:
+    now = float(time.monotonic())
+    guard_until = float(st.session_state.get("training_click_guard_until", 0.0) or 0.0)
+    if now < guard_until:
+        return False
+
+    if bool(st.session_state.get("training_in_progress", False)):
+        return False
+
+    last_started = float(st.session_state.get("training_last_started_monotonic", 0.0) or 0.0)
+    if last_started > 0.0 and (now - last_started) < float(cooldown_seconds):
+        return False
+
+    st.session_state["training_in_progress"] = True
+    st.session_state["training_last_started_monotonic"] = now
+    st.session_state["training_click_guard_until"] = now + 0.8
+    _reset_scan_result_state()
+    return True
+
+
+def _finish_training_run(post_guard_seconds: float = 2.5) -> None:
+    st.session_state["training_in_progress"] = False
+    now = float(time.monotonic())
+    current_guard = float(st.session_state.get("training_click_guard_until", 0.0) or 0.0)
+    st.session_state["training_click_guard_until"] = max(current_guard, now + float(post_guard_seconds))
+
+
+def _resolve_beginner_row_limit(selected_paths: list[Path]) -> int:
+    if not selected_paths:
+        return 25000
+
+    total_bytes = 0
+    for path in selected_paths:
+        try:
+            total_bytes += int(path.stat().st_size)
+        except Exception:
+            continue
+
+    file_count = len(selected_paths)
+    if total_bytes <= 300 * 1024 * 1024 and file_count <= 4:
+        return 0
+    if total_bytes <= 1024 * 1024 * 1024:
+        return 60000
+    return 30000
+
+
+def _resolve_beginner_fast_row_limit(selected_paths: list[Path], dataset_type: str | None) -> int:
+    base_limit = int(_resolve_beginner_row_limit(selected_paths))
+    family_caps = {
+        "CIC-IDS": 40000,
+        "NSL-KDD": 30000,
+        "UNSW-NB15": 30000,
+    }
+    cap = int(family_caps.get(str(dataset_type), 30000))
+
+    if base_limit <= 0:
+        return cap
+    return int(min(base_limit, cap))
+
+
+def _training_row_profiles() -> dict[str, int]:
+    return {
+        "Швидко (демо)": 12000,
+        "Збалансовано": 25000,
+        "Максимальна якість (без обмеження)": 0,
+    }
+
+
+def _resolve_row_limit_from_profile(profile_name: str) -> int:
+    profiles = _training_row_profiles()
+    return int(profiles.get(profile_name, 25000))
+
+
+def _recommended_safe_algorithm_params(
+    selected_algorithm: str,
+    dataset_type: str | None = None,
+    max_rows_per_file: int = 25000,
+) -> dict[str, Any]:
+    if selected_algorithm == "Random Forest":
+        params = {
+            "n_estimators": 300,
+            "max_depth": None,
+            "min_samples_split": 2,
+        }
+        params.update(
+            _recommended_supervised_control_params(
+                dataset_type=dataset_type,
+                max_rows_per_file=max_rows_per_file,
+            )
+        )
+        return params
+
+    if selected_algorithm == "XGBoost":
+        params = {
+            "n_estimators": 300,
+            "max_depth": 6,
+            "learning_rate": 0.05,
+            "subsample": 0.9,
+            "colsample_bytree": 0.9,
+        }
+        params.update(
+            _recommended_supervised_control_params(
+                dataset_type=dataset_type,
+                max_rows_per_file=max_rows_per_file,
+            )
+        )
+        return params
+
+    if selected_algorithm == "Isolation Forest":
+        return {
+            "n_estimators": 300,
+            "contamination": "auto",
+            "if_target_fp_rate": 0.02,
+            "if_use_attack_references": True,
+            "if_attack_reference_files": 3,
+        }
+
+    return {}
+
+
+def _recommended_supervised_control_params(
+    dataset_type: str | None,
+    max_rows_per_file: int,
+) -> dict[str, Any]:
+    effective_rows = int(max_rows_per_file) if int(max_rows_per_file) > 0 else 25000
+    effective_rows = int(np.clip(effective_rows, 2000, 30000))
+
+    if dataset_type == "CIC-IDS":
+        return {
+            "cic_use_reference_corpus": True,
+            "cic_attack_reference_files": 2,
+            "cic_benign_reference_files": 1,
+            "cic_reference_rows_per_file": int(min(effective_rows, 6000)),
+            "cic_reference_max_share": 0.60,
+            "cic_include_original_references": False,
+            "cic_original_reference_files": 0,
+            "cic_original_attack_rows_per_file": 800,
+            "cic_original_benign_rows_per_file": 300,
+            "cic_use_hard_case_references": True,
+            "cic_hard_case_attack_rows_per_file": 600,
+            "cic_hard_case_benign_rows_per_file": 150,
+        }
+
+    if dataset_type == "NSL-KDD":
+        return {
+            "nsl_use_original_references": False,
+            "nsl_reference_rows_per_file": int(min(effective_rows, 12000)),
+            "nsl_reference_max_share": 2.0,
+        }
+
+    if dataset_type == "UNSW-NB15":
+        return {
+            "unsw_use_original_references": False,
+            "unsw_reference_rows_per_file": int(min(effective_rows, 12000)),
+            "unsw_reference_max_share": 2.0,
+        }
+
+    return {}
+
+
+def _resolve_auto_algorithms(allowed_algorithms: list[str]) -> list[str]:
+    supervised_priority = [
+        name
+        for name in ("XGBoost", "Random Forest")
+        if name in allowed_algorithms
+    ]
+    if supervised_priority:
+        return supervised_priority
+    if "Isolation Forest" in allowed_algorithms:
+        return ["Isolation Forest"]
+    return allowed_algorithms[:1]
+
+
+def _score_auto_candidate(result: dict[str, Any]) -> tuple[float, float, float, float]:
+    metrics = result.get("metrics", {}) if isinstance(result, dict) else {}
+    return (
+        float(metrics.get("f1", 0.0)),
+        float(metrics.get("recall", 0.0)),
+        float(metrics.get("precision", 0.0)),
+        float(metrics.get("accuracy", 0.0)),
+    )
+
+
+def _select_best_auto_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    if not candidates:
+        raise ValueError("Автоматичний режим не отримав жодного валідного кандидата.")
+    return sorted(
+        candidates,
+        key=lambda item: _score_auto_candidate(item.get("result", {})),
+        reverse=True,
+    )[0]
+
+
+def _resolve_manual_suggested_params(selected_algorithm: str, training_result: Any) -> dict[str, Any]:
+    if not isinstance(training_result, dict):
+        return {}
+    if str(training_result.get("algorithm") or "") != selected_algorithm:
+        return {}
+
+    best_params = training_result.get("best_params")
+    if isinstance(best_params, dict) and best_params:
+        return dict(best_params)
+
+    configured_params = training_result.get("configured_params")
+    if isinstance(configured_params, dict) and configured_params:
+        return dict(configured_params)
+
+    return {}
+
+
+def _clip_int_param(value: Any, min_value: int, max_value: int, default: int) -> int:
+    try:
+        parsed = int(round(float(value)))
+    except (TypeError, ValueError):
+        return int(default)
+    return int(np.clip(parsed, min_value, max_value))
+
+
+def _quantize_float_param(value: Any, min_value: float, max_value: float, step: float, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = float(default)
+    clipped = float(np.clip(parsed, min_value, max_value))
+    steps = round((clipped - min_value) / step)
+    quantized = min_value + (steps * step)
+    return float(np.clip(round(quantized, 10), min_value, max_value))
+
+
+def _build_manual_param_updates(selected_algorithm: str, params: dict[str, Any]) -> dict[str, Any]:
+    updates: dict[str, Any] = {}
+    if not isinstance(params, dict) or not params:
+        return updates
+
+    if selected_algorithm == "Random Forest":
+        if "n_estimators" in params:
+            updates["rf_n_estimators"] = _clip_int_param(params.get("n_estimators"), 100, 600, 300)
+        if "max_depth" in params:
+            max_depth_raw = params.get("max_depth")
+            updates["rf_max_depth"] = 0 if max_depth_raw in {None, 0, "0"} else _clip_int_param(max_depth_raw, 1, 40, 0)
+        if "min_samples_split" in params:
+            updates["rf_min_split"] = _clip_int_param(params.get("min_samples_split"), 2, 10, 2)
+        return updates
+
+    if selected_algorithm == "XGBoost":
+        if "n_estimators" in params:
+            updates["xgb_n_estimators"] = _clip_int_param(params.get("n_estimators"), 100, 600, 300)
+        if "max_depth" in params:
+            updates["xgb_max_depth"] = _clip_int_param(params.get("max_depth"), 3, 10, 6)
+        if "learning_rate" in params:
+            updates["xgb_learning_rate"] = _quantize_float_param(params.get("learning_rate"), 0.01, 0.30, 0.01, 0.05)
+        subsample_source = params.get("subsample", params.get("colsample_bytree", 0.9))
+        updates["xgb_subsample"] = _quantize_float_param(subsample_source, 0.5, 1.0, 0.05, 0.9)
+        return updates
+
+    if selected_algorithm == "Isolation Forest":
+        if "n_estimators" in params:
+            updates["if_n_estimators"] = _clip_int_param(params.get("n_estimators"), 100, 600, 300)
+
+        contamination = params.get("contamination")
+        if isinstance(contamination, str) and contamination.lower() == "auto":
+            updates["if_auto_contam"] = True
+        elif contamination is not None:
+            updates["if_auto_contam"] = False
+            updates["if_contamination"] = _quantize_float_param(contamination, 0.01, 0.30, 0.01, 0.05)
+
+        if "if_target_fp_rate" in params:
+            updates["if_target_fp_rate"] = _quantize_float_param(params.get("if_target_fp_rate"), 0.01, 0.03, 0.005, 0.02)
+        if "if_use_attack_references" in params:
+            updates["if_use_attack_references"] = bool(params.get("if_use_attack_references"))
+        if "if_attack_reference_files" in params:
+            updates["if_attack_reference_files"] = _clip_int_param(params.get("if_attack_reference_files"), 1, 6, 3)
+
+    return updates
 
 
 def _persist_uploaded_files(uploaded_files: list[Any] | None, destination_dir: Path, prefix: str) -> list[Path]:
@@ -363,13 +894,64 @@ def _render_algorithm_parameters(selected_algorithm: str) -> dict[str, Any]:
             params["colsample_bytree"] = params["subsample"]
 
     else:
-        col1, col2 = st.columns(2)
-        with col1:
-            params["n_estimators"] = st.slider("К-сть дерев IF", 100, 600, 300, 50, key="if_n_estimators")
-        with col2:
-            params["contamination"] = st.slider("Contamination", 0.01, 0.30, 0.05, 0.01, key="if_contamination")
+        params["n_estimators"] = st.slider("К-сть дерев Isolation Forest", 100, 600, 300, 50, key="if_n_estimators")
+
+        auto_contam = st.checkbox(
+            "Авто Contamination (Рекомендовано)",
+            value=True,
+            key="if_auto_contam",
+            help="Алгоритм сам обчислить поріг забруднення (contamination='auto'). Вимкніть для ручного контролю.",
+        )
+        if auto_contam:
+            params["contamination"] = "auto"
+        else:
+            params["contamination"] = st.slider(
+                "Відсоток забруднення (Contamination)",
+                0.01,
+                0.30,
+                0.05,
+                0.01,
+                key="if_contamination",
+            )
+
+        params["if_target_fp_rate"] = st.slider(
+            "Цільова частка хибних тривог (FP rate)",
+            0.01,
+            0.03,
+            0.02,
+            0.005,
+            key="if_target_fp_rate",
+            help="Калібрує поріг IF під low-FP режим (1-3%).",
+        )
+        params["if_use_attack_references"] = st.checkbox(
+            "Використати attack-референси (SynFlood/DDoS/PortScan) для калібрування",
+            value=True,
+            key="if_use_attack_references",
+            help="Референси використовуються для калібрування порогу, а не для fit Isolation Forest.",
+        )
+        if params["if_use_attack_references"]:
+            params["if_attack_reference_files"] = st.slider(
+                "Кількість attack-референс файлів",
+                1,
+                6,
+                3,
+                1,
+                key="if_attack_reference_files",
+            )
 
     return params
+
+
+def _load_training_frames(
+    loader: DataLoader,
+    selected_paths: list[Path],
+    dataset_type: str,
+    max_rows_per_file: int,
+) -> list[pd.DataFrame]:
+    return [
+        loader.load_training_frame(path, expected_dataset=dataset_type, max_rows=max_rows_per_file)
+        for path in selected_paths
+    ]
 
 
 def _run_training(
@@ -382,16 +964,144 @@ def _run_training(
     max_rows_per_file: int,
     test_size: float,
     algorithm_params: dict[str, Any],
+    preloaded_frames: list[pd.DataFrame] | None = None,
 ) -> dict[str, Any]:
-    frames = [
-        loader.load_training_frame(path, expected_dataset=dataset_type, max_rows=max_rows_per_file)
-        for path in selected_paths
-    ]
+    supervised_controls = {
+        "use_reference_corpus": False,
+        "attack_reference_files": 0,
+        "benign_reference_files": 0,
+        "reference_rows_per_file": 0,
+        "reference_max_share": 0.0,
+        "include_original_references": False,
+        "original_reference_files": 0,
+        "original_attack_rows_per_file": 0,
+        "original_benign_rows_per_file": 0,
+        "use_hard_case_references": False,
+        "hard_case_attack_rows_per_file": 0,
+        "hard_case_benign_rows_per_file": 0,
+    }
+    supervised_params = dict(algorithm_params)
+    supervised_extra_metadata: dict[str, Any] = {}
+
+    if algorithm != "Isolation Forest":
+        supervised_params, supervised_controls = _extract_supervised_model_and_control_params(
+            dataset_type=dataset_type,
+            algorithm_params=algorithm_params,
+        )
+
+    if preloaded_frames is not None:
+        frames = [frame.copy() for frame in preloaded_frames]
+    else:
+        frames = _load_training_frames(
+            loader=loader,
+            selected_paths=selected_paths,
+            dataset_type=dataset_type,
+            max_rows_per_file=max_rows_per_file,
+        )
     dataset = pd.concat(frames, ignore_index=True)
     if dataset.empty:
         raise ValueError("Після завантаження вибірка порожня.")
 
     if algorithm != "Isolation Forest":
+        if dataset_type == "CIC-IDS" and bool(supervised_controls.get("use_reference_corpus", False)):
+            reference_dataset, reference_sources = _collect_cic_supervised_reference_data(
+                loader=loader,
+                dataset_type=dataset_type,
+                selected_paths=selected_paths,
+                models_dir=models_dir,
+                max_attack_files=int(supervised_controls.get("attack_reference_files", 0)),
+                max_benign_files=int(supervised_controls.get("benign_reference_files", 0)),
+                max_rows_per_file=int(supervised_controls.get("reference_rows_per_file", max_rows_per_file)),
+                include_original_references=bool(supervised_controls.get("include_original_references", True)),
+                max_original_files=int(supervised_controls.get("original_reference_files", 4)),
+                original_attack_rows_per_file=int(supervised_controls.get("original_attack_rows_per_file", 2500)),
+                original_benign_rows_per_file=int(supervised_controls.get("original_benign_rows_per_file", 1000)),
+                use_hard_case_references=bool(supervised_controls.get("use_hard_case_references", True)),
+                hard_case_attack_rows_per_file=int(supervised_controls.get("hard_case_attack_rows_per_file", 1200)),
+                hard_case_benign_rows_per_file=int(supervised_controls.get("hard_case_benign_rows_per_file", 300)),
+            )
+            if reference_dataset is not None and not reference_dataset.empty:
+                max_reference_share = float(supervised_controls.get("reference_max_share", 0.80))
+                max_reference_rows = int(round(max(len(dataset), 1) * max_reference_share))
+                if max_reference_rows > 0 and len(reference_dataset) > max_reference_rows:
+                    reference_dataset = reference_dataset.sample(n=max_reference_rows, random_state=42)
+
+                dataset = pd.concat([dataset, reference_dataset], ignore_index=True)
+                dataset = dataset.sample(frac=1.0, random_state=42).reset_index(drop=True)
+                hard_case_sources = [
+                    source for source in reference_sources
+                    if source.endswith("::hard_case")
+                ]
+                supervised_extra_metadata = {
+                    "cic_reference_sources": reference_sources,
+                    "reference_sources": list(reference_sources),
+                    "cic_hard_case_reference_sources": hard_case_sources,
+                    "cic_reference_rows_added": int(len(reference_dataset)),
+                    "cic_reference_controls": {
+                        "attack_reference_files": int(supervised_controls.get("attack_reference_files", 0)),
+                        "benign_reference_files": int(supervised_controls.get("benign_reference_files", 0)),
+                        "reference_rows_per_file": int(supervised_controls.get("reference_rows_per_file", max_rows_per_file)),
+                        "reference_max_share": float(max_reference_share),
+                        "include_original_references": bool(supervised_controls.get("include_original_references", True)),
+                        "original_reference_files": int(supervised_controls.get("original_reference_files", 4)),
+                        "original_attack_rows_per_file": int(supervised_controls.get("original_attack_rows_per_file", 2500)),
+                        "original_benign_rows_per_file": int(supervised_controls.get("original_benign_rows_per_file", 1000)),
+                        "use_hard_case_references": bool(supervised_controls.get("use_hard_case_references", True)),
+                        "hard_case_attack_rows_per_file": int(supervised_controls.get("hard_case_attack_rows_per_file", 1200)),
+                        "hard_case_benign_rows_per_file": int(supervised_controls.get("hard_case_benign_rows_per_file", 300)),
+                    },
+                }
+
+        elif dataset_type == "NSL-KDD" and bool(supervised_controls.get("use_reference_corpus", False)):
+            reference_dataset, reference_sources = _collect_nsl_supervised_reference_data(
+                loader=loader,
+                dataset_type=dataset_type,
+                models_dir=models_dir,
+                max_rows_per_file=int(supervised_controls.get("reference_rows_per_file", max_rows_per_file)),
+            )
+            if reference_dataset is not None and not reference_dataset.empty:
+                max_reference_share = float(supervised_controls.get("reference_max_share", 20.0))
+                max_reference_rows = int(round(max(len(dataset), 1) * max_reference_share))
+                if max_reference_rows > 0 and len(reference_dataset) > max_reference_rows:
+                    reference_dataset = reference_dataset.sample(n=max_reference_rows, random_state=42)
+
+                dataset = pd.concat([dataset, reference_dataset], ignore_index=True)
+                dataset = dataset.sample(frac=1.0, random_state=42).reset_index(drop=True)
+                supervised_extra_metadata = {
+                    "nsl_reference_sources": reference_sources,
+                    "reference_sources": list(reference_sources),
+                    "nsl_reference_rows_added": int(len(reference_dataset)),
+                    "nsl_reference_controls": {
+                        "reference_rows_per_file": int(supervised_controls.get("reference_rows_per_file", max_rows_per_file)),
+                        "reference_max_share": float(max_reference_share),
+                    },
+                }
+
+        elif dataset_type == "UNSW-NB15" and bool(supervised_controls.get("use_reference_corpus", False)):
+            reference_dataset, reference_sources = _collect_unsw_supervised_reference_data(
+                loader=loader,
+                dataset_type=dataset_type,
+                models_dir=models_dir,
+                max_rows_per_file=int(supervised_controls.get("reference_rows_per_file", max_rows_per_file)),
+            )
+            if reference_dataset is not None and not reference_dataset.empty:
+                max_reference_share = float(supervised_controls.get("reference_max_share", 8.0))
+                max_reference_rows = int(round(max(len(dataset), 1) * max_reference_share))
+                if max_reference_rows > 0 and len(reference_dataset) > max_reference_rows:
+                    reference_dataset = reference_dataset.sample(n=max_reference_rows, random_state=42)
+
+                dataset = pd.concat([dataset, reference_dataset], ignore_index=True)
+                dataset = dataset.sample(frac=1.0, random_state=42).reset_index(drop=True)
+                supervised_extra_metadata = {
+                    "unsw_reference_sources": reference_sources,
+                    "reference_sources": list(reference_sources),
+                    "unsw_reference_rows_added": int(len(reference_dataset)),
+                    "unsw_reference_controls": {
+                        "reference_rows_per_file": int(supervised_controls.get("reference_rows_per_file", max_rows_per_file)),
+                        "reference_max_share": float(max_reference_share),
+                    },
+                }
+
         dataset = _ensure_supervised_training_sample(
             loader=loader,
             selected_paths=selected_paths,
@@ -407,6 +1117,8 @@ def _run_training(
             dataset=dataset,
             dataset_type=dataset_type,
             models_dir=models_dir,
+            loader=loader,
+            selected_paths=selected_paths,
             algorithm_params=algorithm_params,
             test_size=test_size,
         )
@@ -417,8 +1129,9 @@ def _run_training(
             algorithm=algorithm,
             use_grid_search=use_grid_search,
             models_dir=models_dir,
-            algorithm_params=algorithm_params,
+            algorithm_params=supervised_params,
             test_size=test_size,
+            extra_metadata=supervised_extra_metadata,
         )
 
     result["rows_loaded"] = int(len(dataset))
@@ -578,6 +1291,898 @@ def _format_params_hint(params: dict[str, Any], max_items: int = 8) -> str:
     return ", ".join(rendered)
 
 
+def _extract_if_model_and_control_params(algorithm_params: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    model_params = dict(algorithm_params)
+    target_fp_rate = float(np.clip(float(model_params.pop("if_target_fp_rate", 0.02)), 0.01, 0.03))
+    use_attack_references = bool(model_params.pop("if_use_attack_references", True))
+    attack_reference_files = int(model_params.pop("if_attack_reference_files", 3))
+    attack_reference_files = max(1, min(attack_reference_files, 6))
+
+    controls = {
+        "target_fp_rate": target_fp_rate,
+        "use_attack_references": use_attack_references,
+        "attack_reference_files": attack_reference_files,
+    }
+    return model_params, controls
+
+
+def _extract_supervised_model_and_control_params(
+    dataset_type: str,
+    algorithm_params: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    model_params = dict(algorithm_params)
+
+    controls = {
+        "use_reference_corpus": False,
+        "attack_reference_files": 0,
+        "benign_reference_files": 0,
+        "reference_rows_per_file": 0,
+        "reference_max_share": 0.0,
+        "include_original_references": False,
+        "original_reference_files": 0,
+        "original_attack_rows_per_file": 0,
+        "original_benign_rows_per_file": 0,
+        "use_hard_case_references": False,
+        "hard_case_attack_rows_per_file": 0,
+        "hard_case_benign_rows_per_file": 0,
+    }
+
+    if dataset_type == "CIC-IDS":
+        controls["use_reference_corpus"] = bool(model_params.pop("cic_use_reference_corpus", True))
+        controls["attack_reference_files"] = int(np.clip(int(model_params.pop("cic_attack_reference_files", 6)), 0, 12))
+        controls["benign_reference_files"] = int(np.clip(int(model_params.pop("cic_benign_reference_files", 1)), 0, 6))
+        controls["reference_rows_per_file"] = int(
+            np.clip(int(model_params.pop("cic_reference_rows_per_file", 8000)), 1000, 30000)
+        )
+        controls["reference_max_share"] = float(
+            np.clip(float(model_params.pop("cic_reference_max_share", 0.80)), 0.10, 2.00)
+        )
+        controls["include_original_references"] = bool(model_params.pop("cic_include_original_references", True))
+        controls["original_reference_files"] = int(
+            np.clip(int(model_params.pop("cic_original_reference_files", 4)), 0, 12)
+        )
+        controls["original_attack_rows_per_file"] = int(
+            np.clip(int(model_params.pop("cic_original_attack_rows_per_file", 2500)), 200, 30000)
+        )
+        controls["original_benign_rows_per_file"] = int(
+            np.clip(int(model_params.pop("cic_original_benign_rows_per_file", 1000)), 0, 20000)
+        )
+        controls["use_hard_case_references"] = bool(model_params.pop("cic_use_hard_case_references", True))
+        controls["hard_case_attack_rows_per_file"] = int(
+            np.clip(int(model_params.pop("cic_hard_case_attack_rows_per_file", 1200)), 100, 10000)
+        )
+        controls["hard_case_benign_rows_per_file"] = int(
+            np.clip(int(model_params.pop("cic_hard_case_benign_rows_per_file", 300)), 0, 5000)
+        )
+        model_params.pop("nsl_use_original_references", None)
+        model_params.pop("nsl_reference_rows_per_file", None)
+        model_params.pop("nsl_reference_max_share", None)
+        model_params.pop("unsw_use_original_references", None)
+        model_params.pop("unsw_reference_rows_per_file", None)
+        model_params.pop("unsw_reference_max_share", None)
+    elif dataset_type == "NSL-KDD":
+        controls["use_reference_corpus"] = bool(model_params.pop("nsl_use_original_references", True))
+        controls["reference_rows_per_file"] = int(
+            np.clip(int(model_params.pop("nsl_reference_rows_per_file", 12000)), 1000, 30000)
+        )
+        controls["reference_max_share"] = float(
+            np.clip(float(model_params.pop("nsl_reference_max_share", 20.00)), 0.50, 50.00)
+        )
+        model_params.pop("cic_use_reference_corpus", None)
+        model_params.pop("cic_attack_reference_files", None)
+        model_params.pop("cic_benign_reference_files", None)
+        model_params.pop("cic_reference_rows_per_file", None)
+        model_params.pop("cic_reference_max_share", None)
+        model_params.pop("cic_include_original_references", None)
+        model_params.pop("cic_original_reference_files", None)
+        model_params.pop("cic_original_attack_rows_per_file", None)
+        model_params.pop("cic_original_benign_rows_per_file", None)
+        model_params.pop("cic_use_hard_case_references", None)
+        model_params.pop("cic_hard_case_attack_rows_per_file", None)
+        model_params.pop("cic_hard_case_benign_rows_per_file", None)
+        model_params.pop("unsw_use_original_references", None)
+        model_params.pop("unsw_reference_rows_per_file", None)
+        model_params.pop("unsw_reference_max_share", None)
+    elif dataset_type == "UNSW-NB15":
+        controls["use_reference_corpus"] = bool(model_params.pop("unsw_use_original_references", True))
+        controls["reference_rows_per_file"] = int(
+            np.clip(int(model_params.pop("unsw_reference_rows_per_file", 12000)), 1000, 30000)
+        )
+        controls["reference_max_share"] = float(
+            np.clip(float(model_params.pop("unsw_reference_max_share", 8.00)), 0.50, 20.00)
+        )
+        model_params.pop("cic_use_reference_corpus", None)
+        model_params.pop("cic_attack_reference_files", None)
+        model_params.pop("cic_benign_reference_files", None)
+        model_params.pop("cic_reference_rows_per_file", None)
+        model_params.pop("cic_reference_max_share", None)
+        model_params.pop("cic_include_original_references", None)
+        model_params.pop("cic_original_reference_files", None)
+        model_params.pop("cic_original_attack_rows_per_file", None)
+        model_params.pop("cic_original_benign_rows_per_file", None)
+        model_params.pop("cic_use_hard_case_references", None)
+        model_params.pop("cic_hard_case_attack_rows_per_file", None)
+        model_params.pop("cic_hard_case_benign_rows_per_file", None)
+        model_params.pop("nsl_use_original_references", None)
+        model_params.pop("nsl_reference_rows_per_file", None)
+        model_params.pop("nsl_reference_max_share", None)
+    else:
+        model_params.pop("cic_use_reference_corpus", None)
+        model_params.pop("cic_attack_reference_files", None)
+        model_params.pop("cic_benign_reference_files", None)
+        model_params.pop("cic_reference_rows_per_file", None)
+        model_params.pop("cic_reference_max_share", None)
+        model_params.pop("cic_include_original_references", None)
+        model_params.pop("cic_original_reference_files", None)
+        model_params.pop("cic_original_attack_rows_per_file", None)
+        model_params.pop("cic_original_benign_rows_per_file", None)
+        model_params.pop("cic_use_hard_case_references", None)
+        model_params.pop("cic_hard_case_attack_rows_per_file", None)
+        model_params.pop("cic_hard_case_benign_rows_per_file", None)
+        model_params.pop("nsl_use_original_references", None)
+        model_params.pop("nsl_reference_rows_per_file", None)
+        model_params.pop("nsl_reference_max_share", None)
+        model_params.pop("unsw_use_original_references", None)
+        model_params.pop("unsw_reference_rows_per_file", None)
+        model_params.pop("unsw_reference_max_share", None)
+
+    return model_params, controls
+
+
+def _is_attack_reference_name(path: Path) -> bool:
+    lowered = path.name.lower()
+    keywords = (
+        "synflood",
+        "ddos",
+        "dos",
+        "portscan",
+        "probe",
+        "anomaly",
+        "attack",
+        "flood",
+    )
+    return any(keyword in lowered for keyword in keywords)
+
+
+def _is_benign_reference_name(path: Path) -> bool:
+    lowered = path.name.lower()
+    if _is_attack_reference_name(path):
+        return False
+    keywords = (
+        "benign",
+        "normal",
+        "clean",
+        "baseline",
+        "monday",
+        "workinghours",
+    )
+    return any(keyword in lowered for keyword in keywords)
+
+
+def _coerce_reference_target_labels(target: pd.Series, assume_attack: bool) -> pd.Series:
+    normalized = target.astype(str).str.strip()
+    unknown_mask = normalized.str.lower().isin({"", "unknown", "nan", "none"})
+    fallback_label = "Attack" if assume_attack else "BENIGN"
+    return normalized.mask(unknown_mask, fallback_label)
+
+
+def _collect_cic_supervised_reference_data(
+    loader: DataLoader,
+    dataset_type: str,
+    selected_paths: list[Path],
+    models_dir: Path,
+    max_attack_files: int,
+    max_benign_files: int,
+    max_rows_per_file: int,
+    include_original_references: bool = True,
+    max_original_files: int = 4,
+    original_attack_rows_per_file: int = 2500,
+    original_benign_rows_per_file: int = 1000,
+    use_hard_case_references: bool = True,
+    hard_case_attack_rows_per_file: int = 1200,
+    hard_case_benign_rows_per_file: int = 300,
+) -> tuple[pd.DataFrame | None, list[str]]:
+    if (
+        max_attack_files <= 0
+        and max_benign_files <= 0
+        and not include_original_references
+        and not use_hard_case_references
+    ):
+        return None, []
+
+    root_dir = models_dir.parent
+    scan_dirs = [
+        root_dir / "datasets" / "TEST_DATA",
+        root_dir / "datasets" / "Processed_Scans" / "TEST_DATA",
+        root_dir / "datasets" / "User_Uploads",
+    ]
+    supported_ext = {".csv", ".pcap", ".pcapng", ".cap"}
+    selected_resolved = {path.resolve() for path in selected_paths if path.exists()}
+
+    attack_candidates: list[Path] = []
+    benign_candidates: list[Path] = []
+
+    for folder in scan_dirs:
+        if not folder.exists():
+            continue
+        for path in sorted(folder.iterdir()):
+            if not path.is_file() or path.suffix.lower() not in supported_ext:
+                continue
+            try:
+                if path.resolve() in selected_resolved:
+                    continue
+            except Exception:
+                pass
+            if _is_attack_reference_name(path):
+                attack_candidates.append(path)
+            elif _is_benign_reference_name(path):
+                benign_candidates.append(path)
+
+    def _priority(path: Path) -> tuple[int, int, str]:
+        name = path.name.lower()
+        ext = path.suffix.lower()
+
+        family_priority = 4
+        if "webattack" in name or "bruteforce" in name or "ftp" in name or "ssh" in name:
+            family_priority = 0
+        elif "synflood" in name or "ddos" in name or "dos" in name:
+            family_priority = 1
+        elif "portscan" in name or "probe" in name:
+            family_priority = 2
+        elif "anomaly" in name or "attack" in name or "flood" in name:
+            family_priority = 3
+
+        csv_priority = 0 if ext == ".csv" else 1
+
+        return family_priority, csv_priority, name
+
+    attack_candidates = sorted(attack_candidates, key=_priority)
+    benign_candidates = sorted(benign_candidates, key=lambda path: path.name.lower())
+
+    attack_csv_candidates = [
+        path for path in attack_candidates
+        if path.suffix.lower() == ".csv"
+    ]
+    attack_pcap_candidates = [
+        path for path in attack_candidates
+        if path.suffix.lower() in {".pcap", ".pcapng", ".cap"}
+    ]
+
+    selected_attack_paths: list[Path] = []
+    csv_quota = min(2, max(0, int(max_attack_files)))
+    if csv_quota > 0:
+        selected_attack_paths.extend(attack_csv_candidates[:csv_quota])
+
+    remaining_attack_slots = max(0, int(max_attack_files) - len(selected_attack_paths))
+    if remaining_attack_slots > 0:
+        selected_attack_paths.extend(attack_pcap_candidates[:remaining_attack_slots])
+
+    remaining_attack_slots = max(0, int(max_attack_files) - len(selected_attack_paths))
+    if remaining_attack_slots > 0:
+        for path in attack_csv_candidates[csv_quota:]:
+            if remaining_attack_slots <= 0:
+                break
+            if path in selected_attack_paths:
+                continue
+            selected_attack_paths.append(path)
+            remaining_attack_slots -= 1
+
+    frames: list[pd.DataFrame] = []
+    used_sources: list[str] = []
+
+    for ref_path in selected_attack_paths:
+        try:
+            loaded = loader.load_file(
+                str(ref_path),
+                max_rows=max_rows_per_file,
+                expected_dataset=dataset_type,
+            )
+            if not isinstance(loaded, pd.DataFrame) or loaded.empty:
+                continue
+
+            reference_frame = loaded.copy()
+            reference_frame["target_label"] = _coerce_reference_target_labels(
+                reference_frame["target_label"],
+                assume_attack=True,
+            )
+            binary = reference_frame["target_label"].map(lambda value: 0 if is_benign_label(value) else 1).to_numpy()
+            if int(np.sum(binary == 1)) == 0:
+                continue
+
+            frames.append(reference_frame)
+            used_sources.append(f"{ref_path.name}::attack")
+        except Exception:
+            continue
+
+    for ref_path in benign_candidates[: max(0, int(max_benign_files))]:
+        try:
+            loaded = loader.load_file(
+                str(ref_path),
+                max_rows=max_rows_per_file,
+                expected_dataset=dataset_type,
+            )
+            if not isinstance(loaded, pd.DataFrame) or loaded.empty:
+                continue
+
+            reference_frame = loaded.copy()
+            reference_frame["target_label"] = _coerce_reference_target_labels(
+                reference_frame["target_label"],
+                assume_attack=False,
+            )
+            binary = reference_frame["target_label"].map(lambda value: 0 if is_benign_label(value) else 1).to_numpy()
+            if int(np.sum(binary == 0)) == 0:
+                continue
+
+            frames.append(reference_frame)
+            used_sources.append(f"{ref_path.name}::benign")
+        except Exception:
+            continue
+
+    if not frames:
+        merged_primary = None
+    else:
+        merged_primary = pd.concat(frames, ignore_index=True)
+
+    originals_frame = None
+    originals_sources: list[str] = []
+    if include_original_references and max_original_files > 0:
+        originals_frame, originals_sources = _collect_cic_original_reference_data(
+            root_dir=models_dir.parent,
+            max_files=max_original_files,
+            max_attack_rows_per_file=original_attack_rows_per_file,
+            max_benign_rows_per_file=original_benign_rows_per_file,
+        )
+
+    hard_case_frame = None
+    hard_case_sources: list[str] = []
+    if use_hard_case_references:
+        used_original_names = {
+            source.split("::", 1)[0].strip().lower()
+            for source in originals_sources
+        }
+        hard_case_frame, hard_case_sources = _collect_cic_hard_case_reference_data(
+            root_dir=models_dir.parent,
+            max_attack_rows_per_file=hard_case_attack_rows_per_file,
+            max_benign_rows_per_file=hard_case_benign_rows_per_file,
+            exclude_file_names=used_original_names,
+        )
+
+    merged_frames = [
+        frame
+        for frame in [merged_primary, originals_frame, hard_case_frame]
+        if isinstance(frame, pd.DataFrame) and not frame.empty
+    ]
+    if not merged_frames:
+        return None, []
+
+    merged = pd.concat(merged_frames, ignore_index=True)
+    all_sources = list(used_sources) + list(originals_sources) + list(hard_case_sources)
+    return merged, all_sources
+
+
+def _sample_cic_original_csv_reference(
+    file_path: Path,
+    max_attack_rows: int,
+    max_benign_rows: int,
+    chunksize: int = 50_000,
+) -> pd.DataFrame | None:
+    schema = get_schema("CIC-IDS")
+    required = set(schema.feature_columns)
+
+    remain_attack = max(0, int(max_attack_rows))
+    remain_benign = max(0, int(max_benign_rows))
+    sampled_attack_parts: list[pd.DataFrame] = []
+    sampled_benign_parts: list[pd.DataFrame] = []
+
+    if remain_attack <= 0 and remain_benign <= 0:
+        return None
+
+    try:
+        reader = pd.read_csv(
+            file_path,
+            chunksize=chunksize,
+            low_memory=False,
+            skipinitialspace=True,
+            encoding="utf-8",
+            encoding_errors="replace",
+            on_bad_lines="skip",
+        )
+    except Exception:
+        return None
+
+    for chunk in reader:
+        if chunk is None or chunk.empty:
+            continue
+
+        normalized = normalize_frame_columns(chunk)
+        normalized = normalized.loc[:, ~normalized.columns.duplicated()].copy()
+        if not required.issubset(set(normalized.columns)):
+            continue
+
+        try:
+            target = resolve_target_labels(normalized, "CIC-IDS")
+        except Exception:
+            continue
+
+        frame = normalized.loc[:, list(schema.feature_columns)].copy()
+        frame["target_label"] = target
+
+        attack_mask = ~frame["target_label"].map(is_benign_label)
+        attack_rows = frame.loc[attack_mask]
+        benign_rows = frame.loc[~attack_mask]
+
+        if remain_attack > 0 and not attack_rows.empty:
+            take_n = min(remain_attack, len(attack_rows))
+            sampled = attack_rows.sample(n=take_n, random_state=42) if len(attack_rows) > take_n else attack_rows
+            sampled_attack_parts.append(sampled)
+            remain_attack -= int(len(sampled))
+
+        if remain_benign > 0 and not benign_rows.empty:
+            take_n = min(remain_benign, len(benign_rows))
+            sampled = benign_rows.sample(n=take_n, random_state=42) if len(benign_rows) > take_n else benign_rows
+            sampled_benign_parts.append(sampled)
+            remain_benign -= int(len(sampled))
+
+        if remain_attack <= 0 and remain_benign <= 0:
+            break
+
+    if not sampled_attack_parts and not sampled_benign_parts:
+        return None
+
+    merged = pd.concat(sampled_attack_parts + sampled_benign_parts, ignore_index=True)
+    if merged.empty:
+        return None
+    return merged.sample(frac=1.0, random_state=42).reset_index(drop=True)
+
+
+def _collect_cic_original_reference_data(
+    root_dir: Path,
+    max_files: int,
+    max_attack_rows_per_file: int,
+    max_benign_rows_per_file: int,
+) -> tuple[pd.DataFrame | None, list[str]]:
+    originals_dirs = [
+        root_dir / "datasets" / "CIC-IDS2017_Originals",
+        root_dir / "datasets" / "CIC-IDS2018_Originals",
+    ]
+
+    candidates: list[Path] = []
+    for folder in originals_dirs:
+        if not folder.exists():
+            continue
+        for path in sorted(folder.iterdir()):
+            if path.is_file() and path.suffix.lower() == ".csv":
+                candidates.append(path)
+
+    def _priority(path: Path) -> tuple[int, str]:
+        name = path.name.lower()
+        if "ddos" in name or "portscan" in name or "webattacks" in name or "infilteration" in name:
+            return (0, name)
+        return (1, name)
+
+    candidates = sorted(candidates, key=_priority)
+
+    frames: list[pd.DataFrame] = []
+    sources: list[str] = []
+
+    for file_path in candidates:
+        if len(sources) >= max(0, int(max_files)):
+            break
+
+        sampled = _sample_cic_original_csv_reference(
+            file_path=file_path,
+            max_attack_rows=max_attack_rows_per_file,
+            max_benign_rows=max_benign_rows_per_file,
+        )
+        if sampled is None or sampled.empty:
+            continue
+
+        attack_count = int((~sampled["target_label"].map(is_benign_label)).sum())
+        if attack_count <= 0:
+            continue
+
+        frames.append(sampled)
+        sources.append(f"{file_path.name}::original")
+
+    if not frames:
+        return None, []
+
+    merged = pd.concat(frames, ignore_index=True)
+    return merged.sample(frac=1.0, random_state=42).reset_index(drop=True), sources
+
+
+def _collect_cic_hard_case_reference_data(
+    root_dir: Path,
+    max_attack_rows_per_file: int,
+    max_benign_rows_per_file: int,
+    exclude_file_names: set[str] | None = None,
+) -> tuple[pd.DataFrame | None, list[str]]:
+    # Target files that repeatedly showed low recall during CIC evaluations.
+    candidate_files = [
+        root_dir / "datasets" / "CIC-IDS2017_Originals" / "Friday-WorkingHours-Morning.pcap_ISCX.csv",
+        root_dir / "datasets" / "CIC-IDS2018_Originals" / "03-02-2018.csv",
+    ]
+    excluded = set(exclude_file_names or set())
+
+    frames: list[pd.DataFrame] = []
+    sources: list[str] = []
+
+    for file_path in candidate_files:
+        if not file_path.exists():
+            continue
+        if file_path.name.strip().lower() in excluded:
+            continue
+
+        sampled = _sample_cic_original_csv_reference(
+            file_path=file_path,
+            max_attack_rows=max_attack_rows_per_file,
+            max_benign_rows=max_benign_rows_per_file,
+        )
+        if sampled is None or sampled.empty:
+            continue
+
+        attack_count = int((~sampled["target_label"].map(is_benign_label)).sum())
+        if attack_count <= 0:
+            continue
+
+        frames.append(sampled)
+        sources.append(f"{file_path.name}::hard_case")
+
+    if not frames:
+        return None, []
+
+    merged = pd.concat(frames, ignore_index=True)
+    return merged.sample(frac=1.0, random_state=42).reset_index(drop=True), sources
+
+
+def _collect_nsl_supervised_reference_data(
+    loader: DataLoader,
+    dataset_type: str,
+    models_dir: Path,
+    max_rows_per_file: int,
+) -> tuple[pd.DataFrame | None, list[str]]:
+    if dataset_type != "NSL-KDD":
+        return None, []
+
+    root_dir = models_dir.parent
+    originals_dir = root_dir / "datasets" / "NSL-KDD"
+    candidate_files = [
+        originals_dir / "kdd_train.csv",
+        originals_dir / "kdd_test.csv",
+    ]
+
+    frames: list[pd.DataFrame] = []
+    used_sources: list[str] = []
+
+    for path in candidate_files:
+        if not path.exists():
+            continue
+        try:
+            loaded = loader.load_file(
+                str(path),
+                max_rows=max_rows_per_file,
+                expected_dataset=dataset_type,
+            )
+            if not isinstance(loaded, pd.DataFrame) or loaded.empty:
+                continue
+
+            binary = loaded["target_label"].map(lambda value: 0 if is_benign_label(value) else 1).to_numpy()
+            if int(np.sum(binary == 1)) == 0:
+                continue
+
+            frames.append(loaded)
+            used_sources.append(path.name)
+        except Exception:
+            continue
+
+    if not frames:
+        return None, []
+
+    merged = pd.concat(frames, ignore_index=True)
+    return merged.sample(frac=1.0, random_state=42).reset_index(drop=True), used_sources
+
+
+def _collect_unsw_supervised_reference_data(
+    loader: DataLoader,
+    dataset_type: str,
+    models_dir: Path,
+    max_rows_per_file: int,
+) -> tuple[pd.DataFrame | None, list[str]]:
+    if dataset_type != "UNSW-NB15":
+        return None, []
+
+    root_dir = models_dir.parent
+    originals_dir = root_dir / "datasets" / "UNSW_NB15_Originals"
+    candidate_files = [
+        originals_dir / "UNSW_NB15_training-set.csv",
+        originals_dir / "UNSW_NB15_testing-set.csv",
+    ]
+
+    frames: list[pd.DataFrame] = []
+    used_sources: list[str] = []
+
+    for path in candidate_files:
+        if not path.exists():
+            continue
+        try:
+            loaded = loader.load_file(
+                str(path),
+                max_rows=max_rows_per_file,
+                expected_dataset=dataset_type,
+            )
+            if not isinstance(loaded, pd.DataFrame) or loaded.empty:
+                continue
+
+            binary = loaded["target_label"].map(lambda value: 0 if is_benign_label(value) else 1).to_numpy()
+            if int(np.sum(binary == 1)) == 0:
+                continue
+
+            frames.append(loaded)
+            used_sources.append(path.name)
+        except Exception:
+            continue
+
+    if not frames:
+        return None, []
+
+    merged = pd.concat(frames, ignore_index=True)
+    return merged.sample(frac=1.0, random_state=42).reset_index(drop=True), used_sources
+
+
+def _collect_if_attack_reference_data(
+    loader: DataLoader,
+    preprocessor: Preprocessor,
+    dataset_type: str,
+    selected_paths: list[Path],
+    models_dir: Path,
+    max_files: int,
+    max_rows_per_file: int = 20_000,
+) -> tuple[pd.DataFrame | None, np.ndarray, list[str]]:
+    root_dir = models_dir.parent
+    scan_dirs = [
+        root_dir / "datasets" / "TEST_DATA",
+        root_dir / "datasets" / "Processed_Scans" / "TEST_DATA",
+        root_dir / "datasets" / "User_Uploads",
+    ]
+    supported_ext = {".csv", ".pcap", ".pcapng", ".cap"}
+    selected_resolved = {path.resolve() for path in selected_paths if path.exists()}
+
+    candidate_files: list[Path] = []
+    for folder in scan_dirs:
+        if not folder.exists():
+            continue
+        for path in sorted(folder.iterdir()):
+            if not path.is_file() or path.suffix.lower() not in supported_ext:
+                continue
+            if not _is_attack_reference_name(path):
+                continue
+            try:
+                if path.resolve() in selected_resolved:
+                    continue
+            except Exception:
+                pass
+            candidate_files.append(path)
+
+    def _reference_priority(path: Path) -> tuple[int, int, str]:
+        name = path.name.lower()
+        ext = path.suffix.lower()
+        pcap_priority = 0 if ext in {".pcap", ".pcapng", ".cap"} else 1
+
+        attack_kind_priority = 3
+        if "synflood" in name or "ddos" in name or "dos" in name:
+            attack_kind_priority = 0
+        elif "portscan" in name or "probe" in name:
+            attack_kind_priority = 1
+        elif "anomaly" in name or "attack" in name or "flood" in name:
+            attack_kind_priority = 2
+
+        return pcap_priority, attack_kind_priority, name
+
+    candidate_files = sorted(candidate_files, key=_reference_priority)
+
+    if not candidate_files:
+        return None, np.empty(0, dtype=int), []
+
+    transformed_parts: list[pd.DataFrame] = []
+    y_parts: list[np.ndarray] = []
+    used_sources: list[str] = []
+
+    for ref_path in candidate_files[:max_files]:
+        try:
+            loaded = loader.load_file(
+                str(ref_path),
+                max_rows=max_rows_per_file,
+                expected_dataset=dataset_type,
+            )
+            if not isinstance(loaded, pd.DataFrame) or loaded.empty:
+                continue
+
+            y_ref = loaded["target_label"].map(lambda value: 0 if is_benign_label(value) else 1).astype(int).to_numpy()
+            if y_ref.size == 0:
+                continue
+
+            if int(np.sum(y_ref == 1)) == 0:
+                continue
+
+            X_ref = preprocessor.transform(loaded)
+            transformed_parts.append(X_ref)
+            y_parts.append(y_ref)
+            used_sources.append(ref_path.name)
+        except Exception:
+            continue
+
+    if not transformed_parts:
+        return None, np.empty(0, dtype=int), []
+
+    return pd.concat(transformed_parts, ignore_index=True), np.concatenate(y_parts), used_sources
+
+
+def _apply_if_threshold(decision_scores: np.ndarray, threshold: float) -> np.ndarray:
+    return np.where(np.asarray(decision_scores, dtype=float) < float(threshold), 1, 0).astype(int)
+
+
+def _summarize_if_score_distribution(scores: np.ndarray) -> dict[str, float]:
+    values = np.asarray(scores, dtype=float).reshape(-1)
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size == 0:
+        return {
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "std": 0.0,
+            "q01": 0.0,
+            "q05": 0.0,
+            "q25": 0.0,
+            "q50": 0.0,
+            "q75": 0.0,
+            "q95": 0.0,
+            "q99": 0.0,
+        }
+
+    quantiles = np.quantile(finite_values, [0.01, 0.05, 0.25, 0.50, 0.75, 0.95, 0.99])
+    return {
+        "min": float(np.min(finite_values)),
+        "max": float(np.max(finite_values)),
+        "mean": float(np.mean(finite_values)),
+        "std": float(np.std(finite_values)),
+        "q01": float(quantiles[0]),
+        "q05": float(quantiles[1]),
+        "q25": float(quantiles[2]),
+        "q50": float(quantiles[3]),
+        "q75": float(quantiles[4]),
+        "q95": float(quantiles[5]),
+        "q99": float(quantiles[6]),
+    }
+
+
+def _calibrate_if_threshold(
+    decision_scores: np.ndarray,
+    y_binary: np.ndarray,
+    target_fp_rate: float,
+) -> tuple[float, dict[str, Any]]:
+    scores = np.asarray(decision_scores, dtype=float).reshape(-1)
+    labels = np.asarray(y_binary, dtype=int).reshape(-1)
+    if scores.size == 0 or labels.size != scores.size:
+        return 0.0, {
+            "selection_policy": "invalid_input",
+            "target_fp_rate": float(target_fp_rate),
+            "false_positive_rate": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+        }
+
+    finite_mask = np.isfinite(scores)
+    if not finite_mask.all():
+        if not finite_mask.any():
+            scores = np.zeros_like(scores, dtype=float)
+        else:
+            fill_value = float(np.median(scores[finite_mask]))
+            scores = np.where(finite_mask, scores, fill_value)
+
+    benign_mask = labels == 0
+    attack_mask = labels == 1
+    benign_scores = scores[benign_mask]
+    fallback_threshold = float(np.quantile(benign_scores, float(target_fp_rate))) if benign_scores.size else float(np.quantile(scores, 0.02))
+
+    selected_threshold = fallback_threshold
+    selected_policy = "unsupervised_fp_quantile"
+    selected_metrics: dict[str, float]
+
+    def _evaluate_threshold(threshold: float) -> dict[str, float]:
+        y_pred = _apply_if_threshold(scores, threshold)
+        fp_rate_value = float(np.mean(y_pred[benign_mask] == 1)) if benign_mask.any() else 0.0
+        return {
+            "false_positive_rate": fp_rate_value,
+            "precision": float(precision_score(labels, y_pred, zero_division=0)),
+            "recall": float(recall_score(labels, y_pred, zero_division=0)),
+            "f1": float(f1_score(labels, y_pred, zero_division=0)),
+        }
+
+    selected_metrics = _evaluate_threshold(selected_threshold)
+
+    if attack_mask.any() and benign_mask.any():
+        candidate_quantiles = np.linspace(0.001, 0.995, 900)
+        candidate_thresholds = np.unique(np.quantile(scores, candidate_quantiles))
+        def _search_under_fp_cap(fp_cap: float) -> tuple[float | None, dict[str, float] | None]:
+            best_key: tuple[float, float, float, float] | None = None
+            best_threshold: float | None = None
+            best_metrics: dict[str, float] | None = None
+
+            for threshold in candidate_thresholds:
+                threshold_value = float(threshold)
+                metrics = _evaluate_threshold(threshold_value)
+                if metrics["false_positive_rate"] > float(fp_cap) + 1e-12:
+                    continue
+
+                key = (
+                    float(metrics["recall"]),
+                    float(metrics["f1"]),
+                    float(metrics["precision"]),
+                    -float(metrics["false_positive_rate"]),
+                )
+                if best_key is None or key > best_key:
+                    best_key = key
+                    best_threshold = threshold_value
+                    best_metrics = metrics
+
+            return best_threshold, best_metrics
+
+        strict_threshold, strict_metrics = _search_under_fp_cap(float(target_fp_rate))
+        if strict_threshold is not None and strict_metrics is not None:
+            selected_threshold = float(strict_threshold)
+            selected_metrics = dict(strict_metrics)
+            selected_policy = "supervised_fp_bound"
+
+            strict_recall = float(selected_metrics.get("recall", 0.0))
+            strict_f1 = float(selected_metrics.get("f1", 0.0))
+            if strict_recall <= 0.05:
+                relaxed_candidates: list[tuple[float, float, dict[str, float]]] = []
+                for fp_cap in (0.05, 0.08, 0.12, 0.20):
+                    if fp_cap <= float(target_fp_rate) + 1e-12:
+                        continue
+                    relaxed_threshold, relaxed_metrics = _search_under_fp_cap(fp_cap)
+                    if relaxed_threshold is None or relaxed_metrics is None:
+                        continue
+                    relaxed_candidates.append((float(fp_cap), float(relaxed_threshold), dict(relaxed_metrics)))
+
+                if relaxed_candidates:
+                    best_fp_cap, best_relaxed_threshold, best_relaxed_metrics = sorted(
+                        relaxed_candidates,
+                        key=lambda item: (
+                            float(item[2].get("recall", 0.0)),
+                            float(item[2].get("f1", 0.0)),
+                            float(item[2].get("precision", 0.0)),
+                            -float(item[2].get("false_positive_rate", 1.0)),
+                            -float(item[0]),
+                        ),
+                        reverse=True,
+                    )[0]
+
+                    recall_gain = float(best_relaxed_metrics.get("recall", 0.0)) - strict_recall
+                    f1_gain = float(best_relaxed_metrics.get("f1", 0.0)) - strict_f1
+                    if recall_gain >= 0.10 or (strict_recall <= 0.0 and f1_gain > 0.0):
+                        selected_threshold = float(best_relaxed_threshold)
+                        selected_metrics = dict(best_relaxed_metrics)
+                        selected_policy = "supervised_fp_relaxed_for_recall"
+                        selected_metrics["effective_fp_cap"] = float(best_fp_cap)
+        else:
+            selected_policy = "fp_quantile_fallback"
+            selected_metrics = _evaluate_threshold(selected_threshold)
+
+    return selected_threshold, {
+        "selection_policy": selected_policy,
+        "target_fp_rate": float(target_fp_rate),
+        "false_positive_rate": float(selected_metrics.get("false_positive_rate", 0.0)),
+        "precision": float(selected_metrics.get("precision", 0.0)),
+        "recall": float(selected_metrics.get("recall", 0.0)),
+        "f1": float(selected_metrics.get("f1", 0.0)),
+        "effective_fp_cap": float(selected_metrics.get("effective_fp_cap", target_fp_rate)),
+        "attack_support": int(np.sum(attack_mask)),
+        "benign_support": int(np.sum(benign_mask)),
+    }
+
+
 def _train_supervised_model(
     dataset: pd.DataFrame,
     dataset_type: str,
@@ -586,6 +2191,7 @@ def _train_supervised_model(
     models_dir: Path,
     algorithm_params: dict[str, Any],
     test_size: float,
+    extra_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     dataset = dataset.copy()
     dataset["binary_target_label"] = _collapse_attack_labels(dataset["target_label"])
@@ -657,6 +2263,8 @@ def _train_supervised_model(
         "configured_params": configured_params,
         "metrics": {key: value for key, value in metrics.items() if key not in {"confusion_matrix", "labels"}},
     }
+    if isinstance(extra_metadata, dict) and extra_metadata:
+        metadata.update(extra_metadata)
     if best_params:
         metadata["best_params"] = best_params
     if isinstance(training_info.get("best_score"), (int, float)):
@@ -685,6 +2293,11 @@ def _train_supervised_model(
                 "ймовірність атаки": pd.Series(attack_probabilities, dtype=float).reset_index(drop=True),
             }
         ).head(200),
+        "cic_reference_sources": list((extra_metadata or {}).get("cic_reference_sources", [])),
+        "cic_hard_case_reference_sources": list((extra_metadata or {}).get("cic_hard_case_reference_sources", [])),
+        "nsl_reference_sources": list((extra_metadata or {}).get("nsl_reference_sources", [])),
+        "unsw_reference_sources": list((extra_metadata or {}).get("unsw_reference_sources", [])),
+        "reference_sources": list((extra_metadata or {}).get("reference_sources", [])),
     }
 
 
@@ -692,12 +2305,14 @@ def _train_isolation_forest(
     dataset: pd.DataFrame,
     dataset_type: str,
     models_dir: Path,
+    loader: DataLoader,
+    selected_paths: list[Path],
     algorithm_params: dict[str, Any],
     test_size: float,
 ) -> dict[str, Any]:
+    model_params, controls = _extract_if_model_and_control_params(algorithm_params)
     binary_target = dataset["target_label"].map(lambda value: 0 if is_benign_label(value) else 1).astype(int)
-    if binary_target.nunique() < 2:
-        raise ValueError("Для оцінки Isolation Forest потрібні і benign, і attack-приклади.")
+    has_evaluation_data = binary_target.nunique() >= 2
 
     train_df, test_df, y_train_binary, y_test_binary = train_test_split(
         dataset,
@@ -711,19 +2326,48 @@ def _train_isolation_forest(
     if len(benign_train) < 20:
         raise ValueError("Недостатньо benign-потоків для навчання Isolation Forest.")
 
-    preprocessor = Preprocessor(dataset_type=dataset_type)
+    preprocessor = Preprocessor(dataset_type=dataset_type, enable_scaling=True)
     X_train_benign, _ = preprocessor.fit(benign_train, target_col=None)
     X_test = preprocessor.transform(test_df)
 
     engine = ModelEngine(models_dir=str(models_dir))
-    engine.fit(X_train_benign, algorithm="Isolation Forest", params=algorithm_params)
+    engine.fit(X_train_benign, algorithm="Isolation Forest", params=model_params)
     training_info = getattr(engine, "last_training_info", {}) or {}
     configured_params = training_info.get("params_used") if isinstance(training_info, dict) else None
     if not isinstance(configured_params, dict):
-        configured_params = dict(algorithm_params)
+        configured_params = dict(model_params)
 
-    predictions = engine.predict(X_test)
-    matrix = confusion_matrix(y_test_binary, predictions)
+    decision_scores_test = np.asarray(engine.decision_function(X_test), dtype=float)
+    y_test_array = np.asarray(y_test_binary, dtype=int)
+
+    calib_scores = decision_scores_test.copy()
+    calib_labels = y_test_array.copy()
+    attack_reference_sources: list[str] = []
+
+    if controls["use_attack_references"]:
+        X_ref, y_ref, sources = _collect_if_attack_reference_data(
+            loader=loader,
+            preprocessor=preprocessor,
+            dataset_type=dataset_type,
+            selected_paths=selected_paths,
+            models_dir=models_dir,
+            max_files=int(controls["attack_reference_files"]),
+        )
+        if X_ref is not None and y_ref.size > 0:
+            ref_scores = np.asarray(engine.decision_function(X_ref), dtype=float)
+            calib_scores = np.concatenate([calib_scores, ref_scores])
+            calib_labels = np.concatenate([calib_labels, y_ref.astype(int)])
+            attack_reference_sources = list(sources)
+
+    if_threshold, if_calibration = _calibrate_if_threshold(
+        decision_scores=calib_scores,
+        y_binary=calib_labels,
+        target_fp_rate=float(controls["target_fp_rate"]),
+    )
+    score_stats = _summarize_if_score_distribution(calib_scores)
+
+    predictions = _apply_if_threshold(decision_scores_test, if_threshold)
+    matrix = confusion_matrix(y_test_binary, predictions, labels=[0, 1])
     metrics = {
         "accuracy": float(accuracy_score(y_test_binary, predictions)),
         "precision": float(precision_score(y_test_binary, predictions, zero_division=0)),
@@ -731,30 +2375,45 @@ def _train_isolation_forest(
         "f1": float(f1_score(y_test_binary, predictions, zero_division=0)),
         "confusion_matrix": matrix.tolist(),
         "labels": ["Норма", "Аномалія"],
+        "is_unsupervised_only": not has_evaluation_data,
+        "if_threshold": float(if_threshold),
+        "if_false_positive_rate": float(if_calibration.get("false_positive_rate", 0.0)),
     }
 
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     model_name = f"{dataset_type.lower().replace('-', '_')}_isolation_forest_{timestamp}.joblib"
+    if_calibration_payload = {
+        **if_calibration,
+        "threshold": float(if_threshold),
+        "attack_reference_sources": attack_reference_sources,
+        "score_stats": score_stats,
+    }
+    trained_on_pcap_metrics = bool(attack_reference_sources)
     metadata = {
         "dataset_type": dataset_type,
         "nature_id": nature_for_dataset(dataset_type),
         "analysis_mode": get_schema(dataset_type).analysis_mode,
         "model_type": "anomaly_detection",
-        "compatible_input_types": ["csv"],
-        "trained_on_pcap_metrics": False,
+        "compatible_input_types": list(get_schema(dataset_type).supported_input_types),
+        "trained_on_pcap_metrics": trained_on_pcap_metrics,
         "expected_features": preprocessor.feature_columns,
         "categorical_columns": preprocessor.categorical_columns,
         "use_grid_search": False,
+        "if_threshold": float(if_threshold),
+        "if_target_fp_rate": float(controls["target_fp_rate"]),
+        "if_use_attack_references": bool(controls["use_attack_references"]),
+        "if_calibration": if_calibration_payload,
+        "if_score_stats": score_stats,
         "configured_params": configured_params,
         "metrics": {key: value for key, value in metrics.items() if key not in {"confusion_matrix", "labels"}},
     }
     save_path = engine.save_model(model_name, preprocessor=preprocessor, metadata=metadata)
 
-    decision_scores = engine.decision_function(X_test)
     preview = test_df.loc[:, ["target_label"]].copy()
     preview = preview.rename(columns={"target_label": "початкова мітка"})
     preview["прогноз"] = pd.Series(np.where(predictions == 1, "Аномалія", "Норма"), index=preview.index)
-    preview["оцінка аномалії"] = pd.Series(-decision_scores, index=preview.index)
+    preview["оцінка аномалії"] = pd.Series(-decision_scores_test, index=preview.index)
+    preview["if_threshold"] = float(if_threshold)
 
     return {
         "model_name": model_name,
@@ -763,6 +2422,8 @@ def _train_isolation_forest(
         "algorithm": "Isolation Forest",
         "use_grid_search": False,
         "configured_params": configured_params,
+        "recommended_threshold": float(if_threshold),
+        "recommended_threshold_metrics": if_calibration_payload,
         "metrics": metrics,
         "prediction_preview": preview.head(200).reset_index(drop=True),
     }
@@ -772,7 +2433,7 @@ def _render_training_result(result: dict[str, Any]) -> None:
     metrics = result["metrics"]
 
     st.divider()
-    st.subheader("Результат навчання")
+    st.subheader("Результат навчання", anchor=False)
     st.caption(f"Модель: {result['model_name']} | Домен: {result['dataset_type']} | Завантажено рядків: {result['rows_loaded']:,}")
 
     metric_columns = st.columns(4)
@@ -780,20 +2441,30 @@ def _render_training_result(result: dict[str, Any]) -> None:
     metric_columns[1].metric("Прецизійність", f"{metrics['precision']:.3f}")
     metric_columns[2].metric("Повнота", f"{metrics['recall']:.3f}")
     metric_columns[3].metric("F1-міра", f"{metrics['f1']:.3f}")
+
+    if metrics.get("is_unsupervised_only"):
+        st.warning(
+            "Навчання виконано у fully-unsupervised режимі (переважно benign). "
+            "Метрики виявлення атак можуть бути занижені без достатніх attack-прикладів."
+        )
+
     recommended_threshold = result.get("recommended_threshold")
     recommended_metrics = result.get("recommended_threshold_metrics") or {}
     if isinstance(recommended_threshold, (int, float)):
         extra_note = ""
-        if str(recommended_metrics.get("selection_policy", "")).strip() == "fpr<=1%":
+        if isinstance(recommended_metrics.get("false_positive_rate"), (int, float)):
             extra_note = (
                 f", частка хибних спрацьовувань="
                 f"{float(recommended_metrics.get('false_positive_rate', 0.0)):.3f}"
             )
         st.caption(
-            f"Рекомендований поріг атаки: {recommended_threshold:.2f} "
+            f"Рекомендований поріг атаки: {recommended_threshold:.4f} "
             f"(валідація: F1={float(recommended_metrics.get('f1', 0.0)):.3f}, "
             f"повнота={float(recommended_metrics.get('recall', 0.0)):.3f}{extra_note})"
         )
+        sources = recommended_metrics.get("attack_reference_sources")
+        if isinstance(sources, list) and sources:
+            st.caption("Attack-референси для калібрування: " + ", ".join(map(str, sources[:6])))
 
     best_params = result.get("best_params")
     configured_params = result.get("configured_params")
@@ -802,12 +2473,56 @@ def _render_training_result(result: dict[str, Any]) -> None:
     elif isinstance(configured_params, dict) and configured_params:
         st.caption(f"Параметри, з якими навчено модель: {_format_params_hint(configured_params)}")
 
+    auto_candidate_scores = result.get("auto_candidate_scores")
+    if isinstance(auto_candidate_scores, list) and auto_candidate_scores:
+        auto_rows: list[dict[str, Any]] = []
+        for item in auto_candidate_scores:
+            if not isinstance(item, dict):
+                continue
+            auto_rows.append(
+                {
+                    "Алгоритм": str(item.get("algorithm") or "-"),
+                    "F1": float(item.get("f1", 0.0)),
+                    "Recall": float(item.get("recall", 0.0)),
+                    "Precision": float(item.get("precision", 0.0)),
+                    "Accuracy": float(item.get("accuracy", 0.0)),
+                }
+            )
+        if auto_rows:
+            st.markdown("**Авто-порівняння кандидатів**")
+            st.dataframe(with_row_number(pd.DataFrame(auto_rows)), width="stretch", hide_index=True)
+
+    auto_failed_algorithms = result.get("auto_failed_algorithms")
+    if isinstance(auto_failed_algorithms, list) and auto_failed_algorithms:
+        st.warning("Кандидати, що не пройшли авто-навчання: " + "; ".join(map(str, auto_failed_algorithms)))
+
+    reference_sources = result.get("cic_reference_sources")
+    if isinstance(reference_sources, list) and reference_sources:
+        st.caption("CIC reference-корпус для узагальнення: " + ", ".join(map(str, reference_sources[:10])))
+
+    hard_case_sources = result.get("cic_hard_case_reference_sources")
+    if isinstance(hard_case_sources, list) and hard_case_sources:
+        st.caption("CIC hard-case референси: " + ", ".join(map(str, hard_case_sources[:6])))
+
+    nsl_reference_sources = result.get("nsl_reference_sources")
+    if isinstance(nsl_reference_sources, list) and nsl_reference_sources:
+        st.caption("NSL reference-корпус для узагальнення: " + ", ".join(map(str, nsl_reference_sources[:10])))
+
+    unsw_reference_sources = result.get("unsw_reference_sources")
+    if isinstance(unsw_reference_sources, list) and unsw_reference_sources:
+        st.caption("UNSW reference-корпус для узагальнення: " + ", ".join(map(str, unsw_reference_sources[:10])))
+
     chart_col, preview_col = st.columns([1.2, 1])
     with chart_col:
         st.plotly_chart(
-            _build_confusion_matrix_figure(metrics["confusion_matrix"], metrics["labels"]),
+            _build_confusion_matrix_figure(
+                metrics["confusion_matrix"],
+                metrics["labels"],
+                normalize_rows=True,
+            ),
             width="stretch",
         )
+        _render_confusion_terms_help(metrics["labels"])
     with preview_col:
         st.markdown("**Файли у тренуванні**")
         for file_name in result["files_used"]:
@@ -816,25 +2531,102 @@ def _render_training_result(result: dict[str, Any]) -> None:
         st.code(result["save_path"])
 
     with st.expander("Попередній перегляд прогнозів", expanded=False):
-        st.dataframe(result["prediction_preview"], width="stretch", hide_index=True)
+        st.dataframe(with_row_number(result["prediction_preview"]), width="stretch", hide_index=True)
 
 
-def _build_confusion_matrix_figure(matrix: list[list[int]], labels: list[str]) -> go.Figure:
+def _build_confusion_matrix_figure(
+    matrix: list[list[int]],
+    labels: list[str],
+    *,
+    normalize_rows: bool = False,
+) -> go.Figure:
+    matrix_array = np.asarray(matrix, dtype=float)
+    if matrix_array.ndim != 2:
+        matrix_array = np.atleast_2d(matrix_array)
+
+    row_count, col_count = matrix_array.shape
+    if row_count == 0 or col_count == 0:
+        row_count = col_count = 1
+        matrix_array = np.zeros((1, 1), dtype=float)
+
+    axis_labels = [str(label) for label in labels]
+    if len(axis_labels) != row_count:
+        axis_labels = [str(index) for index in range(row_count)]
+
+    aliases: list[list[str]] | None = None
+    if row_count == 2 and col_count == 2:
+        aliases = [["TN", "FP"], ["FN", "TP"]]
+
+    z_values = matrix_array.copy()
+    title = "Матриця помилок"
+    colorbar_title = "Кількість"
+    if normalize_rows:
+        row_sums = matrix_array.sum(axis=1, keepdims=True)
+        safe_row_sums = np.where(row_sums == 0.0, 1.0, row_sums)
+        z_values = matrix_array / safe_row_sums
+        title = "Матриця помилок (нормалізована по рядках)"
+        colorbar_title = "%"
+
+    text_values: list[list[str]] = []
+    for row_index in range(row_count):
+        text_row: list[str] = []
+        for col_index in range(col_count):
+            count_value = int(matrix_array[row_index, col_index])
+            if normalize_rows:
+                base_text = f"{count_value}<br>{z_values[row_index, col_index] * 100:.1f}%"
+            else:
+                base_text = str(count_value)
+
+            alias_text = aliases[row_index][col_index] if aliases is not None else ""
+            text_row.append(f"{alias_text}<br>{base_text}" if alias_text else base_text)
+        text_values.append(text_row)
+
+    hover_template = (
+        "Фактичний клас: %{y}<br>Спрогнозований клас: %{x}<br>"
+        + ("Частка: %{z:.1%}" if normalize_rows else "Кількість: %{z:.0f}")
+        + "<extra></extra>"
+    )
+
     figure = go.Figure(
         data=go.Heatmap(
-            z=matrix,
-            x=labels,
-            y=labels,
+            z=z_values,
+            x=axis_labels,
+            y=axis_labels,
             colorscale="Blues",
-            text=matrix,
+            text=text_values,
             texttemplate="%{text}",
+            hovertemplate=hover_template,
+            colorbar=dict(title=colorbar_title),
+            zmin=0.0 if normalize_rows else None,
+            zmax=1.0 if normalize_rows else None,
         )
     )
     figure.update_layout(
-        title="Матриця помилок",
+        title=title,
         xaxis_title="Спрогнозований клас",
         yaxis_title="Фактичний клас",
         margin=dict(l=20, r=20, t=50, b=20),
         height=420,
     )
     return figure
+
+
+def _render_confusion_terms_help(labels: list[str]) -> None:
+    if len(labels) != 2:
+        return
+
+    negative_label = str(labels[0])
+    positive_label = str(labels[1])
+
+    with st.expander("Що означають TN / FP / FN / TP", expanded=False):
+        st.markdown(
+            "1. TN (True Negative): фактичний клас — "
+            f"{negative_label}, прогноз моделі — {negative_label}. Це правильне визначення норми.\n"
+            "2. FP (False Positive): фактичний клас — "
+            f"{negative_label}, прогноз моделі — {positive_label}. Це хибна тривога.\n"
+            "3. FN (False Negative): фактичний клас — "
+            f"{positive_label}, прогноз моделі — {negative_label}. Це пропущена атака.\n"
+            "4. TP (True Positive): фактичний клас — "
+            f"{positive_label}, прогноз моделі — {positive_label}. Це правильне виявлення атаки."
+        )
+        st.caption("Похідні метрики: Precision = TP/(TP+FP), Recall = TP/(TP+FN), FPR = FP/(FP+TN).")

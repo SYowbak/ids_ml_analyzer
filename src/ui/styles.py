@@ -537,46 +537,6 @@ def load_css():
         border: 1px solid #111111;
     }
 
-    /* AI Analysis Card */
-    .ai-card {
-        background: var(--bg-card);
-        border: 1px solid var(--border);
-        border-radius: 12px;
-        padding: 1.5rem;
-        margin: 1rem 0;
-    }
-
-    .ai-card-header {
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-        margin-bottom: 1rem;
-        padding-bottom: 0.75rem;
-        border-bottom: 1px solid var(--border);
-    }
-
-    .ai-card-title {
-        color: var(--accent);
-        font-size: 1rem;
-        font-weight: 600;
-    }
-
-    /* Executive Summary Card */
-    .executive-card {
-        background: var(--bg-card);
-        border: 1px solid var(--border);
-        border-radius: 12px;
-        padding: 1.5rem;
-        margin: 1rem 0;
-    }
-
-    .executive-title {
-        color: var(--accent);
-        font-size: 1.1rem;
-        font-weight: 700;
-        margin-bottom: 1rem;
-    }
-
     /* Streamlit alerts and widgets in monochrome */
     [data-testid="stAlert"] {
         background: #ffffff !important;

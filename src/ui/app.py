@@ -19,8 +19,35 @@ from src.services.database import DatabaseService
 from src.services.settings_service import SettingsService
 from src.ui.tabs.history import render_history_tab
 from src.ui.tabs.home import render_home_tab
+from src.ui.tabs.models import render_models_tab
 from src.ui.tabs.scanning import render_scanning_tab
 from src.ui.tabs.training import render_training_tab
+
+
+def _hide_heading_anchor_icons() -> None:
+    """Hide Streamlit heading anchor/link icons across the app."""
+    st.markdown(
+        """
+        <style>
+        [data-testid="stHeaderActionElements"],
+        [data-testid="stHeaderActionElements"] a,
+        [data-testid="stHeaderActionElements"] svg,
+        [data-testid="stMarkdownContainer"] a[href^="#"],
+        [data-testid="stMarkdownContainer"] .anchor-link,
+        [data-testid="stMarkdownContainer"] .header-anchor,
+        [data-testid="stMarkdownContainer"] .header-anchor-link {
+            display: none !important;
+            visibility: hidden !important;
+            width: 0 !important;
+            height: 0 !important;
+            overflow: hidden !important;
+            margin: 0 !important;
+            padding: 0 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 @st.cache_resource
@@ -33,11 +60,13 @@ def init_services() -> dict[str, object]:
 
 services = init_services()
 
-st.title("IDS ML Analyzer")
+_hide_heading_anchor_icons()
+
+st.title("IDS ML Analyzer", anchor=False)
 st.caption("Строгий підхід: окремий NIDS для CIC-IDS і окремий потік SIEM для NSL-KDD / UNSW-NB15.")
 
-home_tab, training_tab, scanning_tab, history_tab = st.tabs(
-    ["Головна", "Тренування", "Сканування", "Історія"]
+home_tab, training_tab, scanning_tab, models_tab, history_tab = st.tabs(
+    ["Головна", "Тренування", "Сканування", "Моделі", "Історія"]
 )
 
 with home_tab:
@@ -48,6 +77,9 @@ with training_tab:
 
 with scanning_tab:
     render_scanning_tab(services=services, root_dir=ROOT_DIR)
+
+with models_tab:
+    render_models_tab(services=services, root_dir=ROOT_DIR)
 
 with history_tab:
     render_history_tab(services=services, root_dir=ROOT_DIR)

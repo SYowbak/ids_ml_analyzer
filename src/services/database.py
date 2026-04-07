@@ -344,3 +344,25 @@ class DatabaseService:
             return -1
         finally:
             db.close()
+
+    def clear_scan_history(self) -> int:
+        """Очищає історію сканувань та повертає кількість видалених сесій."""
+        SessionLocal = get_session_local()
+        db = SessionLocal()
+        try:
+            from src.database.models import Alert, AnalysisSession, DetectedAnomaly
+
+            # Видаляємо в порядку залежностей, щоб уникнути FK-конфліктів.
+            db.query(Alert).delete(synchronize_session=False)
+            db.query(DetectedAnomaly).delete(synchronize_session=False)
+            deleted_sessions = db.query(AnalysisSession).delete(synchronize_session=False)
+
+            db.commit()
+            return int(deleted_sessions)
+        except Exception as e:
+            from loguru import logger
+            logger.error(f"Failed to clear scan history: {e}")
+            db.rollback()
+            return -1
+        finally:
+            db.close()

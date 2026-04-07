@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
-from collections import Counter
-import json
 import sys
 import time
 import uuid
@@ -35,11 +33,13 @@ from src.core.dataset_nature import (
 )
 from src.core.domain_schemas import get_schema, is_benign_label, normalize_column_name
 from src.core.model_engine import ModelEngine
-from src.services.report_generator import ReportGenerator
 from src.services.threat_catalog import get_severity, get_severity_label, get_threat_info
+from src.ui.utils.table_helpers import with_row_number
 
 
 SUPPORTED_EXTENSIONS = {".csv", ".pcap", ".pcapng", ".cap"}
+SENSITIVITY_MODE_AUTO = "Автоматично (рекомендовано)"
+SENSITIVITY_MODE_MANUAL = "Вручну"
 
 
 def render_scanning_tab(services: dict[str, Any], root_dir: Path) -> None:
@@ -53,34 +53,25 @@ def render_scanning_tab(services: dict[str, Any], root_dir: Path) -> None:
     default_threshold = min(max(default_threshold, 0.01), 0.99)
 
     _init_scanning_state(default_threshold=default_threshold)
+    scan_in_progress = bool(st.session_state.get("scan_in_progress", False))
     loader = DataLoader()
     models_dir = root_dir / "models"
     upload_dir = root_dir / "datasets" / "User_Uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
 
-    st.subheader("Контрольоване сканування")
+    st.subheader("Контрольоване сканування", anchor=False)
     st.caption("Система перевіряє природу файлу, сумісність моделі та попереджає про ризик некоректних детекцій.")
-
-    file_options = _build_scan_file_options(root_dir)
 
     with st.container(border=True):
         st.markdown("**Крок 1. Оберіть файл для сканування**")
-        selected_existing_label = st.selectbox(
-            "Файли з робочих директорій",
-            options=[""] + list(file_options.keys()),
-            format_func=lambda label: "Оберіть файл" if label == "" else label,
-            key="scan_selected_existing_label",
-        )
         uploaded_file = st.file_uploader(
-            "Або завантажте CSV / PCAP",
+            "Завантажте CSV / PCAP",
             type=["csv", "pcap", "pcapng", "cap"],
             accept_multiple_files=False,
             key="scan_uploaded_file",
         )
 
         selected_path = _resolve_selected_scan_path(
-            selected_existing_label=selected_existing_label,
-            file_options=file_options,
             uploaded_file=uploaded_file,
             upload_dir=upload_dir,
         )
@@ -107,17 +98,19 @@ def render_scanning_tab(services: dict[str, Any], root_dir: Path) -> None:
                     pass
 
             st.dataframe(
-                pd.DataFrame(
-                    [
-                        {
-                            "Файл": selected_path.name,
-                            "Формат": inspection.input_type.upper(),
-                            "Датасет": inspection.dataset_type,
-                            "Природа": nature_label(file_nature_id),
-                            "Режим": inspection.analysis_mode,
-                            "Впевненість детектора": f"{nature_confidence:.2f}",
-                        }
-                    ]
+                with_row_number(
+                    pd.DataFrame(
+                        [
+                            {
+                                "Файл": selected_path.name,
+                                "Формат": inspection.input_type.upper(),
+                                "Датасет": inspection.dataset_type,
+                                "Природа": nature_label(file_nature_id),
+                                "Режим": inspection.analysis_mode,
+                                "Впевненість детектора": f"{nature_confidence:.2f}",
+                            }
+                        ]
+                    )
                 ),
                 width="stretch",
                 hide_index=True,
@@ -134,7 +127,7 @@ def render_scanning_tab(services: dict[str, Any], root_dir: Path) -> None:
                     f"перевірено пакетів={sampled_packets}."
                 )
         else:
-            st.info("Оберіть файл або завантажте новий.")
+            st.info("Завантажте файл для сканування.")
 
     engine = ModelEngine(models_dir=str(models_dir))
     model_manifests = engine.list_models(include_unsupported=False)
@@ -175,19 +168,21 @@ def render_scanning_tab(services: dict[str, Any], root_dir: Path) -> None:
                 model_names = [manifest["name"] for manifest in ranked_models]
 
                 st.dataframe(
-                    pd.DataFrame(
-                        [
-                            {
-                                "Модель": manifest["name"],
-                                "Алгоритм": manifest["algorithm"],
-                                "Датасет": manifest["dataset_type"],
-                                "Природа": nature_label(nature_for_dataset(manifest.get("dataset_type"))),
-                                "Вхід": ", ".join(manifest["compatible_input_types"]),
-                                "Повнота": _extract_metric(manifest, "recall"),
-                                "F1": _extract_metric(manifest, "f1"),
-                            }
-                            for manifest in ranked_models
-                        ]
+                    with_row_number(
+                        pd.DataFrame(
+                            [
+                                {
+                                    "Модель": manifest["name"],
+                                    "Алгоритм": manifest["algorithm"],
+                                    "Датасет": manifest["dataset_type"],
+                                    "Природа": nature_label(nature_for_dataset(manifest.get("dataset_type"))),
+                                    "Вхід": ", ".join(manifest["compatible_input_types"]),
+                                    "Повнота": _extract_metric(manifest, "recall"),
+                                    "F1": _extract_metric(manifest, "f1"),
+                                }
+                                for manifest in ranked_models
+                            ]
+                        )
                     ),
                     width="stretch",
                     hide_index=True,
@@ -257,6 +252,7 @@ def render_scanning_tab(services: dict[str, Any], root_dir: Path) -> None:
 
         if selected_model_name and st.session_state.get("scan_last_model_name") != selected_model_name:
             st.session_state["scan_sensitivity"] = float(recommended_threshold_value)
+            st.session_state["scan_manual_sensitivity"] = float(recommended_threshold_value)
             st.session_state["scan_last_model_name"] = selected_model_name
 
     current_signature = _build_scan_signature(selected_path, selected_model_name)
@@ -266,61 +262,56 @@ def render_scanning_tab(services: dict[str, Any], root_dir: Path) -> None:
     with st.container(border=True):
         st.markdown("**Крок 3. Запустіть сканування**")
         scan_limit_col, note_col = st.columns([1, 2])
-        allow_arp_fallback = bool(st.session_state.get("scan_allow_arp_fallback", False))
         with scan_limit_col:
             row_limit = st.number_input(
                 "Ліміт рядків / пакетів",
-                min_value=1000,
+                min_value=0,
                 max_value=250000,
-                value=50000,
+                value=0,
                 step=1000,
                 key="scan_row_limit",
-                help="Ліміт захищає інтерфейс від зависань на великих файлах.",
+                help="0 = без обмеження. Ліміт захищає інтерфейс від зависань на великих файлах.",
             )
-            sensitivity = st.slider(
-                "Чутливість (Поріг виявлення)",
-                min_value=0.01,
-                max_value=0.99,
-                step=0.01,
-                key="scan_sensitivity",
-                help="Менше значення = жорсткіша детекція (більше аномалій).",
-            )
-        with note_col:
-            st.caption("Для операцій >0.5 сек використовується індикатор очікування і збереження проміжного стану.")
-            allow_arp_fallback = st.checkbox(
-                "Дозволити ARP fallback, якщо модель не може відпрацювати",
-                key="scan_allow_arp_fallback",
+            sensitivity_mode = st.radio(
+                "Режим чутливості",
+                options=[SENSITIVITY_MODE_AUTO, SENSITIVITY_MODE_MANUAL],
+                key="scan_sensitivity_mode",
+                horizontal=True,
                 help=(
-                    "За замовчуванням вимкнено (строгий режим): система або застосовує обрану модель, "
-                    "або повертає помилку."
+                    "Автоматично: система бере найкращий поріг із поточної моделі. "
+                    "Вручну: можна самостійно змінити поріг."
                 ),
             )
+            if sensitivity_mode == SENSITIVITY_MODE_MANUAL:
+                st.slider(
+                    "Чутливість (Поріг виявлення)",
+                    min_value=0.01,
+                    max_value=0.99,
+                    step=0.01,
+                    key="scan_manual_sensitivity",
+                    help="Менше значення = жорсткіша детекція (більше аномалій).",
+                )
 
-            pcap_requires_fallback = bool(
+            effective_sensitivity = _resolve_effective_sensitivity(
+                sensitivity_mode=sensitivity_mode,
+                recommended_threshold=float(recommended_threshold_value),
+                manual_sensitivity=st.session_state.get("scan_manual_sensitivity"),
+            )
+            st.session_state["scan_sensitivity"] = float(effective_sensitivity)
+            if sensitivity_mode == SENSITIVITY_MODE_AUTO:
+                st.caption(f"Автоматично застосовано рекомендований поріг: {effective_sensitivity:.2f}")
+        with note_col:
+            pcap_requires_ip_flow = bool(
                 inspection
                 and inspection.input_type == "pcap"
                 and pcap_profile is not None
                 and pcap_profile.get("status") == "ok"
                 and not bool(pcap_profile.get("has_ip", False))
             )
-            if pcap_requires_fallback:
-                st.warning(
-                    "Для цього PCAP обрана ML-модель не зможе виконати інференс напряму, "
-                    "бо у файлі немає валідних IP-flow ознак."
-                )
-                st.info(
-                    "Що таке fallback: це запасний режим аналізу, коли основний модельний шлях недоступний. "
-                    "У цьому випадку вмикається L2 ARP-евристика: вона оцінює підозрілі ARP-сплески, "
-                    "а не використовує ознаки моделі."
-                )
-            if pcap_requires_fallback and not allow_arp_fallback:
+            if pcap_requires_ip_flow:
                 st.error(
                     "Цей PCAP не містить валідних IP-flow ознак для моделі. "
-                    "У strict-режимі запуск заблоковано. Увімкніть ARP fallback або оберіть інший файл."
-                )
-            elif pcap_requires_fallback and allow_arp_fallback:
-                st.success(
-                    "ARP fallback увімкнено: сканування буде виконано у запасному режимі (L2 ARP-евристика)."
+                    "У строгому режимі запуск заблоковано. Оберіть інший файл з IP/TCP/UDP потоками."
                 )
 
         mismatch_blocked = bool(mismatch_warning) and not bool(st.session_state.get("scan_allow_mismatch", False))
@@ -330,7 +321,6 @@ def render_scanning_tab(services: dict[str, Any], root_dir: Path) -> None:
             and pcap_profile is not None
             and pcap_profile.get("status") == "ok"
             and not bool(pcap_profile.get("has_ip", False))
-            and not allow_arp_fallback
         )
         can_scan = bool(
             selected_path
@@ -341,39 +331,46 @@ def render_scanning_tab(services: dict[str, Any], root_dir: Path) -> None:
             and not mismatch_blocked
             and not pcap_blocked
         )
-        if st.button("Запустити сканування", width="stretch", type="primary", disabled=not can_scan):
-            try:
-                started_at = time.perf_counter()
-                with st.spinner("Триває аналіз файлу..."):
-                    result = _run_scan(
-                        loader=loader,
-                        models_dir=models_dir,
-                        selected_path=selected_path,
-                        inspection=inspection,
-                        selected_model_name=selected_model_name,
-                        row_limit=int(row_limit),
-                        sensitivity=float(sensitivity),
-                        allow_dataset_mismatch=bool(st.session_state.get("scan_allow_mismatch", False)),
-                        allow_arp_fallback=bool(allow_arp_fallback),
+        scan_start_label = "Сканування виконується..." if scan_in_progress else "Запустити сканування"
+        if st.button(scan_start_label, width="stretch", type="primary", disabled=(not can_scan) or scan_in_progress):
+            if not _try_begin_scan_run():
+                st.warning("Сканування вже виконується або щойно стартувало. Подвійний клік проігноровано.")
+            else:
+                try:
+                    st.session_state.scan_result = None
+                    st.session_state.scan_result_signature = None
+                    started_at = time.perf_counter()
+                    with st.spinner("Триває аналіз файлу..."):
+                        result = _run_scan(
+                            loader=loader,
+                            models_dir=models_dir,
+                            selected_path=selected_path,
+                            inspection=inspection,
+                            selected_model_name=selected_model_name,
+                            row_limit=int(row_limit),
+                            sensitivity=float(effective_sensitivity),
+                            allow_dataset_mismatch=bool(st.session_state.get("scan_allow_mismatch", False)),
+                        )
+                    result["duration_seconds"] = time.perf_counter() - started_at
+                    services["db"].save_scan(
+                        filename=selected_path.name,
+                        total=result["total_records"],
+                        anomalies=result["anomalies_count"],
+                        risk_score=result["risk_score"],
+                        model_name=selected_model_name,
+                        duration=result["duration_seconds"],
                     )
-                result["duration_seconds"] = time.perf_counter() - started_at
-                services["db"].save_scan(
-                    filename=selected_path.name,
-                    total=result["total_records"],
-                    anomalies=result["anomalies_count"],
-                    risk_score=result["risk_score"],
-                    model_name=selected_model_name,
-                    duration=result["duration_seconds"],
-                )
-                if settings_service is not None:
-                    settings_service.set("anomaly_threshold", float(sensitivity))
-                st.session_state.scan_result = result
-                st.session_state.scan_result_signature = current_signature
-                st.success("Сканування завершено.")
-            except Exception as exc:
-                st.session_state.scan_result = None
-                st.session_state.scan_result_signature = None
-                st.error(str(exc))
+                    if settings_service is not None:
+                        settings_service.set("anomaly_threshold", float(effective_sensitivity))
+                    st.session_state.scan_result = result
+                    st.session_state.scan_result_signature = current_signature
+                    st.success("Сканування завершено.")
+                except Exception as exc:
+                    st.session_state.scan_result = None
+                    st.session_state.scan_result_signature = None
+                    st.error(str(exc))
+                finally:
+                    _finish_scan_run()
 
     if st.session_state.scan_result:
         _render_scan_result(st.session_state.scan_result)
@@ -382,15 +379,35 @@ def render_scanning_tab(services: dict[str, Any], root_dir: Path) -> None:
 def _init_scanning_state(default_threshold: float = 0.30) -> None:
     st.session_state.setdefault("scan_result", None)
     st.session_state.setdefault("scan_result_signature", None)
-    st.session_state.setdefault("scan_selected_existing_label", "")
     st.session_state.setdefault("scan_selected_model_name", None)
     st.session_state.setdefault("scan_uploaded_cache", {})
     st.session_state.setdefault("scan_sensitivity", float(default_threshold))
+    st.session_state.setdefault("scan_manual_sensitivity", float(default_threshold))
+    st.session_state.setdefault("scan_sensitivity_mode", SENSITIVITY_MODE_AUTO)
     st.session_state.setdefault("scan_last_model_name", None)
     st.session_state.setdefault("scan_show_only_compatible", True)
     st.session_state.setdefault("scan_model_pick_mode", "Автоматично")
     st.session_state.setdefault("scan_allow_mismatch", False)
-    st.session_state.setdefault("scan_allow_arp_fallback", False)
+    st.session_state.setdefault("scan_in_progress", False)
+    st.session_state.setdefault("scan_last_started_monotonic", 0.0)
+
+
+def _try_begin_scan_run(cooldown_seconds: float = 1.2) -> bool:
+    if bool(st.session_state.get("scan_in_progress", False)):
+        return False
+
+    now = float(time.monotonic())
+    last_started = float(st.session_state.get("scan_last_started_monotonic", 0.0) or 0.0)
+    if last_started > 0.0 and (now - last_started) < float(cooldown_seconds):
+        return False
+
+    st.session_state["scan_in_progress"] = True
+    st.session_state["scan_last_started_monotonic"] = now
+    return True
+
+
+def _finish_scan_run() -> None:
+    st.session_state["scan_in_progress"] = False
 
 
 def _build_scan_file_options(root_dir: Path) -> dict[str, Path]:
@@ -398,21 +415,37 @@ def _build_scan_file_options(root_dir: Path) -> dict[str, Path]:
     for directory in ("datasets/TEST_DATA", "datasets/Processed_Scans", "datasets/User_Uploads"):
         folder = root_dir / directory
         if folder.exists():
-            candidates.extend(sorted(path for path in folder.iterdir() if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS))
+            candidates.extend(
+                sorted(
+                    path
+                    for path in folder.rglob("*")
+                    if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
+                )
+            )
+
+    deduped: list[Path] = []
+    seen_paths: set[str] = set()
+    for path in candidates:
+        try:
+            path_key = str(path.resolve())
+        except Exception:
+            path_key = str(path)
+        if path_key in seen_paths:
+            continue
+        seen_paths.add(path_key)
+        deduped.append(path)
 
     options: dict[str, Path] = {}
-    for path in candidates:
-        label = f"{path.parent.name} / {path.name}"
+    for path in deduped:
+        try:
+            label = path.relative_to(root_dir).as_posix()
+        except Exception:
+            label = path.as_posix()
         options[label] = path
     return options
 
 
-def _resolve_selected_scan_path(
-    selected_existing_label: str,
-    file_options: dict[str, Path],
-    uploaded_file: Any,
-    upload_dir: Path,
-) -> Path | None:
+def _resolve_selected_scan_path(uploaded_file: Any, upload_dir: Path) -> Path | None:
     if uploaded_file is not None:
         cache: dict[str, str] = st.session_state["scan_uploaded_cache"]
         cache_key = f"{uploaded_file.name}:{uploaded_file.size}"
@@ -424,8 +457,6 @@ def _resolve_selected_scan_path(
         destination.write_bytes(uploaded_file.getbuffer())
         cache[cache_key] = str(destination)
         return destination
-    if selected_existing_label:
-        return file_options[selected_existing_label]
     return None
 
 
@@ -546,9 +577,22 @@ def _resolve_recommended_threshold(manifest: dict[str, Any], inspection: Any) ->
         if algorithm == "Random Forest":
             return 0.20, "Рекомендований поріг для цієї моделі: 0.20 (PCAP override для CIC Random Forest)"
         if algorithm == "XGBoost":
+            hard_case_sources = metadata.get("cic_hard_case_reference_sources")
+            if isinstance(hard_case_sources, list) and hard_case_sources:
+                adjusted = max(threshold_value, 0.20)
+                return adjusted, (
+                    f"Рекомендований поріг для цієї моделі: {adjusted:.2f} "
+                    "(PCAP stability override для CIC XGBoost з hard-case референсами)"
+                )
             return 0.05, "Рекомендований поріг для цієї моделі: 0.05 (PCAP override для CIC XGBoost)"
 
     if inspection and inspection.input_type == "csv":
+        if dataset_type == "CIC-IDS" and algorithm in {"Random Forest", "XGBoost"}:
+            adjusted = min(threshold_value, 0.02)
+            return adjusted, (
+                f"Рекомендований поріг для цієї моделі: {adjusted:.2f} "
+                "(CIC CSV override для покриття рідкісних атак)"
+            )
         if dataset_type == "NSL-KDD":
             adjusted = min(threshold_value, 0.05)
             return adjusted, (
@@ -570,6 +614,18 @@ def _resolve_recommended_threshold(manifest: dict[str, Any], inspection: Any) ->
             )
 
     return threshold_value, f"Рекомендований поріг для цієї моделі: {threshold_value:.2f}"
+
+
+def _resolve_effective_sensitivity(
+    sensitivity_mode: str,
+    recommended_threshold: float,
+    manual_sensitivity: Any,
+) -> float:
+    if sensitivity_mode == SENSITIVITY_MODE_MANUAL and isinstance(manual_sensitivity, (int, float)):
+        selected = float(manual_sensitivity)
+    else:
+        selected = float(recommended_threshold)
+    return min(max(selected, 0.01), 0.99)
 
 
 def _build_scan_signature(selected_path: Path | None, selected_model_name: str | None) -> str | None:
@@ -648,6 +704,330 @@ def _severity_order() -> dict[str, int]:
     }
 
 
+def _is_informative_series(series: pd.Series) -> bool:
+    if series is None:
+        return False
+    non_null = series.dropna()
+    if non_null.empty:
+        return False
+    text = non_null.astype(str).str.strip()
+    text = text[(text != "") & (text.str.lower() != "н/д") & (text.str.lower() != "nan")]
+    return not text.empty
+
+
+def _build_top_table(
+    frame: pd.DataFrame,
+    column: str,
+    value_label: str,
+    top_n: int = 10,
+) -> pd.DataFrame:
+    if column not in frame.columns or not _is_informative_series(frame[column]):
+        return pd.DataFrame(columns=[value_label, "Кількість"])
+
+    series = frame[column].dropna().astype(str).str.strip()
+    series = series[(series != "") & (series.str.lower() != "н/д") & (series.str.lower() != "nan")]
+    if series.empty:
+        return pd.DataFrame(columns=[value_label, "Кількість"])
+
+    table = series.value_counts().head(top_n).reset_index()
+    table.columns = [value_label, "Кількість"]
+    return table
+
+
+def _top_value_stats(frame: pd.DataFrame, column: str) -> tuple[str, int, float] | None:
+    if column not in frame.columns or not _is_informative_series(frame[column]):
+        return None
+
+    series = frame[column].dropna().astype(str).str.strip()
+    series = series[(series != "") & (series.str.lower() != "н/д") & (series.str.lower() != "nan")]
+    if series.empty:
+        return None
+
+    value_counts = series.value_counts()
+    if value_counts.empty:
+        return None
+
+    value = str(value_counts.index[0])
+    count = int(value_counts.iloc[0])
+    share = (count / max(int(len(series)), 1)) * 100.0
+    return value, count, share
+
+
+def _build_family_indicator_tables(
+    alerts_only: pd.DataFrame,
+    dataset_type: str,
+) -> list[tuple[str, pd.DataFrame]]:
+    if alerts_only is None or alerts_only.empty:
+        return []
+
+    family = str(dataset_type or "")
+    tables: list[tuple[str, pd.DataFrame]] = []
+
+    if family == "NSL-KDD":
+        candidates = [
+            ("Найчастіші протоколи", "protocol_type", "Протокол"),
+            ("Найчастіші сервіси", "service", "Сервіс"),
+            ("Найчастіші TCP прапори", "flag", "Прапор"),
+            ("Найпоширеніші типи аномалій", "attack_name", "Тип аномалії"),
+        ]
+    else:
+        candidates = [
+            ("Найбільш атаковані IP-адреси", "src_ip", "IP"),
+            ("Найбільш використовувані порти атак", "dst_port", "Порт"),
+            ("Найчастіші протоколи", "protocol", "Протокол"),
+            ("Найпоширеніші типи аномалій", "attack_name", "Тип аномалії"),
+        ]
+
+    for title, column, value_label in candidates:
+        table = _build_top_table(alerts_only, column, value_label=value_label, top_n=10)
+        if not table.empty:
+            tables.append((title, table))
+
+    return tables
+
+
+def _normalize_attack_display_name(label: Any, algorithm: str | None = None) -> str:
+    text = str(label or "").strip()
+    if not text:
+        return "Аномалія (тип не визначено)"
+    if is_benign_label(text):
+        return "Нормальний трафік"
+
+    generic_labels = {
+        "anomaly",
+        "attack",
+        "unknown",
+        "suspicious",
+        "malicious",
+        "1",
+        "1.0",
+    }
+    if text.lower() in generic_labels:
+        if str(algorithm or "") == "Isolation Forest":
+            return "Аномалія (тип не класифікується цією моделлю)"
+        return "Аномалія (тип не визначено)"
+
+    threat = get_threat_info(text)
+    name_uk = str(threat.get("name_uk") or "").strip()
+    if name_uk and name_uk.lower() != text.lower():
+        # Show localized name while preserving original model label for international consistency.
+        return f"{name_uk} ({text})"
+    return text
+
+
+def _build_incident_action_plan(
+    alerts_only: pd.DataFrame,
+    risk_score: float,
+    algorithm: str,
+    dataset_type: str = "",
+) -> pd.DataFrame:
+    if alerts_only is None or alerts_only.empty:
+        return pd.DataFrame(columns=["Пріоритет", "Дія", "Чому це важливо зараз"])
+
+    plan_rows: list[dict[str, str]] = []
+    total_alerts = int(len(alerts_only))
+
+    attack_col = "attack_name" if "attack_name" in alerts_only.columns else "attack_type"
+    top_attack_name = "Аномалія"
+    top_attack_count = total_alerts
+    if attack_col in alerts_only.columns and _is_informative_series(alerts_only[attack_col]):
+        top_attacks = (
+            alerts_only[attack_col]
+            .astype(str)
+            .str.strip()
+            .value_counts()
+        )
+        if not top_attacks.empty:
+            top_attack_name = str(top_attacks.index[0])
+            top_attack_count = int(top_attacks.iloc[0])
+
+    urgent_tag = "P1" if float(risk_score) >= 40.0 else "P2"
+    plan_rows.append(
+        {
+            "Пріоритет": urgent_tag,
+            "Дія": (
+                f"Ізолюйте джерела трафіку для '{top_attack_name}' та підніміть інцидент у SOC "
+                "з дедлайном 15 хв."
+            ),
+            "Чому це важливо зараз": (
+                f"'{top_attack_name}' формує {top_attack_count:,} із {total_alerts:,} аномальних подій."
+            ),
+        }
+    )
+
+    family = str(dataset_type or "")
+    if family == "NSL-KDD":
+        top_protocol = _top_value_stats(alerts_only, "protocol_type")
+        if top_protocol is not None:
+            protocol, count, share = top_protocol
+            protocol_action = {
+                "tcp": "Перевірте сплески TCP-сесій у SIEM та ввімкніть rate-limit/connection-threshold на perimeter FW.",
+                "udp": "Перевірте UDP burst-патерни, обмежте аномальний UDP трафік та DNS/NTP amplification вектори.",
+                "icmp": "Перевірте ICMP flood/scan активність та увімкніть ICMP rate-limit.",
+            }.get(protocol.lower(), f"Перевірте аномалії протоколу {protocol} у SIEM та мережевих ACL.")
+            plan_rows.append(
+                {
+                    "Пріоритет": "P1" if share >= 35.0 else "P2",
+                    "Дія": protocol_action,
+                    "Чому це важливо зараз": (
+                        f"Протокол {protocol} домінує у {count:,} подіях ({share:.1f}% аномалій)."
+                    ),
+                }
+            )
+
+        top_service = _top_value_stats(alerts_only, "service")
+        if top_service is not None:
+            service, count, share = top_service
+            sensitive_services = {"ftp", "ftp_data", "telnet", "ssh", "http", "smtp"}
+            if service.lower() in sensitive_services:
+                service_action = (
+                    f"Підсиліть контроль сервісу {service}: MFA/lockout, обмеження джерел, підвищене логування невдалих сесій."
+                )
+            else:
+                service_action = f"Перевірте аномальний профіль сервісу {service} та правила доступу до нього."
+            plan_rows.append(
+                {
+                    "Пріоритет": "P1" if share >= 30.0 else "P2",
+                    "Дія": service_action,
+                    "Чому це важливо зараз": (
+                        f"Сервіс {service} присутній у {count:,} подіях ({share:.1f}% аномалій)."
+                    ),
+                }
+            )
+
+        top_flag = _top_value_stats(alerts_only, "flag")
+        if top_flag is not None:
+            flag, count, share = top_flag
+            flag_action = {
+                "S0": "Перевірте SYN-flood/scan ознаки: увімкніть SYN cookies та ліміти напіввідкритих сесій.",
+                "REJ": "Перевірте масові відхилення з'єднань: можливе сканування або брутфорс.",
+                "RSTR": "Перевірте примусові reset-потоки: можливі спроби зриву сесій.",
+            }.get(flag.upper(), f"Перевірте патерн TCP прапора {flag} у кореляційних правилах SIEM.")
+            plan_rows.append(
+                {
+                    "Пріоритет": "P1" if share >= 30.0 else "P2",
+                    "Дія": flag_action,
+                    "Чому це важливо зараз": (
+                        f"Прапор {flag} спостерігається у {count:,} подіях ({share:.1f}% аномалій)."
+                    ),
+                }
+            )
+    else:
+        if "src_ip" in alerts_only.columns and _is_informative_series(alerts_only["src_ip"]):
+            top_src = (
+                alerts_only["src_ip"]
+                .astype(str)
+                .str.strip()
+                .value_counts()
+            )
+            if not top_src.empty:
+                src_ip = str(top_src.index[0])
+                src_count = int(top_src.iloc[0])
+                src_share = (src_count / max(total_alerts, 1)) * 100.0
+                plan_rows.append(
+                    {
+                        "Пріоритет": "P1" if src_share >= 30.0 else "P2",
+                        "Дія": f"Додайте тимчасове блокування/рейт-ліміт для IP {src_ip} на периметрі.",
+                        "Чому це важливо зараз": (
+                            f"Цей IP генерує {src_count:,} подій ({src_share:.1f}% усіх аномалій)."
+                        ),
+                    }
+                )
+
+        if "dst_port" in alerts_only.columns and _is_informative_series(alerts_only["dst_port"]):
+            top_ports = (
+                alerts_only["dst_port"]
+                .astype(str)
+                .str.strip()
+                .value_counts()
+            )
+            if not top_ports.empty:
+                port = str(top_ports.index[0])
+                port_count = int(top_ports.iloc[0])
+                port_share = (port_count / max(total_alerts, 1)) * 100.0
+
+                if port == "53":
+                    port_action = "Увімкніть DNS rate-limit, перевірте резолвери та заблокуйте підозрілі домени/джерела."
+                elif port in {"22", "23", "3389", "445"}:
+                    port_action = "Посильте ACL/GeoIP для критичного сервісного порту та увімкніть MFA/lockout політики."
+                else:
+                    port_action = f"Перевірте правила FW/IPS для порту {port} та тимчасово обмежте доступ."
+
+                plan_rows.append(
+                    {
+                        "Пріоритет": "P1" if port_share >= 25.0 else "P2",
+                        "Дія": port_action,
+                        "Чому це важливо зараз": (
+                            f"Порт {port} присутній у {port_count:,} подіях ({port_share:.1f}% усіх аномалій)."
+                        ),
+                    }
+                )
+
+    generic_name = "Аномалія (тип не класифікується цією моделлю)"
+    undefined_name = "Аномалія (тип не визначено)"
+    generic_share = 0.0
+    if "attack_name" in alerts_only.columns and _is_informative_series(alerts_only["attack_name"]):
+        attack_series = alerts_only["attack_name"].astype(str)
+        generic_share = float((attack_series.isin({generic_name, undefined_name})).mean())
+    if generic_share >= 0.50:
+        plan_rows.append(
+            {
+                "Пріоритет": "P2",
+                "Дія": (
+                    "Після локалізації інциденту перейдіть на supervised-модель для цього домену, "
+                    "щоб отримувати конкретні назви атак замість загальної аномалії."
+                ),
+                "Чому це важливо зараз": (
+                    f"{generic_share * 100.0:.1f}% подій мають загальну мітку без типу атаки "
+                    f"(поточний алгоритм: {algorithm})."
+                ),
+            }
+        )
+
+    return pd.DataFrame(plan_rows).head(5)
+
+
+def _is_generic_attack_name(name: str) -> bool:
+    normalized = str(name or "").strip().lower()
+    return normalized in {
+        "anomaly",
+        "attack",
+        "unknown",
+        "аnomалія (тип не визначено)",
+        "аномалія (тип не визначено)",
+        "аномалія (тип не класифікується цією моделлю)",
+    }
+
+
+def _build_audience_summaries(
+    dataset_type: str,
+    total_records: int,
+    anomalies_count: int,
+    risk_score: float,
+    top_attack_name: str,
+) -> tuple[str, str]:
+    user_text = (
+        f"Перевірено {total_records:,} записів, підозрілих: {anomalies_count:,} "
+        f"({risk_score:.2f}%)."
+    )
+    if _is_generic_attack_name(top_attack_name):
+        user_text += " Система бачить аномалію, але без точного імені атаки."
+    else:
+        user_text += f" Найчастіша загроза: {top_attack_name}."
+
+    if str(dataset_type) == "NSL-KDD":
+        soc_text = (
+            "NSL-KDD: фокусуйте triage на protocol_type/service/flag та аномальних шаблонах сесій, "
+            "бо IP/порт-поля часто відсутні."
+        )
+    else:
+        soc_text = (
+            "Фокусуйте triage на top source IP, destination port, protocol та часових піках у секціях нижче."
+        )
+
+    return user_text, soc_text
+
+
 def _run_scan(
     loader: DataLoader,
     models_dir: Path,
@@ -657,7 +1037,6 @@ def _run_scan(
     row_limit: int,
     sensitivity: float,
     allow_dataset_mismatch: bool = False,
-    allow_arp_fallback: bool = True,
 ) -> dict[str, Any]:
     engine = ModelEngine(models_dir=str(models_dir))
     model, preprocessor, metadata = engine.load_model(selected_model_name)
@@ -666,27 +1045,19 @@ def _run_scan(
     expected_dataset = None if allow_dataset_mismatch else inspection.dataset_type
 
     try:
+        effective_row_limit = None if int(row_limit) <= 0 else int(row_limit)
         loaded = loader.load_file(
             str(selected_path),
-            max_rows=row_limit,
+            max_rows=effective_row_limit,
             preserve_context=True,
             expected_dataset=expected_dataset,
         )
     except ValueError as exc:
         if inspection.input_type == "pcap" and "PCAP не містить валідних IP-потоків" in str(exc):
-            if not allow_arp_fallback:
-                raise ValueError(
-                    "Обрана модель не може бути застосована до цього PCAP: файл не містить валідних IP-flow "
-                    "ознак для NIDS-інференсу. Увімкніть опцію 'Дозволити ARP fallback' або оберіть файл "
-                    "із IP/TCP/UDP потоками."
-                ) from exc
-            return _run_l2_arp_fallback_scan(
-                selected_path=selected_path,
-                inspection=inspection,
-                selected_model_name=selected_model_name,
-                row_limit=row_limit,
-                sensitivity=sensitivity,
-            )
+            raise ValueError(
+                "Обрана модель не може бути застосована до цього PCAP: файл не містить валідних IP-flow "
+                "ознак для NIDS-інференсу. Оберіть інший файл із IP/TCP/UDP потоками."
+            ) from exc
         raise
 
     if not isinstance(loaded, tuple):
@@ -707,13 +1078,103 @@ def _run_scan(
     predictions = engine.predict(X)
     algorithm = str(metadata.get("algorithm"))
     is_if = algorithm == "Isolation Forest"
+    model_note = "Обрану модель застосовано для інференсу."
+    if_diagnostics: dict[str, Any] | None = None
 
     if is_if:
-        scores = np.maximum(-engine.decision_function(X), 0.0)
+        decision_scores = np.asarray(engine.decision_function(X), dtype=float).reshape(-1)
+        finite_mask = np.isfinite(decision_scores)
+        if not finite_mask.any():
+            decision_scores = np.zeros(len(X), dtype=float)
+        elif not finite_mask.all():
+            fill_value = float(np.median(decision_scores[finite_mask]))
+            decision_scores = np.where(finite_mask, decision_scores, fill_value)
+
+        threshold_from_model_raw = metadata.get("if_threshold")
+        threshold_from_model = (
+            float(threshold_from_model_raw)
+            if isinstance(threshold_from_model_raw, (int, float))
+            else None
+        )
+
+        score_stats = metadata.get("if_score_stats") if isinstance(metadata.get("if_score_stats"), dict) else {}
+        calibration_band = 0.0
+        if isinstance(score_stats.get("q95"), (int, float)) and isinstance(score_stats.get("q05"), (int, float)):
+            calibration_band = float(score_stats.get("q95", 0.0)) - float(score_stats.get("q05", 0.0))
+        elif isinstance(score_stats.get("q99"), (int, float)) and isinstance(score_stats.get("q01"), (int, float)):
+            calibration_band = float(score_stats.get("q99", 0.0)) - float(score_stats.get("q01", 0.0))
+        elif isinstance(score_stats.get("std"), (int, float)):
+            calibration_band = float(score_stats.get("std", 0.0)) * 6.0
+
+        score_std = float(np.std(decision_scores)) if decision_scores.size else 0.0
+        adaptive_scale = max(score_std, calibration_band * 0.15, 1e-6)
+        sensitivity_shift = (0.30 - float(sensitivity)) * adaptive_scale * 2.0
+        threshold_base = (
+            threshold_from_model
+            if threshold_from_model is not None
+            else (float(np.quantile(decision_scores, 0.02)) if decision_scores.size else 0.0)
+        )
+        effective_threshold = float(threshold_base + sensitivity_shift)
+
+        predictions = np.where(decision_scores < effective_threshold, 1, 0).astype(np.int32)
+        predicted_anomalies = int(np.sum(predictions == 1))
+        predicted_anomaly_rate = float(predicted_anomalies / max(len(predictions), 1))
+        selection_policy = "if_threshold"
+
+        quantile_map: dict[str, float] = {}
+        if decision_scores.size:
+            for quantile in (0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99):
+                quantile_map[f"{int(round(quantile * 100)):02d}%"] = float(np.quantile(decision_scores, quantile))
+
+        if_diagnostics = {
+            "model_name": selected_model_name,
+            "algorithm": algorithm,
+            "selection_policy": selection_policy,
+            "sensitivity": float(sensitivity),
+            "model_threshold": threshold_from_model,
+            "base_threshold": float(threshold_base),
+            "effective_threshold": float(effective_threshold),
+            "threshold_shift": float(sensitivity_shift),
+            "adaptive_scale": float(adaptive_scale),
+            "calibration_band": float(calibration_band),
+            "predicted_anomalies": predicted_anomalies,
+            "predicted_anomaly_rate": float(predicted_anomaly_rate),
+            "score_min": float(np.min(decision_scores)) if decision_scores.size else 0.0,
+            "score_max": float(np.max(decision_scores)) if decision_scores.size else 0.0,
+            "score_mean": float(np.mean(decision_scores)) if decision_scores.size else 0.0,
+            "score_std": float(score_std),
+            "score_quantiles": quantile_map,
+        }
+
+        if threshold_from_model is not None:
+            model_note = (
+                "Обрану модель застосовано для інференсу. "
+                f"Базовий IF-поріг={float(threshold_from_model):.6f}, "
+                f"ефективний поріг сканування={float(effective_threshold):.6f} "
+                f"(sensitivity={float(sensitivity):.2f})."
+            )
+        else:
+            model_note = (
+                "Обрану модель застосовано для інференсу. "
+                "Модель не містить каліброваного IF-порогу, тому використано статистичний базовий поріг "
+                f"{float(threshold_base):.6f} та корекцію чутливості (sensitivity={float(sensitivity):.2f}) "
+                f"до {float(effective_threshold):.6f}."
+            )
+
+        scores = np.maximum(-decision_scores, 0.0)
         prediction_labels = np.where(predictions == 1, "Anomaly", "Normal")
         score_values = scores
         score_column_name = "anomaly_score"
         score_metric_label = "Середня оцінка аномалії"
+
+        if len(predictions) >= 200 and int(np.sum(predictions == 1)) == 0:
+            span = float(np.max(decision_scores) - np.min(decision_scores)) if len(decision_scores) else 0.0
+            if span <= 1e-6:
+                model_note += (
+                    " Рішення Isolation Forest майже константні для цього PCAP. "
+                    "Є ризик пропуску атак; рекомендовано перетренувати IF на змішаному наборі "
+                    "(benign + attack) та перевірити поріг."
+                )
     else:
         probabilities = engine.predict_proba(X)
         if probabilities is not None:
@@ -725,7 +1186,7 @@ def _run_scan(
             if benign_idx != -1 and probabilities.shape[1] > 1:
                 attack_probs = 1.0 - probabilities[:, benign_idx]
             elif probabilities.shape[1] > 1:
-                attack_probs = probabilities[:, 1]  # Fallback
+                attack_probs = probabilities[:, 1]  # Secondary class probability for binary models
             else:
                 attack_probs = probabilities[:, 0]
 
@@ -823,7 +1284,7 @@ def _run_scan(
         "algorithm": algorithm,
         "model_name": selected_model_name,
         "model_applied": True,
-        "model_note": "Обрану модель застосовано для інференсу.",
+        "model_note": model_note,
         "total_records": total_records,
         "anomalies_count": anomalies_count,
         "risk_score": risk_score,
@@ -831,129 +1292,7 @@ def _run_scan(
         "avg_score": float(np.mean(score_values)) if len(score_values) else 0.0,
         "score_metric_label": score_metric_label,
         "score_column_name": score_column_name,
-        "result_frame": result_frame.reset_index(drop=True),
-        "result_preview": result_frame.head(300).reset_index(drop=True),
-        "distribution": distribution,
-    }
-
-
-def _run_l2_arp_fallback_scan(
-    selected_path: Path,
-    inspection: Any,
-    selected_model_name: str,
-    row_limit: int,
-    sensitivity: float,
-) -> dict[str, Any]:
-    del sensitivity
-    try:
-        from scapy.all import ARP, PcapReader  # type: ignore
-    except Exception as exc:
-        raise RuntimeError("Для L2-аналізу потрібен scapy.") from exc
-
-    rows: list[dict[str, Any]] = []
-    per_second_counter: Counter[int] = Counter()
-
-    with PcapReader(str(selected_path)) as packets:
-        for packet in packets:
-            if len(rows) >= int(row_limit):
-                break
-            if ARP not in packet:
-                continue
-
-            arp_layer = packet[ARP]
-            timestamp = float(packet.time)
-            second_bucket = int(timestamp)
-            per_second_counter[second_bucket] += 1
-
-            operation = int(getattr(arp_layer, "op", 0) or 0)
-            operation_label = "REQUEST" if operation == 1 else ("REPLY" if operation == 2 else str(operation))
-            rows.append(
-                {
-                    "timestamp": pd.to_datetime(timestamp, unit="s", utc=True).isoformat(),
-                    "second_bucket": second_bucket,
-                    "src_ip": str(getattr(arp_layer, "psrc", "") or ""),
-                    "dst_ip": str(getattr(arp_layer, "pdst", "") or ""),
-                    "src_mac": str(getattr(arp_layer, "hwsrc", "") or ""),
-                    "dst_mac": str(getattr(arp_layer, "hwdst", "") or ""),
-                    "src_port": "ARP",
-                    "dst_port": "ARP",
-                    "protocol": "ARP",
-                    "arp_op": operation_label,
-                }
-            )
-
-    if not rows:
-        raise ValueError("PCAP не містить ARP або IP пакетів для аналізу.")
-
-    result_frame = pd.DataFrame(rows)
-
-    # ARP fallback is model-agnostic, so keep one stable threshold independent of model pick.
-    effective_sensitivity = 0.20
-    packets_per_second_threshold = max(4, int(round(8 + effective_sensitivity * 60)))
-    suspicious_seconds = {
-        second
-        for second, count in per_second_counter.items()
-        if count >= packets_per_second_threshold
-    }
-
-    confidence_map = {
-        second: min(1.0, count / max(float(packets_per_second_threshold), 1.0))
-        for second, count in per_second_counter.items()
-    }
-
-    result_frame["confidence"] = result_frame["second_bucket"].map(
-        lambda value: float(confidence_map.get(int(value), 0.0))
-    )
-    result_frame["is_alert"] = result_frame["second_bucket"].isin(suspicious_seconds)
-    result_frame["attack_type"] = np.where(result_frame["is_alert"], "ARP Storm", "Normal")
-    result_frame["prediction"] = result_frame["attack_type"]
-
-    severity_values: list[str] = []
-    recommendation_values: list[str] = []
-    for is_alert in result_frame["is_alert"].tolist():
-        if bool(is_alert):
-            severity_values.append("Високий")
-            recommendation_values.append("Перевірити ARP-таблиці, увімкнути DHCP snooping / DAI, локалізувати джерело шторму.")
-        else:
-            severity_values.append("Безпечно")
-            recommendation_values.append("Моніторинг у штатному режимі")
-
-    result_frame["severity"] = severity_values
-    result_frame["recommendation"] = recommendation_values
-
-    total_records = int(len(result_frame))
-    anomalies_count = int(result_frame["is_alert"].sum())
-    risk_score = round((anomalies_count / max(total_records, 1)) * 100, 2)
-
-    distribution = (
-        result_frame["prediction"]
-        .value_counts()
-        .rename_axis("prediction")
-        .reset_index(name="count")
-        .sort_values("count", ascending=False)
-    )
-
-    result_frame = result_frame.drop(columns=["second_bucket"])
-
-    return {
-        "file_name": selected_path.name,
-        "dataset_type": inspection.dataset_type,
-        "analysis_mode": inspection.analysis_mode,
-        "algorithm": "L2 ARP Heuristic Fallback",
-        "model_name": selected_model_name,
-        "model_applied": False,
-        "model_note": (
-            "Обрана модель не застосовувалась: у PCAP немає валідних IP-flow ознак для NIDS-моделі, "
-            "тому використано L2 ARP fallback з фіксованою чутливістю 0.20."
-        ),
-        "fallback_sensitivity": effective_sensitivity,
-        "total_records": total_records,
-        "anomalies_count": anomalies_count,
-        "risk_score": risk_score,
-        "risk_level": _risk_level(risk_score),
-        "avg_score": float(result_frame["confidence"].mean()) if total_records else 0.0,
-        "score_metric_label": "ARP burst confidence",
-        "score_column_name": "confidence",
+        "if_diagnostics": if_diagnostics,
         "result_frame": result_frame.reset_index(drop=True),
         "result_preview": result_frame.head(300).reset_index(drop=True),
         "distribution": distribution,
@@ -962,18 +1301,17 @@ def _run_l2_arp_fallback_scan(
 
 def _render_scan_result(result: dict[str, Any]) -> None:
     st.divider()
-    st.subheader("РОЗДІЛ 1 — ЗВЕДЕННЯ")
+    st.subheader("РОЗДІЛ 1 — ЗВЕДЕННЯ", anchor=False)
     st.caption(
         f"Файл: {result['file_name']} | Датасет: {result['dataset_type']} | "
         f"Модель: {result['model_name']} | Алгоритм: {result['algorithm']}"
     )
 
+    note_text = str(result.get("model_note") or "").strip()
     if not bool(result.get("model_applied", True)):
-        note_text = str(
-            result.get("model_note")
-            or "Обрана модель не застосовувалась; використано fallback-алгоритм."
-        )
-        st.warning(note_text)
+        st.warning(note_text or "Обрана модель не застосовувалась.")
+    elif note_text and note_text != "Обрану модель застосовано для інференсу.":
+        st.info(note_text)
 
     metric_cols = st.columns(5)
     metric_cols[0].metric("Загальна кількість записів", f"{result['total_records']:,}")
@@ -981,6 +1319,12 @@ def _render_scan_result(result: dict[str, Any]) -> None:
     metric_cols[2].metric("Показник ризику", f"{result['risk_score']:.2f}%")
     metric_cols[3].metric("Рівень ризику", result.get("risk_level", "НИЗЬКИЙ"))
     metric_cols[4].metric("Час аналізу", f"{float(result.get('duration_seconds', 0.0)):.2f} с")
+
+    if_diagnostics = result.get("if_diagnostics")
+    if isinstance(if_diagnostics, dict) and if_diagnostics:
+        with st.expander("Технічна діагностика Isolation Forest", expanded=False):
+            st.caption("Скопіюйте цей JSON і надішліть для точного розбору причин хибнонегативів.")
+            st.json(if_diagnostics)
 
     result_frame = result.get("result_frame", pd.DataFrame()).copy()
     if result_frame.empty:
@@ -992,53 +1336,114 @@ def _render_scan_result(result: dict[str, Any]) -> None:
     details_df["severity_rank"] = details_df["severity"].map(lambda value: severity_rank.get(str(value), 0))
     details_df = details_df.sort_values(["severity_rank", "confidence"], ascending=[False, False])
 
-    display_columns = {
+    if "attack_type" not in details_df.columns and "prediction" in details_df.columns:
+        details_df["attack_type"] = details_df["prediction"]
+    details_df["attack_label_raw"] = details_df["attack_type"].astype(str)
+    details_df["attack_name"] = details_df["attack_label_raw"].map(
+        lambda value: _normalize_attack_display_name(value, str(result.get("algorithm", "")))
+    )
+
+    alerts_only = details_df[details_df["is_alert"]].copy()
+    dataset_type = str(result.get("dataset_type", ""))
+    top_attack_name = "Аномалія"
+    if not alerts_only.empty and _is_informative_series(alerts_only["attack_name"]):
+        top_attack_name = str(alerts_only["attack_name"].astype(str).value_counts().index[0])
+
+    if not alerts_only.empty:
+        generic_name = "Аномалія (тип не класифікується цією моделлю)"
+        undefined_name = "Аномалія (тип не визначено)"
+        generic_share = float((alerts_only["attack_name"].astype(str).isin({generic_name, undefined_name})).mean())
+        if generic_share >= 0.50:
+            st.info(
+                "Більшість аномалій у цьому звіті не мають конкретної назви атаки, "
+                "бо поточна модель визначає факт аномалії, а не клас атаки."
+            )
+
+    user_summary, soc_summary = _build_audience_summaries(
+        dataset_type=dataset_type,
+        total_records=int(result.get("total_records", 0)),
+        anomalies_count=int(result.get("anomalies_count", 0)),
+        risk_score=float(result.get("risk_score", 0.0)),
+        top_attack_name=top_attack_name,
+    )
+    summary_col1, summary_col2 = st.columns(2)
+    with summary_col1:
+        st.markdown("**Що це означає для користувача**")
+        st.caption(user_summary)
+    with summary_col2:
+        st.markdown("**Фокус для кіберкоманди**")
+        st.caption(soc_summary)
+
+    preferred_display_columns = {
         "timestamp": "Час",
         "src_ip": "IP джерела",
         "dst_ip": "IP призначення",
         "src_port": "Порт джерела",
         "dst_port": "Порт призначення",
         "protocol": "Протокол",
-        "attack_type": "Назва аномалії",
+        "attack_name": "Назва аномалії",
         "confidence": "Ймовірність",
         "severity": "Критичність",
         "recommendation": "Рекомендація",
     }
 
-    for column in display_columns:
-        if column not in details_df.columns:
-            details_df[column] = "Н/Д"
+    available_display_columns: dict[str, str] = {}
+    for column, label in preferred_display_columns.items():
+        if column in details_df.columns and _is_informative_series(details_df[column]):
+            available_display_columns[column] = label
 
-    details_view = details_df[list(display_columns.keys())].rename(columns=display_columns)
+    mandatory_columns = {
+        "attack_name": "Назва аномалії",
+        "severity": "Критичність",
+        "confidence": "Ймовірність",
+    }
+    for column, label in mandatory_columns.items():
+        if column in details_df.columns and column not in available_display_columns:
+            available_display_columns[column] = label
 
-    st.subheader("РОЗДІЛ 2 — ДЕТАЛІ АТАК")
-    st.dataframe(details_view.head(500), width="stretch", hide_index=True)
+    details_source = alerts_only if not alerts_only.empty else details_df
+    details_view = details_source[list(available_display_columns.keys())].rename(columns=available_display_columns)
 
-    st.subheader("РОЗДІЛ 3 — ТОП ВРАЗЛИВИХ ВУЗЛІВ")
-    top_col1, top_col2, top_col3 = st.columns(3)
-    with top_col1:
-        if "src_ip" in details_df.columns:
-            top_src = details_df[details_df["is_alert"]]["src_ip"].astype(str).value_counts().head(10).reset_index()
-            top_src.columns = ["IP", "Кількість"]
-            st.markdown("**Найбільш атаковані IP-адреси**")
-            st.dataframe(top_src, width="stretch", hide_index=True)
-    with top_col2:
-        if "dst_port" in details_df.columns:
-            top_ports = details_df[details_df["is_alert"]]["dst_port"].astype(str).value_counts().head(10).reset_index()
-            top_ports.columns = ["Порт", "Кількість"]
-            st.markdown("**Найбільш використовувані порти атак**")
-            st.dataframe(top_ports, width="stretch", hide_index=True)
-    with top_col3:
-        top_attacks = details_df[details_df["is_alert"]]["attack_type"].astype(str).value_counts().head(10).reset_index()
-        top_attacks.columns = ["Тип атаки", "Кількість"]
-        st.markdown("**Найпоширеніші типи атак**")
-        st.dataframe(top_attacks, width="stretch", hide_index=True)
+    if alerts_only.empty:
+        st.info("Аномалій не виявлено. Нижче показано загальні записи для контролю якості даних.")
 
-    st.subheader("РОЗДІЛ 4 — ХРОНОЛОГІЯ")
+    st.subheader("РОЗДІЛ 2 — ДЕТАЛІ АТАК", anchor=False)
+    st.dataframe(with_row_number(details_view.head(500)), width="stretch", hide_index=True)
+
+    st.subheader("РОЗДІЛ 3 — КЛЮЧОВІ ІНДИКАТОРИ", anchor=False)
+    indicator_tables = _build_family_indicator_tables(alerts_only=alerts_only, dataset_type=dataset_type)
+    if indicator_tables:
+        primary = indicator_tables[:3]
+        secondary = indicator_tables[3:]
+        cols = st.columns(len(primary))
+        for idx, (title, table) in enumerate(primary):
+            with cols[idx]:
+                st.markdown(f"**{title}**")
+                st.dataframe(with_row_number(table), width="stretch", hide_index=True)
+
+        for title, table in secondary:
+            with st.expander(title, expanded=False):
+                st.dataframe(with_row_number(table), width="stretch", hide_index=True)
+    else:
+        st.info("У цьому результаті немає інформативних полів для побудови ключових індикаторів.")
+
     timeline_column = "timestamp" if "timestamp" in details_df.columns else ("time" if "time" in details_df.columns else None)
     if timeline_column and details_df[timeline_column].notna().any():
+        st.subheader("РОЗДІЛ 4 — ХРОНОЛОГІЯ", anchor=False)
         timeline = details_df.copy()
-        timeline[timeline_column] = pd.to_datetime(timeline[timeline_column], errors="coerce")
+        try:
+            timeline[timeline_column] = pd.to_datetime(
+                timeline[timeline_column],
+                errors="coerce",
+                format="mixed",
+                utc=True,
+            )
+        except TypeError:
+            timeline[timeline_column] = pd.to_datetime(
+                timeline[timeline_column],
+                errors="coerce",
+                utc=True,
+            )
         timeline = timeline.dropna(subset=[timeline_column])
         if not timeline.empty:
             timeline["minute_bucket"] = timeline[timeline_column].dt.floor("min")
@@ -1049,80 +1454,48 @@ def _render_scan_result(result: dict[str, Any]) -> None:
                     width="stretch",
                 )
                 st.caption(f"Піки активності: максимум {int(timeline_counts['attacks'].max())} атак за інтервал.")
-            else:
-                st.info("У хронології не знайдено атак для відображення.")
-        else:
-            st.info("Колонка часу не містить валідних значень.")
-    else:
-        st.info("У файлі відсутня коректна колонка часу для побудови хронології.")
+            
 
-    st.subheader("РОЗДІЛ 5 — РЕКОМЕНДАЦІЇ")
-    alerts_only = details_df[details_df["is_alert"]]
+    st.subheader("РОЗДІЛ 5 — РЕКОМЕНДАЦІЇ", anchor=False)
     if alerts_only.empty:
         st.success("Аномалій не виявлено. Додаткові дії не потрібні.")
     else:
-        grouped = alerts_only.groupby(["attack_type", "src_ip"], dropna=False).size().reset_index(name="count")
-        grouped = grouped.sort_values("count", ascending=False).head(8)
-        for _, row in grouped.iterrows():
-            threat = get_threat_info(str(row["attack_type"]))
-            action = (threat.get("actions") or ["Перевірити журнал подій і посилити фільтрацію трафіку."])[0]
-            st.markdown(
-                f"- Вузол `{row['src_ip']}` | Тип `{row['attack_type']}` | Подій: {int(row['count'])}. "
-                f"Рекомендація: {action}"
-            )
+        st.markdown("**План дій на найближчі 15 хвилин**")
+        action_plan = _build_incident_action_plan(
+            alerts_only=alerts_only,
+            risk_score=float(result.get("risk_score", 0.0)),
+            algorithm=str(result.get("algorithm", "")),
+            dataset_type=dataset_type,
+        )
+        if action_plan.empty:
+            st.info("Для цього набору поки недостатньо індикаторів для автоматичного плану дій.")
+        else:
+            st.dataframe(with_row_number(action_plan), width="stretch", hide_index=True)
 
-    st.subheader("РОЗДІЛ 6 — ЕКСПОРТ")
-    export_summary = {
-        "filename": result.get("file_name", "scan"),
-        "model_name": result.get("model_name", ""),
-        "total": int(result.get("total_records", 0)),
-        "anomalies": int(result.get("anomalies_count", 0)),
-        "risk_score": float(result.get("risk_score", 0.0)),
-    }
+        st.markdown("**Точкові рекомендації за типами загроз**")
+        top_attack_types = alerts_only["attack_label_raw"].astype(str).value_counts().head(5)
+        rendered_lines = 0
+        for raw_attack_name in top_attack_types.index.tolist():
+            display_attack_name = _normalize_attack_display_name(raw_attack_name, str(result.get("algorithm", "")))
+            if _is_generic_attack_name(display_attack_name):
+                continue
+            threat = get_threat_info(str(raw_attack_name))
+            actions = threat.get("actions") or []
+            if actions:
+                st.markdown(f"- {display_attack_name}: {actions[0]}")
+                rendered_lines += 1
 
-    report = ReportGenerator()
-    export_col1, export_col2, export_col3 = st.columns(3)
-    with export_col1:
-        csv_data = report.export_csv(details_view)
-        st.download_button(
-            "Завантажити CSV",
-            data=csv_data,
-            file_name=f"scan_{result.get('file_name', 'report')}.csv",
-            mime="text/csv",
-            width="stretch",
-        )
-    with export_col2:
-        pdf_data = report.generate_pdf_report(
-            summary=export_summary,
-            details_df=alerts_only.head(200),
-            network_context={
-                "top_src_ips": alerts_only["src_ip"].astype(str).value_counts().head(10).reset_index().to_dict("records")
-                if "src_ip" in alerts_only.columns else [],
-                "top_dst_ports": alerts_only["dst_port"].astype(str).value_counts().head(10).reset_index().to_dict("records")
-                if "dst_port" in alerts_only.columns else [],
-            },
-        )
-        st.download_button(
-            "Завантажити PDF",
-            data=pdf_data,
-            file_name=f"scan_{result.get('file_name', 'report')}.pdf",
-            mime="application/pdf",
-            width="stretch",
-        )
-    with export_col3:
-        json_data = json.dumps(details_view.to_dict(orient="records"), ensure_ascii=False, indent=2)
-        st.download_button(
-            "Завантажити JSON",
-            data=json_data.encode("utf-8"),
-            file_name=f"scan_{result.get('file_name', 'report')}.json",
-            mime="application/json",
-            width="stretch",
-        )
+        if rendered_lines == 0:
+            if dataset_type == "NSL-KDD":
+                st.markdown("- Для NSL-KDD орієнтуйтесь на аномальні комбінації protocol_type/service/flag та пікові класи сервісів із розділу 3.")
+                st.markdown("- Для user-friendly контролю: якщо ризик > 15%, варто обмежити зовнішній доступ до чутливих сервісів до завершення triage.")
+            else:
+                st.markdown("- Для цього набору немає надійної деталізації типів атак; пріоритезуйте дії за IP/портами та часовими піками із розділів 3-4.")
 
     with st.expander("Приклад результатів", expanded=False):
         preview = result.get("result_preview")
         if isinstance(preview, pd.DataFrame):
-            st.dataframe(preview, width="stretch", hide_index=True)
+            st.dataframe(with_row_number(preview), width="stretch", hide_index=True)
 
 
 if __name__ == "__main__":

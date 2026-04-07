@@ -71,6 +71,7 @@ from src.core.domain_schemas import (
     DATASET_SCHEMAS,
     DatasetSchema,
     get_schema,
+    is_benign_label,
     normalize_column_name,
     normalize_frame_columns,
     resolve_target_labels,
@@ -352,6 +353,9 @@ class DataLoader:
     ) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
         del multiclass, align_to_schema
 
+        if isinstance(max_rows, (int, np.integer)) and int(max_rows) <= 0:
+            max_rows = None
+
         inspection = self.inspect_file(file_path)
         if inspection.dataset_type == "Unknown":
             raise ValueError(
@@ -429,6 +433,32 @@ class DataLoader:
             "on_bad_lines": "warn",
         }
 
+        if max_rows is not None and int(max_rows) > 0:
+            # Training row limits should preserve traffic diversity; avoid head-only truncation.
+            if file_size > _CSV_CHUNK_THRESHOLD_BYTES:
+                return self._load_csv_chunk_sampled(
+                    path=path,
+                    dataset_type=dataset_type,
+                    schema=schema,
+                    max_rows=int(max_rows),
+                    common_kwargs=common_kwargs,
+                )
+
+            try:
+                frame = pd.read_csv(path, **common_kwargs)
+                frame.columns = self._sanitize_column_names(frame.columns)
+                frame = normalize_frame_columns(frame)
+            except ValueError as exc:
+                raise ValueError(f"Не вдалося прочитати CSV {path.name}: {exc}") from exc
+
+            frame = self._drop_repeated_header_rows(frame)
+            self._validate_domain_columns(frame, schema, path.name)
+
+            target = resolve_target_labels(frame, dataset_type)
+            features = frame.loc[:, list(schema.feature_columns)].copy()
+            features["target_label"] = target
+            return self._sample_frame_with_class_guard(features, max_rows=int(max_rows), random_state=42)
+
         try:
             if use_chunks:
                 chunks: list[pd.DataFrame] = []
@@ -452,6 +482,196 @@ class DataLoader:
         features = frame.loc[:, list(schema.feature_columns)].copy()
         features["target_label"] = target
         return features
+
+    @staticmethod
+    def _sample_frame_with_class_guard(
+        frame: pd.DataFrame,
+        max_rows: int,
+        random_state: int = 42,
+    ) -> pd.DataFrame:
+        safe_max_rows = max(int(max_rows), 1)
+        if len(frame) <= safe_max_rows:
+            return frame.reset_index(drop=True)
+
+        if "target_label" not in frame.columns:
+            return frame.sample(n=safe_max_rows, random_state=random_state).reset_index(drop=True)
+
+        binary_labels = frame["target_label"].map(lambda value: "benign" if is_benign_label(value) else "attack")
+        label_counts = binary_labels.value_counts()
+        if len(label_counts) < 2:
+            return frame.sample(n=safe_max_rows, random_state=random_state).reset_index(drop=True)
+
+        total_rows = max(len(frame), 1)
+        raw_allocations = {
+            label: (safe_max_rows * (int(count) / total_rows))
+            for label, count in label_counts.items()
+        }
+        allocations = {
+            label: max(1, min(int(label_counts[label]), int(math.floor(raw_allocations[label]))))
+            for label in label_counts.index
+        }
+
+        allocated_rows = int(sum(allocations.values()))
+        if allocated_rows < safe_max_rows:
+            order = sorted(
+                allocations.keys(),
+                key=lambda label: (raw_allocations[label] - allocations[label], int(label_counts[label])),
+                reverse=True,
+            )
+            while allocated_rows < safe_max_rows:
+                changed = False
+                for label in order:
+                    if allocated_rows >= safe_max_rows:
+                        break
+                    if allocations[label] >= int(label_counts[label]):
+                        continue
+                    allocations[label] += 1
+                    allocated_rows += 1
+                    changed = True
+                if not changed:
+                    break
+        elif allocated_rows > safe_max_rows:
+            order = sorted(allocations.keys(), key=lambda label: allocations[label], reverse=True)
+            while allocated_rows > safe_max_rows:
+                changed = False
+                for label in order:
+                    if allocated_rows <= safe_max_rows:
+                        break
+                    if allocations[label] <= 1:
+                        continue
+                    allocations[label] -= 1
+                    allocated_rows -= 1
+                    changed = True
+                if not changed:
+                    break
+
+        sampled_parts: list[pd.DataFrame] = []
+        for index, label in enumerate(allocations.keys()):
+            take_rows = int(allocations[label])
+            if take_rows <= 0:
+                continue
+            label_frame = frame.loc[binary_labels == label]
+            if label_frame.empty:
+                continue
+            if take_rows >= len(label_frame):
+                sampled_parts.append(label_frame)
+            else:
+                sampled_parts.append(label_frame.sample(n=take_rows, random_state=random_state + index))
+
+        if not sampled_parts:
+            return frame.sample(n=safe_max_rows, random_state=random_state).reset_index(drop=True)
+
+        sampled = pd.concat(sampled_parts, ignore_index=True)
+        if len(sampled) > safe_max_rows:
+            sampled = sampled.sample(n=safe_max_rows, random_state=random_state)
+
+        return sampled.sample(frac=1.0, random_state=random_state).reset_index(drop=True)
+
+    @staticmethod
+    def _build_chunk_row_allocations(chunk_sizes: list[int], target_rows: int) -> list[int]:
+        if not chunk_sizes:
+            return []
+
+        total_rows = int(sum(max(int(size), 0) for size in chunk_sizes))
+        if total_rows <= 0:
+            return [0 for _ in chunk_sizes]
+
+        safe_target = max(1, int(target_rows))
+        if safe_target >= total_rows:
+            return [int(size) for size in chunk_sizes]
+
+        raw = [safe_target * (int(size) / total_rows) for size in chunk_sizes]
+        allocations = [min(int(size), int(math.floor(value))) for size, value in zip(chunk_sizes, raw)]
+
+        remaining = safe_target - int(sum(allocations))
+        if remaining > 0:
+            order = sorted(
+                range(len(chunk_sizes)),
+                key=lambda index: (raw[index] - allocations[index], int(chunk_sizes[index])),
+                reverse=True,
+            )
+            for index in order:
+                if remaining <= 0:
+                    break
+                if allocations[index] >= int(chunk_sizes[index]):
+                    continue
+                allocations[index] += 1
+                remaining -= 1
+
+        if remaining > 0:
+            order = sorted(range(len(chunk_sizes)), key=lambda index: int(chunk_sizes[index]), reverse=True)
+            for index in order:
+                if remaining <= 0:
+                    break
+                spare = int(chunk_sizes[index]) - allocations[index]
+                if spare <= 0:
+                    continue
+                add = min(spare, remaining)
+                allocations[index] += add
+                remaining -= add
+
+        return allocations
+
+    def _load_csv_chunk_sampled(
+        self,
+        path: Path,
+        dataset_type: str,
+        schema: DatasetSchema,
+        max_rows: int,
+        common_kwargs: dict[str, object],
+    ) -> pd.DataFrame:
+        chunk_sizes: list[int] = []
+
+        try:
+            for chunk in pd.read_csv(path, chunksize=_CSV_CHUNK_ROWS, **common_kwargs):
+                chunk.columns = self._sanitize_column_names(chunk.columns)
+                chunk = normalize_frame_columns(chunk)
+                chunk = self._drop_repeated_header_rows(chunk)
+                if chunk.empty:
+                    continue
+
+                self._validate_domain_columns(chunk, schema, path.name)
+                chunk_sizes.append(len(chunk))
+        except ValueError as exc:
+            raise ValueError(f"Не вдалося прочитати CSV {path.name}: {exc}") from exc
+
+        if not chunk_sizes:
+            raise ValueError(f"CSV {path.name} не містить валідних рядків після парсингу.")
+
+        allocations = self._build_chunk_row_allocations(chunk_sizes, target_rows=max_rows)
+        sampled_parts: list[pd.DataFrame] = []
+        chunk_index = 0
+
+        try:
+            for chunk in pd.read_csv(path, chunksize=_CSV_CHUNK_ROWS, **common_kwargs):
+                chunk.columns = self._sanitize_column_names(chunk.columns)
+                chunk = normalize_frame_columns(chunk)
+                chunk = self._drop_repeated_header_rows(chunk)
+                if chunk.empty:
+                    continue
+
+                self._validate_domain_columns(chunk, schema, path.name)
+                take_rows = allocations[chunk_index] if chunk_index < len(allocations) else 0
+                chunk_index += 1
+                if take_rows <= 0:
+                    continue
+
+                if take_rows < len(chunk):
+                    chunk = chunk.sample(n=int(take_rows), random_state=42 + chunk_index)
+
+                target = resolve_target_labels(chunk, dataset_type)
+                features = chunk.loc[:, list(schema.feature_columns)].copy()
+                features["target_label"] = target
+                sampled_parts.append(features)
+        except ValueError as exc:
+            raise ValueError(f"Не вдалося прочитати CSV {path.name}: {exc}") from exc
+
+        if not sampled_parts:
+            raise ValueError(f"CSV {path.name} не містить доступних рядків для семплювання.")
+
+        sampled = pd.concat(sampled_parts, ignore_index=True)
+        sampled = self._sample_frame_with_class_guard(sampled, max_rows=int(max_rows), random_state=42)
+        return sampled.reset_index(drop=True)
 
     @staticmethod
     def _sanitize_column_names(columns: pd.Index) -> pd.Index:

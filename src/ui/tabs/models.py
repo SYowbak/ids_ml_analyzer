@@ -9,6 +9,7 @@ import streamlit as st
 
 from src.core.dataset_nature import nature_for_dataset, nature_label
 from src.core.model_engine import ModelEngine
+from src.ui.utils.table_helpers import with_row_number
 
 
 def _safe_float(value: Any) -> float | None:
@@ -92,18 +93,20 @@ def render_models_tab(services: dict[str, Any], root_dir: Path) -> None:
     active_model = st.session_state.get("active_model_name")
     st.markdown("**Таблиця моделей**")
     st.dataframe(
-        filtered.rename(
-            columns={
-                "name": "Модель",
-                "algorithm": "Алгоритм",
-                "dataset_type": "Датасет",
-                "nature": "Природа",
-                "saved_at": "Дата",
-                "accuracy": "Accuracy",
-                "precision": "Precision",
-                "recall": "Recall",
-                "f1": "F1",
-            }
+        with_row_number(
+            filtered.rename(
+                columns={
+                    "name": "Модель",
+                    "algorithm": "Алгоритм",
+                    "dataset_type": "Датасет",
+                    "nature": "Природа",
+                    "saved_at": "Дата",
+                    "accuracy": "Accuracy",
+                    "precision": "Precision",
+                    "recall": "Recall",
+                    "f1": "F1",
+                }
+            )
         ),
         width="stretch",
         hide_index=True,
@@ -120,7 +123,7 @@ def render_models_tab(services: dict[str, Any], root_dir: Path) -> None:
             ["name", "algorithm", "dataset_type", "accuracy", "precision", "recall", "f1"]
         ].copy()
         st.markdown("**Порівняння метрик**")
-        st.dataframe(comparison, width="stretch", hide_index=True)
+        st.dataframe(with_row_number(comparison), width="stretch", hide_index=True)
 
     action_col1, action_col2, action_col3 = st.columns(3)
     with action_col1:

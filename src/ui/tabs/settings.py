@@ -12,7 +12,6 @@ def render_settings_tab(services: dict[str, Any], root_dir: Path) -> None:
     settings = services["settings"]
 
     current_threshold = float(settings.get("anomaly_threshold", 0.30) or 0.30)
-    current_key = str(settings.get("gemini_api_key", "") or "")
 
     st.markdown("**Параметри детекції**")
     threshold = st.slider(
@@ -26,20 +25,11 @@ def render_settings_tab(services: dict[str, Any], root_dir: Path) -> None:
 
     st.info("Інтерфейс працює лише у світлій темі та з українською локалізацією.")
 
-    st.markdown("**Інтеграції**")
-    gemini_key = st.text_input(
-        "Gemini API ключ",
-        value=current_key,
-        type="password",
-        help="Зберігається локально у user_settings.json.",
-    )
-
     save_disabled = False
     if st.button("Зберегти налаштування", type="primary", disabled=save_disabled, width="stretch"):
         settings.set("anomaly_threshold", float(threshold))
         settings.set("ui_language", "Українська")
         settings.set("ui_theme", "light")
-        settings.set("gemini_api_key", gemini_key.strip())
 
         st.session_state.scan_sensitivity = float(threshold)
         st.success("Налаштування збережено.")

@@ -8,6 +8,7 @@ import contextlib
 import io
 import json
 import logging
+import os
 import warnings
 
 import joblib
@@ -34,6 +35,30 @@ logger = logging.getLogger(__name__)
 
 AlgorithmType = Literal["Random Forest", "XGBoost", "Isolation Forest"]
 MANIFEST_VERSION = 3
+
+
+def _resolve_training_n_jobs() -> int:
+    """Return effective worker count for model training.
+
+    Resolution order:
+    1) IDS_TRAIN_N_JOBS env var (if valid integer)
+    2) auto: cpu_count - 1 (bounded to [1, 8])
+
+    The bound keeps UI responsive while still accelerating training.
+    """
+    raw_value = str(os.getenv("IDS_TRAIN_N_JOBS", "")).strip()
+    if raw_value:
+        try:
+            parsed = int(raw_value)
+        except ValueError:
+            parsed = 0
+        if parsed > 0:
+            return parsed
+
+    cpu_total = int(os.cpu_count() or 1)
+    if cpu_total <= 1:
+        return 1
+    return max(1, min(cpu_total - 1, 8))
 
 
 @dataclass(frozen=True)
@@ -84,6 +109,7 @@ class ModelEngine:
 
     def _create_base_model(self, algorithm: AlgorithmType, params: Optional[dict[str, Any]] = None) -> Any:
         params = params or {}
+        default_n_jobs = _resolve_training_n_jobs()
         if algorithm == "Random Forest":
             base_params = {
                 "n_estimators": 300,
@@ -92,7 +118,7 @@ class ModelEngine:
                 "min_samples_leaf": 1,
                 "class_weight": "balanced",
                 "random_state": 42,
-                "n_jobs": 1,
+                "n_jobs": default_n_jobs,
             }
             base_params.update(params)
             return RandomForestClassifier(**base_params)
@@ -107,7 +133,7 @@ class ModelEngine:
                 "subsample": 0.9,
                 "colsample_bytree": 0.9,
                 "random_state": 42,
-                "n_jobs": 1,
+                "n_jobs": default_n_jobs,
                 "eval_metric": "mlogloss",
                 "tree_method": "hist",
             }
@@ -119,7 +145,7 @@ class ModelEngine:
                 "n_estimators": 300,
                 "contamination": 0.05,
                 "random_state": 42,
-                "n_jobs": 1,
+                "n_jobs": default_n_jobs,
             }
             base_params.update(params)
             return IsolationForest(**base_params)
@@ -149,6 +175,14 @@ class ModelEngine:
             grid = {name: values[:1] for name, values in grid.items()}
 
         model = self._create_base_model(algorithm, params=base_params)
+        search_n_jobs = _resolve_training_n_jobs()
+        try:
+            model_params = model.get_params(deep=False)
+            if "n_jobs" in model_params:
+                model.set_params(n_jobs=1)
+        except Exception:
+            pass
+
         min_class_count = int(y.value_counts().min())
         cv_splits = min(3, max(2, min_class_count))
         cv = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=42)
@@ -161,7 +195,7 @@ class ModelEngine:
             param_grid=grid,
             scoring="f1",
             cv=cv,
-            n_jobs=1,
+            n_jobs=search_n_jobs,
             refit=True,
         )
         search.fit(X, y)

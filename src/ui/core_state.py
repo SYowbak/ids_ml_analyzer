@@ -4,7 +4,6 @@ import sys
 import logging
 from pathlib import Path
 from src.services.database import DatabaseService
-from src.services.report_generator import ReportGenerator
 from src.services.settings_service import SettingsService
 
 
@@ -44,7 +43,6 @@ TWO_STAGE_PROFILE_RULES = {
 def init_services():
     return {
         'db': DatabaseService(),
-        'report': ReportGenerator(),
         'settings': SettingsService()
     }
 
@@ -59,7 +57,7 @@ def clear_session_memory():
         'preprocessor', 'engine', 'model', 'features_list',
         'anomalies_df', 'predictions_df', 'current_file_path',
         'scan_done', 'scan_results', 'scan_anomalies', 'scan_metrics',
-        'anomaly_scores', 'heavy_reports', 'ai_analysis', 'exec_summary',
+        'anomaly_scores', 'heavy_reports',
         'scan_in_progress', 'training_in_progress'
     ]
     for key in keys_to_remove:

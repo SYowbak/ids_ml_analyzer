@@ -27,7 +27,7 @@ XSS Audit Status: CLEAN (reviewed 2026-04-04)
 Dataframe size protection
 --------------------------
 st.dataframe ALWAYS renders at most _DATAFRAME_UI_LIMIT rows.
-A caption informs the user that the full dataset is in the export.
+This protects the UI from freezing on very large datasets.
 """
 
 from __future__ import annotations
@@ -40,7 +40,6 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from src.services.gemini_service import GeminiService
 from src.services.visualizer import Visualizer
 from src.services.threat_catalog import (
     get_threat_info,
@@ -48,6 +47,7 @@ from src.services.threat_catalog import (
     get_severity_color,
     get_severity_icon,
 )
+from src.ui.utils.table_helpers import with_row_number
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -63,7 +63,6 @@ PLOTLY_CONFIG_LIGHT = {
 
 # Maximum rows rendered in any st.dataframe / st.table call.
 # Prevents UI freeze on large anomaly sets.
-# Users get the full dataset via CSV / Excel export.
 _DATAFRAME_UI_LIMIT = 1000
 
 # Maximum rows sampled for Plotly visualizations.
@@ -295,6 +294,7 @@ def _safe_dataframe(
 
     total = len(df)
     display_df = df.head(limit) if total > limit else df
+    display_df = with_row_number(display_df)
 
     try:
         styled = display_df.style.set_properties(**{
@@ -551,22 +551,6 @@ def _ensure_figure_readability(fig):
     return fig
 
 
-def _sanitize_ai_markdown(text: str) -> str:
-    """Strip noise from AI markdown response. Output rendered via st.markdown (no HTML)."""
-    if not text:
-        return ""
-    cleaned = (
-        text.replace("\U0001f517", "")
-        .replace("\U0001f4ce", "")
-        .replace("\U0001f587\ufe0f", "")
-        .replace("\u00b6", "")
-    )
-    cleaned = re.sub(r"\[(.*?)\]\((.*?)\)", r"\1", cleaned)
-    cleaned = re.sub(r"<a\s+[^>]*>(.*?)</a>", r"\1", cleaned, flags=re.IGNORECASE | re.DOTALL)
-    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
-    return cleaned
-
-
 # ---------------------------------------------------------------------------
 # Section header helpers (static HTML — no user data)
 # ---------------------------------------------------------------------------
@@ -609,7 +593,6 @@ def render_comprehensive_dashboard(
     anomalies: pd.DataFrame,
     metrics: dict[str, Any],
     services: dict[str, Any],
-    gemini_key: str | None = None,
 ) -> None:
     """Render the main scan result dashboard."""
     del services
@@ -954,158 +937,3 @@ def render_comprehensive_dashboard(
                 _safe_dataframe(viz_df, label="загальних рядків", key="detail_tab_general")
     else:
         st.caption("Детальні графіки вимкнені для швидшої роботи сторінки.")
-
-    # ── Export Buttons ────────────────────────────────────────────────────
-    st.markdown("---")
-    _render_section_card("Експорт звіту")
-
-    try:
-        from src.services.report_generator import ReportGenerator
-        report_gen = ReportGenerator()
-        export_summary = {
-            "filename": metrics.get("filename", "scan"),
-            "model_name": metrics.get("model_name", ""),
-            "total": total,
-            "anomalies": anomalies_count,
-            "risk_score": risk_score,
-        }
-
-        exp_col1, exp_col2, exp_col3 = st.columns(3)
-        with exp_col1:
-            try:
-                csv_bytes = report_gen.export_csv(result_df)
-                st.download_button(
-                    label="Завантажити CSV",
-                    data=csv_bytes,
-                    file_name=f"scan_results_{metrics.get('filename', 'export')}.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                    key="export_csv_btn",
-                )
-            except Exception as exc:
-                st.warning(f"Помилка CSV: {exc}")
-
-        with exp_col2:
-            try:
-                xlsx_bytes = report_gen.export_excel(
-                    result_df,
-                    anomalies_df=anomalies if len(anomalies) > 0 else None,
-                    summary=export_summary,
-                )
-                st.download_button(
-                    label="Завантажити Excel",
-                    data=xlsx_bytes,
-                    file_name=f"scan_report_{metrics.get('filename', 'export')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                    key="export_excel_btn",
-                )
-            except Exception as exc:
-                st.warning(f"Помилка Excel: {exc}")
-
-        with exp_col3:
-            try:
-                plain_summary_text = _plain_summary(total, anomalies_count, risk_score)
-                pdf_bytes = report_gen.generate_pdf_report(
-                    summary=export_summary,
-                    details_df=anomalies.head(50) if len(anomalies) > 0 else None,
-                    network_context=network_context_data if anomalies_count > 0 else None,
-                    executive_summary=plain_summary_text,
-                )
-                st.download_button(
-                    label="Завантажити PDF",
-                    data=pdf_bytes,
-                    file_name=f"scan_report_{metrics.get('filename', 'export')}.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                    key="export_pdf_btn",
-                )
-            except Exception as exc:
-                st.warning(f"Помилка PDF: {exc}")
-
-    except ImportError:
-        st.caption("Експорт недоступний: встановіть reportlab та openpyxl.")
-
-    # ── AI Analysis (Gemini) ──────────────────────────────────────────────
-    if gemini_key and anomalies_count > 0:
-        gemini = GeminiService(api_key=gemini_key)
-        if gemini.available:
-            with st.expander("AI-пояснення результату (Gemini)", expanded=False):
-                summary_input = {
-                    "total": total,
-                    "anomalies": anomalies_count,
-                    "risk_score": risk_score,
-                    "model_name": metrics.get("model_name", ""),
-                    "algorithm": metrics.get("algorithm", ""),
-                    "filename": metrics.get("filename", ""),
-                    "network_context": network_context_data,
-                }
-                top_threats_list = [
-                    {"type": k, "count": int(v)}
-                    for k, v in list(threat_counts.items())[:10]
-                ]
-                all_threats = {str(k): int(v) for k, v in threat_counts.items()}
-
-                ai_context_key = (
-                    f"{metrics.get('filename', '')}|{metrics.get('model_name', '')}|"
-                    f"{total}|{anomalies_count}|{risk_score:.4f}"
-                )
-                if st.session_state.get("ai_context_key") != ai_context_key:
-                    st.session_state["ai_context_key"] = ai_context_key
-                    st.session_state.pop("ai_short_explain", None)
-                    st.session_state.pop("ai_detailed_explain", None)
-
-                c_short, c_detailed = st.columns(2)
-                with c_short:
-                    short_clicked = st.button(
-                        "Коротке пояснення (керівництво)",
-                        key="btn_generate_ai_explain_short",
-                        use_container_width=True,
-                    )
-                with c_detailed:
-                    detailed_clicked = st.button(
-                        "Детальний SOC-аналіз (рекомендовано)",
-                        key="btn_generate_ai_explain_detailed",
-                        use_container_width=True,
-                    )
-                st.caption(
-                    "Коротке пояснення: стислий менеджерський підсумок. "
-                    "Детальний SOC-аналіз: технічний розбір з діями для команди безпеки."
-                )
-
-                if short_clicked:
-                    with st.spinner("Генеруємо короткий звіт..."):
-                        text = gemini.generate_executive_summary(summary_input, top_threats_list)
-                    if text and not str(text).lower().startswith("помилка"):
-                        st.session_state["ai_short_explain"] = text
-                    else:
-                        st.warning("Не вдалося отримати коротке пояснення від Gemini.")
-
-                if detailed_clicked:
-                    sample_rows = anomalies.head(25).to_dict(orient="records") if len(anomalies) > 0 else []
-                    with st.spinner("Генеруємо детальний SOC-аналіз..."):
-                        detailed = gemini.generate_comprehensive_analysis(
-                            scan_summary=summary_input,
-                            all_threats=all_threats,
-                            sample_data={"sample_anomalies": sample_rows},
-                        )
-                    if detailed and not str(detailed).lower().startswith("помилка"):
-                        st.session_state["ai_detailed_explain"] = detailed
-                    else:
-                        st.warning("Не вдалося отримати детальний аналіз від Gemini.")
-
-                short_text = st.session_state.get("ai_short_explain")
-                detailed_text = st.session_state.get("ai_detailed_explain")
-
-                if short_text:
-                    st.markdown("### Короткий підсумок")
-                    # _sanitize_ai_markdown strips links/anchors; rendered as markdown (no HTML).
-                    st.markdown(_sanitize_ai_markdown(short_text))
-                if detailed_text:
-                    st.markdown("---")
-                    st.markdown("### Детальний SOC-аналіз")
-                    st.markdown(_sanitize_ai_markdown(detailed_text))
-                if not short_text and not detailed_text:
-                    st.caption(
-                        "Оберіть формат: короткий звіт для керівництва або детальний технічний аналіз для SOC."
-                    )
