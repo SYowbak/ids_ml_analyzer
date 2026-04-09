@@ -473,6 +473,7 @@ class Preprocessor:
             "dst_ip",
             "src_port",
             "dst_port",
+            "protocol",
         }
 
     def _encode_categorical(

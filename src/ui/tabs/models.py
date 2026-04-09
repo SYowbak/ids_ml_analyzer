@@ -90,6 +90,10 @@ def render_models_tab(services: dict[str, Any], root_dir: Path) -> None:
     else:
         filtered = filtered.sort_values("saved_at", ascending=False, na_position="last")
 
+    if filtered.empty:
+        st.warning("За поточними фільтрами моделей не знайдено. Змініть фільтри або оберіть 'Усі'.")
+        return
+
     active_model = st.session_state.get("active_model_name")
     st.markdown("**Таблиця моделей**")
     st.dataframe(
@@ -128,13 +132,13 @@ def render_models_tab(services: dict[str, Any], root_dir: Path) -> None:
     action_col1, action_col2, action_col3 = st.columns(3)
     with action_col1:
         model_for_activation = st.selectbox(
-            "Встановити активною",
+            "Типова модель",
             options=filtered["name"].tolist(),
-            help="Активна модель використовується за замовчуванням на сторінці аналізу.",
+            help="Типова модель має пріоритет у скануванні (авто- та ручний вибір) якщо сумісна з файлом.",
         )
-        if st.button("Встановити активною", type="primary", width="stretch"):
+        if st.button("Застосувати як типову", type="primary", width="stretch"):
             st.session_state.active_model_name = model_for_activation
-            st.success(f"Активна модель: {model_for_activation}")
+            st.success(f"Типова модель: {model_for_activation}")
 
     with action_col2:
         model_for_delete = st.selectbox(
@@ -176,4 +180,4 @@ def render_models_tab(services: dict[str, Any], root_dir: Path) -> None:
             )
 
     if active_model:
-        st.caption(f"Поточна активна модель: {active_model}")
+        st.caption(f"Поточна типова модель: {active_model}")

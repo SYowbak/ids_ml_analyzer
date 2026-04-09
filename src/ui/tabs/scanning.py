@@ -189,13 +189,28 @@ def render_scanning_tab(services: dict[str, Any], root_dir: Path) -> None:
                 )
 
                 if model_pick_mode == "Автоматично":
-                    selected_model_name = model_names[0]
+                    active_model_name = str(st.session_state.get("active_model_name") or "").strip()
+                    if active_model_name and active_model_name in model_names:
+                        selected_model_name = active_model_name
+                        auto_selection_note = (
+                            "Автовибір моделі увімкнено: використано активну модель, "
+                            "оскільки вона сумісна з поточним файлом."
+                        )
+                    else:
+                        selected_model_name = model_names[0]
+                        auto_selection_note = (
+                            "Автовибір моделі увімкнено: використовується найкраща сумісна модель "
+                            "(ранжування за F1, Recall, Precision)."
+                        )
                     st.session_state["scan_selected_model_name"] = selected_model_name
-                    st.info(
-                        "Автовибір моделі увімкнено: використовується найкраща сумісна модель "
-                        "(ранжування за F1, Recall, Precision)."
-                    )
-                    st.caption(f"Обрана автоматично модель: {selected_model_name}")
+                    st.info(auto_selection_note)
+                    if active_model_name and active_model_name != selected_model_name:
+                        st.caption(
+                            f"Активна модель {active_model_name} несумісна з файлом, "
+                            f"тому обрано: {selected_model_name}"
+                        )
+                    else:
+                        st.caption(f"Обрана автоматично модель: {selected_model_name}")
                 else:
                     default_name = st.session_state.get("active_model_name")
                     current_model_name = st.session_state.get("scan_selected_model_name")
@@ -300,6 +315,11 @@ def render_scanning_tab(services: dict[str, Any], root_dir: Path) -> None:
             st.session_state["scan_sensitivity"] = float(effective_sensitivity)
             if sensitivity_mode == SENSITIVITY_MODE_AUTO:
                 st.caption(f"Автоматично застосовано рекомендований поріг: {effective_sensitivity:.2f}")
+            else:
+                st.caption(
+                    f"Вручну застосовано поріг: {effective_sensitivity:.2f}. "
+                    f"Рекомендований поріг моделі ({float(recommended_threshold_value):.2f}) зараз не використовується."
+                )
         with note_col:
             pcap_requires_ip_flow = bool(
                 inspection
@@ -1253,10 +1273,15 @@ def _run_scan(
 
     severity_values: list[str] = []
     recommendation_values: list[str] = []
-    for label in result_frame["attack_type"]:
+    detection_reason_values: list[str] = []
+    for idx, label in enumerate(result_frame["attack_type"]):
+        current_score = float(score_values[idx]) if idx < len(score_values) else 0.0
         if is_benign_label(label):
             severity_values.append("Безпечно")
             recommendation_values.append("Моніторинг у штатному режимі")
+            detection_reason_values.append(
+                f"Поведінка в межах норми моделі ({algorithm}); {score_column_name}={current_score:.3f}."
+            )
             continue
 
         severity_key = get_severity(label)
@@ -1264,9 +1289,20 @@ def _run_scan(
         threat = get_threat_info(str(label))
         actions = threat.get("actions", [])
         recommendation_values.append(actions[0] if actions else "Перевірити журнали та ізолювати підозрілу активність")
+        if is_if:
+            detection_reason_values.append(
+                "Аномалія визначена за відхиленням профілю Isolation Forest; "
+                f"{score_column_name}={current_score:.3f}, sensitivity={float(sensitivity):.2f}."
+            )
+        else:
+            detection_reason_values.append(
+                "Ймовірність атаки перевищила поріг моделі; "
+                f"{score_column_name}={current_score:.3f}, sensitivity={float(sensitivity):.2f}."
+            )
 
     result_frame["severity"] = severity_values
     result_frame["recommendation"] = recommendation_values
+    result_frame["detection_reason"] = detection_reason_values
     result_frame["is_alert"] = anomalies_mask
 
     distribution = (
@@ -1382,6 +1418,7 @@ def _render_scan_result(result: dict[str, Any]) -> None:
         "dst_port": "Порт призначення",
         "protocol": "Протокол",
         "attack_name": "Назва аномалії",
+        "detection_reason": "Пояснення детекції",
         "confidence": "Ймовірність",
         "severity": "Критичність",
         "recommendation": "Рекомендація",

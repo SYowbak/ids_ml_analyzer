@@ -374,7 +374,7 @@ class DataLoader:
 
         if preserve_context:
             context_cols = [
-                col for col in ("src_ip", "dst_ip", "src_port", "destination_port")
+                col for col in ("src_ip", "dst_ip", "src_port", "destination_port", "protocol")
                 if col in frame.columns
             ]
             context = frame[context_cols].copy() if context_cols else pd.DataFrame(index=frame.index)
@@ -1049,6 +1049,15 @@ class DataLoader:
         return frame
 
     @staticmethod
+    def _protocol_label(protocol_id: int) -> str:
+        protocol_map = {
+            1: "ICMP",
+            6: "TCP",
+            17: "UDP",
+        }
+        return protocol_map.get(int(protocol_id), str(int(protocol_id)))
+
+    @staticmethod
     def _flow_record_to_row(flow: _FlowRecord) -> dict[str, object]:
         """Convert a _FlowRecord to a CIC-IDS feature dict.
 
@@ -1093,6 +1102,7 @@ class DataLoader:
             "dst_ip":                         flow.dst_ip,
             "src_port":                       flow.src_port,
             "destination_port":               flow.dst_port,
+            "protocol":                       DataLoader._protocol_label(flow.protocol),
             "flow_duration":                  duration_us,
             "total_fwd_packets":              flow.fwd_packets,
             "total_backward_packets":         flow.bwd_packets,
