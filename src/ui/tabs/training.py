@@ -26,6 +26,7 @@ from src.core.dataset_nature import (
 from src.core.domain_schemas import get_schema, is_benign_label, normalize_frame_columns, resolve_target_labels
 from src.core.model_engine import ModelEngine
 from src.core.preprocessor import Preprocessor
+from src.core.threshold_policy import build_threshold_provenance
 from src.ui.utils.table_helpers import with_row_number
 
 
@@ -143,10 +144,6 @@ def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
     if not allowed_algorithms:
         allowed_algorithms = ["Random Forest"]
 
-    if st.session_state.get("training_force_expert_mode", False):
-        st.session_state["training_ui_mode"] = TRAINING_UI_MODE_EXPERT
-        st.session_state["training_force_expert_mode"] = False
-
     training_ui_mode = st.radio(
         "Режим керування навчанням",
         options=[TRAINING_UI_MODE_BEGINNER, TRAINING_UI_MODE_EXPERT],
@@ -159,154 +156,107 @@ def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
         ),
     )
     is_expert_mode = training_ui_mode == TRAINING_UI_MODE_EXPERT
+
+    pcap_optimization_available = bool(selected_dataset_type == "CIC-IDS")
+    optimize_for_pcap_detection = st.checkbox(
+        "Оптимізувати навчання для виявлення у PCAP",
+        value=bool(st.session_state.get("training_optimize_for_pcap", False)),
+        key="training_optimize_for_pcap",
+        disabled=not pcap_optimization_available,
+        help=(
+            "Додає PCAP-орієнтовані референси та жорсткіший профіль підбору даних для CIC-IDS, "
+            "щоб покращити детекцію атак у офлайн PCAP."
+        ),
+    )
+    if optimize_for_pcap_detection:
+        st.caption("PCAP-оптимізація увімкнена.")
+    elif selected_dataset_type and selected_dataset_type != "CIC-IDS":
+        st.caption("PCAP-оптимізація доступна лише для домену CIC-IDS.")
+
     if not is_expert_mode:
-        st.info(
-            "Рекомендований шлях для новачка: 1) оберіть файли, 2) натисніть запуск. "
-            "Система сама застосує безпечні параметри."
+        default_beginner_algorithm = _default_simple_auto_algorithm(
+            allowed_algorithms,
+            optimize_for_pcap_detection=bool(optimize_for_pcap_detection),
+        )
+        if st.session_state.get("training_beginner_auto_algorithm") not in allowed_algorithms:
+            st.session_state["training_beginner_auto_algorithm"] = default_beginner_algorithm
+
+        selected_beginner_algorithm = st.selectbox(
+            "Алгоритм",
+            options=allowed_algorithms,
+            index=allowed_algorithms.index(st.session_state["training_beginner_auto_algorithm"]),
+            key="training_beginner_auto_algorithm",
+        )
+        auto_max_rows_per_file = int(
+            _resolve_beginner_fast_row_limit(selected_paths, selected_dataset_type)
+        )
+        st.caption(
+            "Профіль: "
+            f"{auto_max_rows_per_file if auto_max_rows_per_file > 0 else 'без обмеження'} рядків/файл, без GridSearch."
         )
 
-    mode_auto_tab, mode_manual_tab = st.tabs(["Автоматичний режим", "Ручний режим"])
-
-    with mode_auto_tab:
-        st.markdown("**Система автоматично обирає та навчає найкращу доступну модель для активної природи.**")
-        if is_expert_mode:
-            auto_max_rows_per_file = st.number_input(
-                "Ліміт рядків з одного CSV (авто)",
-                min_value=0,
-                max_value=250000,
-                value=0,
-                step=1000,
-                help="0 = без обмеження. Інакше застосовується репрезентативний семпл для стабільності UI.",
-                key="training_auto_max_rows_per_file",
-            )
-        else:
-            auto_max_rows_per_file = 0
-            st.caption(
-                "Простий режим: застосовано швидкий безпечний профіль "
-                f"({'без обмеження' if auto_max_rows_per_file <= 0 else auto_max_rows_per_file} рядків/файл, без GridSearch)."
-            )
-        auto_grid_search_enabled = bool(is_expert_mode)
         auto_disabled = not selected_paths or bool(selection_error) or not selected_dataset_type
         if training_in_progress:
             auto_start_label = "Навчання виконується..."
         elif training_click_locked:
             auto_start_label = "Зачекайте..."
         else:
-            auto_start_label = "Навчити найкращу модель"
+            auto_start_label = "Навчити модель"
+
         if st.button(
             auto_start_label,
             type="primary",
             disabled=auto_disabled or training_in_progress or training_click_locked,
             width="stretch",
-            help=(
-                "У простому режимі: швидке авто-навчання без GridSearch. "
-                "В експертному: авто-порівняння кандидатів із GridSearch."
-            ),
             key="training_auto_start",
         ):
             if not _try_begin_training_run():
                 st.warning("Запуск уже виконується або щойно стартував. Подвійний клік проігноровано.")
             else:
-                auto_algorithms = _resolve_auto_algorithms(allowed_algorithms)
                 progress = st.progress(0, text="Підготовка даних...")
                 try:
-                    progress.progress(20, text="Валідація датасетів...")
-                    shared_frames: list[pd.DataFrame] | None = None
-                    if (not is_expert_mode) and selected_dataset_type:
-                        progress.progress(28, text="Підготовка спільної вибірки для кандидатів...")
-                        shared_frames = _load_training_frames(
+                    progress.progress(25, text="Побудова train/test вибірок...")
+                    with st.spinner("Триває навчання моделі..."):
+                        result = _run_training(
                             loader=loader,
+                            models_dir=models_dir,
                             selected_paths=selected_paths,
                             dataset_type=selected_dataset_type,
+                            algorithm=str(selected_beginner_algorithm),
+                            use_grid_search=False,
                             max_rows_per_file=int(auto_max_rows_per_file),
+                            test_size=0.2,
+                            algorithm_params=_recommended_safe_algorithm_params(
+                                selected_algorithm=str(selected_beginner_algorithm),
+                                dataset_type=selected_dataset_type,
+                                max_rows_per_file=int(auto_max_rows_per_file),
+                                optimize_for_pcap_detection=bool(optimize_for_pcap_detection),
+                            ),
                         )
-                    progress.progress(35, text="Запуск авто-порівняння алгоритмів...")
-                    candidate_runs: list[dict[str, Any]] = []
-                    failed_runs: list[str] = []
-                    total_candidates = max(1, len(auto_algorithms))
-                    with st.spinner("Триває автоматичне навчання..."):
-                        for index, auto_algorithm in enumerate(auto_algorithms, start=1):
-                            step_progress = int(35 + ((index - 1) / total_candidates) * 50)
-                            progress.progress(
-                                step_progress,
-                                text=f"Навчання кандидата {index}/{total_candidates}: {auto_algorithm}...",
-                            )
-                            try:
-                                candidate_result = _run_training(
-                                    loader=loader,
-                                    models_dir=models_dir,
-                                    selected_paths=selected_paths,
-                                    dataset_type=selected_dataset_type,
-                                    algorithm=auto_algorithm,
-                                    use_grid_search=bool(
-                                        auto_grid_search_enabled and auto_algorithm != "Isolation Forest"
-                                    ),
-                                    max_rows_per_file=int(auto_max_rows_per_file),
-                                    test_size=0.2,
-                                    algorithm_params=(
-                                        _recommended_safe_algorithm_params(
-                                            selected_algorithm=auto_algorithm,
-                                            dataset_type=selected_dataset_type,
-                                            max_rows_per_file=int(auto_max_rows_per_file),
-                                        )
-                                        if not is_expert_mode
-                                        else {}
-                                    ),
-                                    preloaded_frames=shared_frames,
-                                )
-                                candidate_runs.append(
-                                    {
-                                        "algorithm": auto_algorithm,
-                                        "result": candidate_result,
-                                    }
-                                )
-                            except Exception as exc:
-                                failed_runs.append(f"{auto_algorithm}: {exc}")
 
-                    if not candidate_runs:
-                        details = "; ".join(failed_runs[:3]) if failed_runs else "невідома причина"
-                        raise ValueError(f"Авто-режим не зміг навчити жодного кандидата ({details}).")
-
-                    best_candidate = _select_best_auto_candidate(candidate_runs)
-                    result = dict(best_candidate["result"])
                     result["training_mode"] = "auto"
-                    result["auto_selected_algorithm"] = best_candidate["algorithm"]
-                    result["auto_compared_algorithms"] = [item["algorithm"] for item in candidate_runs]
+                    result["auto_selected_algorithm"] = str(selected_beginner_algorithm)
+                    result["auto_compared_algorithms"] = [str(selected_beginner_algorithm)]
                     result["auto_candidate_scores"] = [
                         {
-                            "algorithm": item["algorithm"],
-                            "accuracy": float(item["result"].get("metrics", {}).get("accuracy", 0.0)),
-                            "precision": float(item["result"].get("metrics", {}).get("precision", 0.0)),
-                            "recall": float(item["result"].get("metrics", {}).get("recall", 0.0)),
-                            "f1": float(item["result"].get("metrics", {}).get("f1", 0.0)),
+                            "algorithm": str(selected_beginner_algorithm),
+                            "accuracy": float(result.get("metrics", {}).get("accuracy", 0.0)),
+                            "precision": float(result.get("metrics", {}).get("precision", 0.0)),
+                            "recall": float(result.get("metrics", {}).get("recall", 0.0)),
+                            "f1": float(result.get("metrics", {}).get("f1", 0.0)),
                         }
-                        for item in candidate_runs
                     ]
-                    if failed_runs:
-                        result["auto_failed_algorithms"] = failed_runs
 
-                    progress.progress(95, text="Формування фінального звіту...")
+                    progress.progress(90, text="Підготовка підсумкових метрик...")
                     st.session_state.training_result = result
                     progress.progress(100, text="Готово")
-                    compared = ", ".join(result.get("auto_compared_algorithms", []))
-                    st.success(
-                        "Автоматичне навчання завершено. "
-                        f"Порівняно: {compared}. Обрано: {result.get('auto_selected_algorithm', result.get('algorithm'))}."
-                    )
-                    if failed_runs:
-                        st.warning("Не вдалося навчити частину кандидатів: " + "; ".join(failed_runs))
+                    st.success(f"Навчено алгоритм: {selected_beginner_algorithm}.")
                 except Exception as exc:
                     st.session_state.training_result = None
                     st.error(str(exc))
                 finally:
                     _finish_training_run()
-
-    with mode_manual_tab:
-        if is_expert_mode:
-            st.markdown("**Ручний режим для повного контролю параметрів навчання.**")
-        else:
-            st.markdown("**Спрощений ручний режим: безпечні параметри без складних налаштувань.**")
-
+    else:
         selected_algorithm = st.selectbox(
             "Алгоритм",
             options=allowed_algorithms,
@@ -314,133 +264,60 @@ def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
             key="training_algorithm",
         )
 
-        if not is_expert_mode:
-            max_rows_per_file = 0
-            test_size = 0.2
+        _apply_expert_defaults_if_needed(
+            selected_algorithm=selected_algorithm,
+            dataset_type=selected_dataset_type,
+            selected_paths=selected_paths,
+            optimize_for_pcap_detection=bool(optimize_for_pcap_detection),
+        )
+
+        supports_grid_search = selected_algorithm in {"Random Forest", "XGBoost"}
+        if supports_grid_search:
+            use_grid_search = st.checkbox(
+                "Використати GridSearchCV",
+                value=False,
+                help="Працює для Random Forest та XGBoost.",
+                key="training_use_grid_search",
+            )
+        else:
             use_grid_search = False
-            algorithm_params = _recommended_safe_algorithm_params(
-                selected_algorithm=selected_algorithm,
-                dataset_type=selected_dataset_type,
-                max_rows_per_file=int(max_rows_per_file),
-            )
-
-            st.caption(
-                "У спрощеному режимі параметри безпеки/стабільності застосовуються автоматично: "
-                f"test_size={test_size:.2f}, grid_search=off, max_rows_per_file="
-                f"{'без обмеження' if max_rows_per_file <= 0 else max_rows_per_file}, "
-                f"params={_format_params_hint(algorithm_params)}"
-            )
-
-            manual_disabled = not selected_paths or bool(selection_error) or not selected_dataset_type
-            if training_in_progress:
-                safe_start_label = "Навчання виконується..."
-            elif training_click_locked:
-                safe_start_label = "Зачекайте..."
-            else:
-                safe_start_label = "Запустити навчання (безпечний режим)"
-            if st.button(
-                safe_start_label,
-                type="primary",
-                disabled=manual_disabled or training_in_progress or training_click_locked,
-                width="stretch",
-                help="Запускає навчання з безпечними рекомендованими параметрами.",
-                key="training_manual_start_safe",
-            ):
-                if not _try_begin_training_run():
-                    st.warning("Запуск уже виконується або щойно стартував. Подвійний клік проігноровано.")
-                else:
-                    progress = st.progress(0, text="Підготовка даних...")
-                    try:
-                        progress.progress(25, text="Побудова train/test вибірок...")
-                        with st.spinner("Триває навчання моделі..."):
-                            result = _run_training(
-                                loader=loader,
-                                models_dir=models_dir,
-                                selected_paths=selected_paths,
-                                dataset_type=selected_dataset_type,
-                                algorithm=selected_algorithm,
-                                use_grid_search=use_grid_search,
-                                max_rows_per_file=int(max_rows_per_file),
-                                test_size=float(test_size),
-                                algorithm_params=algorithm_params,
-                            )
-                        progress.progress(90, text="Підготовка підсумкових метрик...")
-                        result["training_mode"] = "manual_safe"
-                        st.session_state.training_result = result
-                        progress.progress(100, text="Готово")
-                        st.success("Навчання у безпечному режимі завершено успішно.")
-                    except Exception as exc:
-                        st.session_state.training_result = None
-                        st.error(str(exc))
-                    finally:
-                        _finish_training_run()
-
-            if st.button(
-                "Перейти в експертний режим",
-                key="training_switch_to_expert",
-                width="stretch",
-                disabled=training_in_progress,
-                help="Відкриває повний набір повзунків та ручних параметрів.",
-            ):
-                st.session_state["training_force_expert_mode"] = True
-                st.rerun()
-
-            st.caption("Потрібні детальні повзунки? Перейдіть у експертний режим.")
-
-            if st.session_state.training_result:
-                _render_training_result(st.session_state.training_result)
-            return
-
-        evaluation_mode = st.selectbox(
-            "Режим валідації",
-            options=["Поділ на train/test", "Крос-валідація"],
-            help="Крос-валідація у цій версії виконується через розширений сценарій train/test.",
-            key="training_eval_mode",
-        )
-
-        selected_metrics = st.multiselect(
-            "Метрики для оцінки",
-            options=["Точність", "Прецизійність", "Повнота", "F1-міра"],
-            default=["Точність", "Прецизійність", "Повнота", "F1-міра"],
-            help="Базові метрики показуються після завершення навчання.",
-            key="training_metrics_selection",
-        )
-        del selected_metrics, evaluation_mode
-
-        use_grid_search = st.checkbox(
-            "Використати GridSearchCV",
-            value=False,
-            disabled=selected_algorithm == "Isolation Forest",
-            help="Працює для Random Forest та XGBoost.",
-            key="training_use_grid_search",
-        )
 
         suggested_params = _resolve_manual_suggested_params(
             selected_algorithm=selected_algorithm,
             training_result=st.session_state.get("training_result"),
         )
+        suggested_updates = _build_manual_param_updates(selected_algorithm, suggested_params) if suggested_params else {}
         suggested_hint = "best_params" if isinstance((st.session_state.get("training_result") or {}).get("best_params"), dict) else "поточних configured_params"
-        if suggested_params:
+        if suggested_updates:
             st.caption(
                 "Доступна підказка параметрів з останнього навчання для цього алгоритму. "
                 f"Джерело: {suggested_hint}."
             )
 
-        if st.button(
-            "Підставити best_params у повзунки",
-            disabled=not bool(suggested_params) or training_in_progress,
-            width="stretch",
-            help="Заповнює повзунки ручного режиму найкращими параметрами з останнього результату.",
-            key="training_apply_best_params",
-        ):
-            updates = _build_manual_param_updates(selected_algorithm, suggested_params)
-            if not updates:
-                st.info("Для цього алгоритму немає параметрів, які можна підставити у повзунки.")
-            else:
-                for key, value in updates.items():
+        if suggested_updates:
+            if st.button(
+                "Підставити best_params у повзунки",
+                disabled=training_in_progress,
+                width="stretch",
+                help="Заповнює повзунки ручного режиму найкращими параметрами з останнього результату.",
+                key="training_apply_best_params",
+            ):
+                for key, value in suggested_updates.items():
                     st.session_state[key] = value
                 st.success("Параметри застосовано до ручного режиму.")
                 st.rerun()
+        else:
+            last_result = st.session_state.get("training_result") or {}
+            last_algorithm = str(last_result.get("algorithm") or "")
+            if suggested_params:
+                st.caption("Для цього алгоритму немає сумісних повзунків для автопідстановки параметрів.")
+            elif last_algorithm and last_algorithm != selected_algorithm:
+                st.caption(
+                    f"Останній результат збережено для {last_algorithm}. "
+                    "Підказка best_params з'явиться після навчання поточного алгоритму."
+                )
+            else:
+                st.caption("Підказка best_params з'явиться після першого успішного навчання цього алгоритму.")
 
         param_col1, param_col2 = st.columns(2)
         with param_col1:
@@ -465,6 +342,7 @@ def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
             )
 
         algorithm_params = _render_algorithm_parameters(selected_algorithm)
+        algorithm_params["optimize_for_pcap_detection"] = bool(optimize_for_pcap_detection)
 
         manual_disabled = not selected_paths or bool(selection_error) or not selected_dataset_type
         if training_in_progress:
@@ -518,10 +396,12 @@ def _init_training_state() -> None:
     st.session_state.setdefault("training_result", None)
     st.session_state.setdefault("training_uploaded_cache", {})
     st.session_state.setdefault("training_ui_mode", TRAINING_UI_MODE_BEGINNER)
-    st.session_state.setdefault("training_force_expert_mode", False)
+    st.session_state.setdefault("training_optimize_for_pcap", False)
     st.session_state.setdefault("training_in_progress", False)
     st.session_state.setdefault("training_last_started_monotonic", 0.0)
     st.session_state.setdefault("training_click_guard_until", 0.0)
+    st.session_state.setdefault("training_beginner_auto_algorithm", None)
+    st.session_state.setdefault("training_expert_defaults_signature", None)
 
 
 def _reset_scan_result_state() -> None:
@@ -607,6 +487,7 @@ def _recommended_safe_algorithm_params(
     selected_algorithm: str,
     dataset_type: str | None = None,
     max_rows_per_file: int = 25000,
+    optimize_for_pcap_detection: bool = False,
 ) -> dict[str, Any]:
     if selected_algorithm == "Random Forest":
         params = {
@@ -618,8 +499,10 @@ def _recommended_safe_algorithm_params(
             _recommended_supervised_control_params(
                 dataset_type=dataset_type,
                 max_rows_per_file=max_rows_per_file,
+                optimize_for_pcap_detection=optimize_for_pcap_detection,
             )
         )
+        params["optimize_for_pcap_detection"] = bool(optimize_for_pcap_detection)
         return params
 
     if selected_algorithm == "XGBoost":
@@ -634,18 +517,25 @@ def _recommended_safe_algorithm_params(
             _recommended_supervised_control_params(
                 dataset_type=dataset_type,
                 max_rows_per_file=max_rows_per_file,
+                optimize_for_pcap_detection=optimize_for_pcap_detection,
             )
         )
+        params["optimize_for_pcap_detection"] = bool(optimize_for_pcap_detection)
         return params
 
     if selected_algorithm == "Isolation Forest":
-        return {
+        params = {
             "n_estimators": 300,
             "contamination": "auto",
             "if_target_fp_rate": 0.02,
             "if_use_attack_references": True,
             "if_attack_reference_files": 3,
         }
+        if bool(optimize_for_pcap_detection) and str(dataset_type) == "CIC-IDS":
+            params["if_target_fp_rate"] = 0.03
+            params["if_attack_reference_files"] = 6
+        params["optimize_for_pcap_detection"] = bool(optimize_for_pcap_detection)
+        return params
 
     return {}
 
@@ -653,12 +543,13 @@ def _recommended_safe_algorithm_params(
 def _recommended_supervised_control_params(
     dataset_type: str | None,
     max_rows_per_file: int,
+    optimize_for_pcap_detection: bool = False,
 ) -> dict[str, Any]:
     effective_rows = int(max_rows_per_file) if int(max_rows_per_file) > 0 else 25000
     effective_rows = int(np.clip(effective_rows, 2000, 30000))
 
     if dataset_type == "CIC-IDS":
-        return {
+        params = {
             "cic_use_reference_corpus": True,
             "cic_attack_reference_files": 2,
             "cic_benign_reference_files": 1,
@@ -672,6 +563,23 @@ def _recommended_supervised_control_params(
             "cic_hard_case_attack_rows_per_file": 600,
             "cic_hard_case_benign_rows_per_file": 150,
         }
+        if bool(optimize_for_pcap_detection):
+            params.update(
+                {
+                    "cic_attack_reference_files": 6,
+                    "cic_benign_reference_files": 2,
+                    "cic_reference_rows_per_file": int(min(max(effective_rows, 12000), 30000)),
+                    "cic_reference_max_share": 1.20,
+                    "cic_include_original_references": True,
+                    "cic_original_reference_files": 8,
+                    "cic_original_attack_rows_per_file": 3000,
+                    "cic_original_benign_rows_per_file": 1200,
+                    "cic_use_hard_case_references": True,
+                    "cic_hard_case_attack_rows_per_file": 2200,
+                    "cic_hard_case_benign_rows_per_file": 700,
+                }
+            )
+        return params
 
     if dataset_type == "NSL-KDD":
         return {
@@ -690,7 +598,19 @@ def _recommended_supervised_control_params(
     return {}
 
 
-def _resolve_auto_algorithms(allowed_algorithms: list[str]) -> list[str]:
+def _resolve_auto_algorithms(
+    allowed_algorithms: list[str],
+    optimize_for_pcap_detection: bool = False,
+) -> list[str]:
+    if bool(optimize_for_pcap_detection):
+        pcap_priority = [
+            name
+            for name in ("Random Forest", "Isolation Forest")
+            if name in allowed_algorithms
+        ]
+        if pcap_priority:
+            return pcap_priority
+
     supervised_priority = [
         name
         for name in ("XGBoost", "Random Forest")
@@ -701,6 +621,76 @@ def _resolve_auto_algorithms(allowed_algorithms: list[str]) -> list[str]:
     if "Isolation Forest" in allowed_algorithms:
         return ["Isolation Forest"]
     return allowed_algorithms[:1]
+
+
+def _default_simple_auto_algorithm(
+    allowed_algorithms: list[str],
+    optimize_for_pcap_detection: bool = False,
+) -> str:
+    if not allowed_algorithms:
+        return "Random Forest"
+    ordered = _resolve_auto_algorithms(
+        allowed_algorithms,
+        optimize_for_pcap_detection=bool(optimize_for_pcap_detection),
+    )
+    if ordered:
+        return str(ordered[0])
+    return str(allowed_algorithms[0])
+
+
+def _expert_default_widget_updates(
+    selected_algorithm: str,
+    dataset_type: str | None,
+    selected_paths: list[Path],
+    optimize_for_pcap_detection: bool,
+) -> dict[str, Any]:
+    if selected_paths:
+        default_row_limit = int(
+            _resolve_beginner_fast_row_limit(selected_paths, dataset_type)
+            if dataset_type
+            else _resolve_beginner_row_limit(selected_paths)
+        )
+    else:
+        default_row_limit = 0
+
+    algorithm_params = _recommended_safe_algorithm_params(
+        selected_algorithm=selected_algorithm,
+        dataset_type=dataset_type,
+        max_rows_per_file=int(default_row_limit),
+        optimize_for_pcap_detection=bool(optimize_for_pcap_detection),
+    )
+    updates = _build_manual_param_updates(selected_algorithm, algorithm_params)
+    updates["training_max_rows_per_file"] = int(max(default_row_limit, 0))
+    updates["training_test_size"] = 0.20
+    updates["training_use_grid_search"] = False
+    return updates
+
+
+def _apply_expert_defaults_if_needed(
+    selected_algorithm: str,
+    dataset_type: str | None,
+    selected_paths: list[Path],
+    optimize_for_pcap_detection: bool,
+) -> None:
+    dataset_label = str(dataset_type or "unknown")
+    signature = (
+        str(selected_algorithm),
+        dataset_label,
+        int(bool(optimize_for_pcap_detection)),
+        len(selected_paths),
+    )
+    if st.session_state.get("training_expert_defaults_signature") == signature:
+        return
+
+    updates = _expert_default_widget_updates(
+        selected_algorithm=selected_algorithm,
+        dataset_type=dataset_type,
+        selected_paths=selected_paths,
+        optimize_for_pcap_detection=bool(optimize_for_pcap_detection),
+    )
+    for key, value in updates.items():
+        st.session_state[key] = value
+    st.session_state["training_expert_defaults_signature"] = signature
 
 
 def _score_auto_candidate(result: dict[str, Any]) -> tuple[float, float, float, float]:
@@ -979,6 +969,7 @@ def _run_training(
         "use_hard_case_references": False,
         "hard_case_attack_rows_per_file": 0,
         "hard_case_benign_rows_per_file": 0,
+        "optimize_for_pcap_detection": False,
     }
     supervised_params = dict(algorithm_params)
     supervised_extra_metadata: dict[str, Any] = {}
@@ -1003,6 +994,9 @@ def _run_training(
         raise ValueError("Після завантаження вибірка порожня.")
 
     if algorithm != "Isolation Forest":
+        supervised_extra_metadata["pcap_optimized_training"] = bool(
+            supervised_controls.get("optimize_for_pcap_detection", False)
+        )
         if dataset_type == "CIC-IDS" and bool(supervised_controls.get("use_reference_corpus", False)):
             reference_dataset, reference_sources = _collect_cic_supervised_reference_data(
                 loader=loader,
@@ -1122,6 +1116,7 @@ def _run_training(
             algorithm_params=algorithm_params,
             test_size=test_size,
         )
+        result["pcap_optimized_training"] = bool(algorithm_params.get("optimize_for_pcap_detection", False))
     else:
         result = _train_supervised_model(
             dataset=dataset,
@@ -1133,6 +1128,7 @@ def _run_training(
             test_size=test_size,
             extra_metadata=supervised_extra_metadata,
         )
+        result["pcap_optimized_training"] = bool(supervised_controls.get("optimize_for_pcap_detection", False))
 
     result["rows_loaded"] = int(len(dataset))
     result["files_used"] = [path.name for path in selected_paths]
@@ -1293,15 +1289,22 @@ def _format_params_hint(params: dict[str, Any], max_items: int = 8) -> str:
 
 def _extract_if_model_and_control_params(algorithm_params: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     model_params = dict(algorithm_params)
+    optimize_for_pcap_detection = bool(model_params.pop("optimize_for_pcap_detection", False))
     target_fp_rate = float(np.clip(float(model_params.pop("if_target_fp_rate", 0.02)), 0.01, 0.03))
     use_attack_references = bool(model_params.pop("if_use_attack_references", True))
     attack_reference_files = int(model_params.pop("if_attack_reference_files", 3))
     attack_reference_files = max(1, min(attack_reference_files, 6))
 
+    if optimize_for_pcap_detection:
+        target_fp_rate = float(max(target_fp_rate, 0.03))
+        use_attack_references = True
+        attack_reference_files = max(attack_reference_files, 6)
+
     controls = {
         "target_fp_rate": target_fp_rate,
         "use_attack_references": use_attack_references,
         "attack_reference_files": attack_reference_files,
+        "optimize_for_pcap_detection": optimize_for_pcap_detection,
     }
     return model_params, controls
 
@@ -1311,6 +1314,7 @@ def _extract_supervised_model_and_control_params(
     algorithm_params: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     model_params = dict(algorithm_params)
+    optimize_for_pcap_detection = bool(model_params.pop("optimize_for_pcap_detection", False))
 
     controls = {
         "use_reference_corpus": False,
@@ -1325,6 +1329,7 @@ def _extract_supervised_model_and_control_params(
         "use_hard_case_references": False,
         "hard_case_attack_rows_per_file": 0,
         "hard_case_benign_rows_per_file": 0,
+        "optimize_for_pcap_detection": optimize_for_pcap_detection,
     }
 
     if dataset_type == "CIC-IDS":
@@ -1354,6 +1359,19 @@ def _extract_supervised_model_and_control_params(
         controls["hard_case_benign_rows_per_file"] = int(
             np.clip(int(model_params.pop("cic_hard_case_benign_rows_per_file", 300)), 0, 5000)
         )
+        if optimize_for_pcap_detection:
+            controls["use_reference_corpus"] = True
+            controls["attack_reference_files"] = max(int(controls["attack_reference_files"]), 6)
+            controls["benign_reference_files"] = max(int(controls["benign_reference_files"]), 2)
+            controls["reference_rows_per_file"] = max(int(controls["reference_rows_per_file"]), 12000)
+            controls["reference_max_share"] = max(float(controls["reference_max_share"]), 1.20)
+            controls["include_original_references"] = True
+            controls["original_reference_files"] = max(int(controls["original_reference_files"]), 8)
+            controls["original_attack_rows_per_file"] = max(int(controls["original_attack_rows_per_file"]), 3000)
+            controls["original_benign_rows_per_file"] = max(int(controls["original_benign_rows_per_file"]), 1200)
+            controls["use_hard_case_references"] = True
+            controls["hard_case_attack_rows_per_file"] = max(int(controls["hard_case_attack_rows_per_file"]), 2200)
+            controls["hard_case_benign_rows_per_file"] = max(int(controls["hard_case_benign_rows_per_file"]), 700)
         model_params.pop("nsl_use_original_references", None)
         model_params.pop("nsl_reference_rows_per_file", None)
         model_params.pop("nsl_reference_max_share", None)
@@ -2235,6 +2253,16 @@ def _train_supervised_model(
     matrix = confusion_matrix(y_test, predictions)
     attack_probabilities = _compute_attack_probabilities(probabilities, preprocessor, len(predictions))
     recommended_threshold, recommended_threshold_metrics = _find_best_threshold(y_test, attack_probabilities)
+    provenance_context: dict[str, Any] = {}
+    if isinstance(extra_metadata, dict) and extra_metadata:
+        provenance_context.update(extra_metadata)
+    threshold_provenance = build_threshold_provenance(
+        dataset_type=dataset_type,
+        algorithm=algorithm,
+        recommended_threshold=float(recommended_threshold),
+        recommended_metrics=recommended_threshold_metrics,
+        model_metadata=provenance_context,
+    )
 
     metrics = {
         "accuracy": float(accuracy_score(y_test, predictions)),
@@ -2259,6 +2287,7 @@ def _train_supervised_model(
         "training_label_counts": {key: int(value) for key, value in dataset["binary_target_label"].value_counts().to_dict().items()},
         "recommended_threshold": recommended_threshold,
         "recommended_threshold_metrics": recommended_threshold_metrics,
+        "threshold_provenance": threshold_provenance,
         "use_grid_search": bool(use_grid_search),
         "configured_params": configured_params,
         "metrics": {key: value for key, value in metrics.items() if key not in {"confusion_matrix", "labels"}},
@@ -2388,6 +2417,16 @@ def _train_isolation_forest(
         "attack_reference_sources": attack_reference_sources,
         "score_stats": score_stats,
     }
+    threshold_provenance = build_threshold_provenance(
+        dataset_type=dataset_type,
+        algorithm="Isolation Forest",
+        recommended_threshold=float(if_threshold),
+        recommended_metrics=if_calibration_payload,
+        model_metadata={
+            "if_calibration": if_calibration_payload,
+            "if_target_fp_rate": float(controls["target_fp_rate"]),
+        },
+    )
     trained_on_pcap_metrics = bool(attack_reference_sources)
     metadata = {
         "dataset_type": dataset_type,
@@ -2396,6 +2435,7 @@ def _train_isolation_forest(
         "model_type": "anomaly_detection",
         "compatible_input_types": list(get_schema(dataset_type).supported_input_types),
         "trained_on_pcap_metrics": trained_on_pcap_metrics,
+        "pcap_optimized_training": bool(controls.get("optimize_for_pcap_detection", False)),
         "expected_features": preprocessor.feature_columns,
         "categorical_columns": preprocessor.categorical_columns,
         "use_grid_search": False,
@@ -2403,6 +2443,7 @@ def _train_isolation_forest(
         "if_target_fp_rate": float(controls["target_fp_rate"]),
         "if_use_attack_references": bool(controls["use_attack_references"]),
         "if_calibration": if_calibration_payload,
+        "threshold_provenance": threshold_provenance,
         "if_score_stats": score_stats,
         "configured_params": configured_params,
         "metrics": {key: value for key, value in metrics.items() if key not in {"confusion_matrix", "labels"}},
@@ -2441,6 +2482,12 @@ def _render_training_result(result: dict[str, Any]) -> None:
     metric_columns[1].metric("Прецизійність", f"{metrics['precision']:.3f}")
     metric_columns[2].metric("Повнота", f"{metrics['recall']:.3f}")
     metric_columns[3].metric("F1-міра", f"{metrics['f1']:.3f}")
+
+    if bool(result.get("pcap_optimized_training", False)):
+        st.info(
+            "Режим PCAP-оптимізації був увімкнений під час навчання цієї моделі. "
+            "Використано розширений профіль референсів для покращення детекції в офлайн PCAP."
+        )
 
     if metrics.get("is_unsupervised_only"):
         st.warning(

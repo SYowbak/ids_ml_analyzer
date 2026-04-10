@@ -2,6 +2,8 @@ from pathlib import Path
 
 from src.ui.tabs.training import (
     _build_manual_param_updates,
+    _default_simple_auto_algorithm,
+    _expert_default_widget_updates,
     _recommended_safe_algorithm_params,
     _resolve_auto_algorithms,
     _resolve_beginner_fast_row_limit,
@@ -23,6 +25,58 @@ def test_resolve_auto_algorithms_falls_back_to_isolation_forest() -> None:
     selected = _resolve_auto_algorithms(["Isolation Forest"])
 
     assert selected == ["Isolation Forest"]
+
+
+def test_resolve_auto_algorithms_pcap_optimization_keeps_rf_and_if_only() -> None:
+    allowed = ["Isolation Forest", "XGBoost", "Random Forest"]
+
+    selected = _resolve_auto_algorithms(allowed, optimize_for_pcap_detection=True)
+
+    assert selected == ["Random Forest", "Isolation Forest"]
+
+
+def test_default_simple_auto_algorithm_uses_first_auto_candidate() -> None:
+    allowed = ["Isolation Forest", "XGBoost", "Random Forest"]
+
+    default_regular = _default_simple_auto_algorithm(allowed)
+    default_pcap = _default_simple_auto_algorithm(allowed, optimize_for_pcap_detection=True)
+
+    assert default_regular == "XGBoost"
+    assert default_pcap == "Random Forest"
+
+
+def test_expert_default_widget_updates_prefill_global_controls(tmp_path: Path) -> None:
+    sample = tmp_path / "small.csv"
+    sample.write_text("a,b\n1,2\n", encoding="utf-8")
+
+    updates = _expert_default_widget_updates(
+        selected_algorithm="Random Forest",
+        dataset_type="CIC-IDS",
+        selected_paths=[sample],
+        optimize_for_pcap_detection=True,
+    )
+
+    assert updates["training_max_rows_per_file"] == 40000
+    assert updates["training_test_size"] == 0.2
+    assert updates["training_use_grid_search"] is False
+    assert updates["rf_n_estimators"] == 300
+
+
+def test_expert_default_widget_updates_prefill_if_pcap_params(tmp_path: Path) -> None:
+    sample = tmp_path / "small.csv"
+    sample.write_text("a,b\n1,2\n", encoding="utf-8")
+
+    updates = _expert_default_widget_updates(
+        selected_algorithm="Isolation Forest",
+        dataset_type="CIC-IDS",
+        selected_paths=[sample],
+        optimize_for_pcap_detection=True,
+    )
+
+    assert updates["if_n_estimators"] == 300
+    assert updates["if_attack_reference_files"] == 6
+    assert updates["if_target_fp_rate"] == 0.03
+    assert updates["if_use_attack_references"] is True
 
 
 def test_select_best_auto_candidate_uses_f1_then_recall() -> None:
@@ -160,3 +214,31 @@ def test_recommended_safe_algorithm_params_keep_light_cic_references() -> None:
     assert params["cic_use_reference_corpus"] is True
     assert params["cic_include_original_references"] is False
     assert params["cic_attack_reference_files"] == 2
+
+
+def test_recommended_safe_algorithm_params_enable_pcap_optimized_cic_profile() -> None:
+    params = _recommended_safe_algorithm_params(
+        selected_algorithm="Random Forest",
+        dataset_type="CIC-IDS",
+        max_rows_per_file=25000,
+        optimize_for_pcap_detection=True,
+    )
+
+    assert params["optimize_for_pcap_detection"] is True
+    assert params["cic_use_reference_corpus"] is True
+    assert params["cic_include_original_references"] is True
+    assert params["cic_attack_reference_files"] >= 6
+    assert params["cic_reference_max_share"] >= 1.0
+
+
+def test_recommended_safe_algorithm_params_enable_if_pcap_mode() -> None:
+    params = _recommended_safe_algorithm_params(
+        selected_algorithm="Isolation Forest",
+        dataset_type="CIC-IDS",
+        max_rows_per_file=25000,
+        optimize_for_pcap_detection=True,
+    )
+
+    assert params["optimize_for_pcap_detection"] is True
+    assert params["if_attack_reference_files"] == 6
+    assert params["if_target_fp_rate"] == 0.03

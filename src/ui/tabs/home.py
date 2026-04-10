@@ -14,21 +14,100 @@ def _safe_numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce").fillna(0.0)
 
 
-def _render_thesis_value_block() -> None:
+def _render_system_overview_block() -> None:
     with st.container(border=True):
-        st.subheader("Навіщо цей проєкт", anchor=False)
+        st.subheader("Що це за система", anchor=False)
         st.markdown(
             """
-            1. **Проблема:** ручний аналіз мережевого трафіку та журналів повільний, тому частина аномалій може бути пропущена.
-            2. **Рішення:** застосунок автоматизує підготовку даних, навчання ML-моделей і контрольоване сканування.
-            3. **Практична користь:** швидший triage інцидентів, прозорі метрики ризику та зрозумілі рекомендації для оператора.
+            **IDS ML Analyzer** — прикладний інструмент для швидкого виявлення аномалій у мережевому трафіку та CSV-журналах.
+
+            - **Для чого:** первинний triage інцидентів, перевірка підозрілих файлів, оцінка ризику перед ескалацією.
+            - **Для кого:** SOC-аналітик, інженер кіберзахисту, адміністратор мережі, DevSecOps команда.
+            - **Що на виході:** ризик у %, кількість аномалій, top-джерела активності, модель і поріг, пояснення для дій.
+
+            **Важливо:** навчання моделі в інтерфейсі виконується лише на CSV. PCAP використовується для сканування та детекції аномалій.
+
+            Система допомагає швидко пріоритезувати роботу команди, але не замінює SIEM/EDR та повноцінне розслідування.
+            """
+        )
+
+
+def _render_target_users_block() -> None:
+    with st.container(border=True):
+        st.subheader("Коли система найбільш корисна", anchor=False)
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown(
+                """
+                **Операційні сценарії**
+
+                - потрібно швидко перевірити підозрілий `PCAP` або `CSV`
+                - треба відділити високий ризик від шуму
+                - потрібно порівняти кілька моделей на однаковому вході
+                """
+            )
+        with col2:
+            st.markdown(
+                """
+                **Сценарії підготовки/контролю**
+
+                - навчити модель на власних даних команди
+                - зберегти та повторно використати найкращу модель
+                - контролювати історію сканувань і динаміку ризику
+                """
+            )
+
+
+def _render_quick_start_block() -> None:
+    with st.container(border=True):
+        st.subheader("Як користуватись (швидкий старт)", anchor=False)
+        st.markdown(
+            """
+            1. **Підготуйте файл для сканування**:
+               - `PCAP` або `CIC-IDS CSV` для мережевого режиму (NIDS)
+               - `NSL-KDD/UNSW-NB15 CSV` для SIEM-режиму
+            2. **Перевірте моделі у вкладці "Моделі"**:
+               - якщо моделей немає, перейдіть у "Тренування" і навчіть нову
+            3. **Відкрийте "Сканування"**:
+               - оберіть файл
+               - оберіть сумісну модель (або залиште автоматичний вибір)
+               - запустіть сканування
+            4. **Інтерпретуйте результат**:
+               - ризик, % аномалій, ключові ознаки та джерела
+            5. **Зафіксуйте рішення**:
+               - збережіть результат в історію та передайте у triage/IR процес
+            """
+        )
+        st.info("Нагадування: у вкладці Тренування приймаються тільки CSV-файли. PCAP призначений для сканування.")
+
+
+def _render_results_interpretation_block() -> None:
+    with st.container(border=True):
+        st.subheader("Як читати ризик після сканування", anchor=False)
+        st.markdown(
+            """
+            - **0-5%:** фоновий рівень, зазвичай без ескалації
+            - **5-15%:** підвищена увага, перевірка топ IP/портів і часових піків
+            - **15%+:** пріоритетний triage, швидка перевірка IOC та обмеження доступу до чутливих сервісів
+
+            Рішення завжди приймайте в контексті інфраструктури та інших джерел (SIEM, EDR, firewall, netflow).
             """
         )
 
 
 def _render_explanations_block() -> None:
     with st.container(border=True):
-        st.subheader("Короткі пояснення", anchor=False)
+        st.subheader("Поширені питання", anchor=False)
+        with st.expander("Чи можна навчати модель прямо на PCAP?", expanded=False):
+            st.markdown(
+                "У поточному UI — ні. Навчання виконується на CSV з цільовими мітками. "
+                "PCAP використовується на етапі сканування: система витягує flow-ознаки і застосовує вже навчено модель."
+            )
+        with st.expander("Що робити, якщо файл не підходить до моделі?", expanded=False):
+            st.markdown(
+                "Застосунок навмисно блокує несумісні по схемі запуски. "
+                "Оберіть модель того ж домену, що й файл, або перенавчіть модель на відповідному наборі даних."
+            )
         with st.expander("Чому тут ML, а не тільки сигнатури/правила?", expanded=False):
             st.markdown(
                 "ML виявляє нетипові патерни поведінки, які не завжди покриваються статичними правилами. "
@@ -126,7 +205,9 @@ def render_home_tab(services: dict[str, Any], root_dir: Path) -> None:
     with metrics_col2:
         st.metric("Виконані сканування", scans_count)
 
-    _render_thesis_value_block()
+    _render_system_overview_block()
+    _render_target_users_block()
+    _render_quick_start_block()
 
     with st.container(border=True):
         st.subheader("Дворежимний IDS", anchor=False)
@@ -137,7 +218,8 @@ def render_home_tab(services: dict[str, Any], root_dir: Path) -> None:
                 **Режим A: мережевий трафік (NIDS)**
 
                 - Домен: `CIC-IDS`
-                - Вхід: `PCAP` або `CIC-IDS CSV`
+                - Сканування: `PCAP` або `CIC-IDS CSV`
+                - Навчання: лише `CIC-IDS CSV`
                 - Алгоритми: `Random Forest`, `XGBoost`, `Isolation Forest`
                 - `PCAP` доступний лише для CIC-сумісних моделей; `Isolation Forest` показується для `PCAP` тільки якщо модель навчали на flow-ознаках з мережевого трафіку
                 """
@@ -161,5 +243,6 @@ def render_home_tab(services: dict[str, Any], root_dir: Path) -> None:
             "Якщо схема ознак не збігається, застосунок зупиняє операцію та показує помилку."
         )
 
+    _render_results_interpretation_block()
     _render_visual_summary(services)
     _render_explanations_block()

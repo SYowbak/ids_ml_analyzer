@@ -11,11 +11,14 @@ from src.ui.utils.table_helpers import with_row_number
 def render_history_tab(services: dict[str, Any], root_dir: Path) -> None:
     del root_dir
 
+    confirm_generation = int(st.session_state.get("history_clear_confirm_generation", 0))
+    confirm_widget_key = f"history_clear_confirm_{confirm_generation}"
+
     with st.container(border=True):
         st.markdown("**Керування історією**")
         confirm_clear = st.checkbox(
             "Підтверджую очищення історії сканувань",
-            key="history_clear_confirm",
+            key=confirm_widget_key,
             help="Ця дія видалить історію сканувань і скине лічильник на головній вкладці.",
         )
         if st.button(
@@ -26,7 +29,7 @@ def render_history_tab(services: dict[str, Any], root_dir: Path) -> None:
         ):
             deleted_sessions = int(services["db"].clear_scan_history())
             if deleted_sessions >= 0:
-                st.session_state["history_clear_confirm"] = False
+                st.session_state["history_clear_confirm_generation"] = confirm_generation + 1
                 st.success(f"Історію очищено. Видалено сканувань: {deleted_sessions}.")
                 st.rerun()
             else:

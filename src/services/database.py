@@ -4,38 +4,70 @@
 
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Generator
+from typing import Generator, Optional
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 
 from src.database.models import Base
 import json
-import os
 
 # Створення engine
 _engine = None
+_engine_db_path: Optional[Path] = None
 _SessionLocal = None
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _settings_file_path() -> Path:
+    return Path(__file__).parent / "user_settings.json"
+
+
+def _read_db_path_setting(settings_path: Optional[Path] = None, default: str = "ids_history.db") -> str:
+    path = settings_path or _settings_file_path()
+    if not path.exists():
+        return str(default)
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                value = str(data.get("db_path", default)).strip()
+                return value or str(default)
+    except Exception:
+        pass
+    return str(default)
+
+
+def _resolve_db_path(db_path_value: Optional[str] = None, project_root: Optional[Path] = None) -> Path:
+    base_dir = project_root or _project_root()
+    raw_value = str(db_path_value or "ids_history.db").strip() or "ids_history.db"
+    candidate = Path(raw_value).expanduser()
+    if not candidate.is_absolute():
+        candidate = base_dir / candidate
+
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    return candidate.resolve()
 
 
 def get_engine():
     """Отримання engine бази даних"""
-    global _engine
+    global _engine, _engine_db_path, _SessionLocal
+    resolved_db_path = _resolve_db_path(_read_db_path_setting())
     
+    if _engine is not None and _engine_db_path is not None and _engine_db_path != resolved_db_path:
+        try:
+            _engine.dispose()
+        except Exception:
+            pass
+        _engine = None
+        _SessionLocal = None
+
     if _engine is None:
-        # Check settings — читаємо з того ж місця що і SettingsService (src/services/)
-        settings_path = Path(__file__).parent / "user_settings.json"
-        db_path = "ids_history.db"
-        if settings_path.exists():
-            try:
-                with open(settings_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    db_path = data.get("db_path", db_path)
-            except Exception:
-                pass
-                
-        database_url = f"sqlite:///{db_path}"
-        
+        database_url = f"sqlite:///{resolved_db_path.as_posix()}"
+
         # SQLite специфічні налаштування
         _engine = create_engine(
             database_url,
@@ -45,6 +77,7 @@ def get_engine():
             },
             poolclass=None  # Вимикаємо pooling для SQLite
         )
+        _engine_db_path = resolved_db_path
     
     return _engine
 
@@ -103,22 +136,9 @@ def init_db():
     
     # Створення таблиць
     Base.metadata.create_all(bind=engine)
-    
-    # Створення директорії для бази, якщо потрібно
-    settings_path = Path(__file__).parent / "user_settings.json"
-    db_path_str = "ids_history.db"
-    if settings_path.exists():
-        try:
-            with open(settings_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                db_path_str = data.get("db_path", db_path_str)
-        except Exception:
-            pass
-            
-    Path(db_path_str).parent.mkdir(parents=True, exist_ok=True)
-    
+
     from loguru import logger
-    logger.info("Базу даних ініціалізовано")
+    logger.info("Базу даних ініціалізовано: {}", str(_engine_db_path) if _engine_db_path else "unknown")
 
 def drop_db():
     """

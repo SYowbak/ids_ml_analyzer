@@ -268,6 +268,135 @@ class ModelEngine:
             raise AttributeError("Поточна модель не підтримує decision_function().")
         return np.asarray(self.model.decision_function(X))
 
+    def auto_calibrate_isolation_threshold(
+        self,
+        X: pd.DataFrame,
+        y_attack_binary: Optional[np.ndarray | pd.Series] = None,
+        target_fp_rate: float = 0.01,
+    ) -> dict[str, Any]:
+        """Auto-calibrate threshold for Isolation Forest decision scores.
+
+        Returns a dict with calibration metadata and stores:
+        - self.if_threshold_
+        - self.if_threshold_mode_
+        """
+        if self.model is None:
+            raise RuntimeError("Модель не завантажена.")
+        if self.algorithm_name != "Isolation Forest" and not isinstance(self.model, IsolationForest):
+            raise ValueError("auto_calibrate_isolation_threshold підтримується лише для Isolation Forest.")
+
+        scores = np.asarray(self.decision_function(X), dtype=float).reshape(-1)
+        if scores.size == 0:
+            self.if_threshold_ = 0.0
+            self.if_threshold_mode_ = "empty_scores"
+            return {
+                "mode": self.if_threshold_mode_,
+                "threshold": float(self.if_threshold_),
+                "target_fp_rate": float(target_fp_rate),
+                "false_positive_rate": 0.0,
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+                "evaluated_points": 0,
+                "support_attack": 0,
+                "support_benign": 0,
+            }
+
+        safe_target_fp_rate = float(np.clip(float(target_fp_rate), 0.001, 0.5))
+
+        finite_mask = np.isfinite(scores)
+        if not finite_mask.any():
+            scores = np.zeros_like(scores, dtype=float)
+        elif not finite_mask.all():
+            fill_value = float(np.median(scores[finite_mask]))
+            scores = np.where(finite_mask, scores, fill_value)
+
+        labels: np.ndarray | None = None
+        if y_attack_binary is not None:
+            labels = np.asarray(y_attack_binary, dtype=int).reshape(-1)
+            if labels.shape[0] != scores.shape[0]:
+                raise ValueError(
+                    "y_attack_binary має той самий розмір, що й decision scores."
+                )
+
+        def _predict_at(threshold: float) -> np.ndarray:
+            return np.where(scores < float(threshold), 1, 0).astype(int)
+
+        def _metrics_at(threshold: float) -> dict[str, float]:
+            prediction = _predict_at(threshold)
+            if labels is None:
+                return {
+                    "false_positive_rate": float(np.mean(prediction == 1)),
+                    "precision": 0.0,
+                    "recall": 0.0,
+                    "f1": 0.0,
+                }
+
+            benign_mask = labels == 0
+            fp_rate = float(np.mean(prediction[benign_mask] == 1)) if benign_mask.any() else 0.0
+            return {
+                "false_positive_rate": fp_rate,
+                "precision": float(precision_score(labels, prediction, zero_division=0)),
+                "recall": float(recall_score(labels, prediction, zero_division=0)),
+                "f1": float(f1_score(labels, prediction, zero_division=0)),
+            }
+
+        threshold = float(np.quantile(scores, safe_target_fp_rate))
+        mode = "unsupervised_fp_quantile"
+        evaluated_points = 1
+
+        if labels is not None and labels.size > 0 and np.unique(labels).size >= 2:
+            candidate_thresholds = np.unique(np.quantile(scores, np.linspace(0.001, 0.999, 500)))
+            evaluated_points = int(candidate_thresholds.size)
+
+            best_key: tuple[float, float, float, float] | None = None
+            best_threshold: float | None = None
+
+            for candidate in candidate_thresholds:
+                metrics = _metrics_at(float(candidate))
+                if metrics["false_positive_rate"] > safe_target_fp_rate + 1e-12:
+                    continue
+                key = (
+                    float(metrics["recall"]),
+                    float(metrics["f1"]),
+                    float(metrics["precision"]),
+                    -float(metrics["false_positive_rate"]),
+                )
+                if best_key is None or key > best_key:
+                    best_key = key
+                    best_threshold = float(candidate)
+
+            if best_threshold is not None:
+                threshold = float(best_threshold)
+                mode = "supervised_fp_bound"
+            else:
+                benign_scores = scores[labels == 0]
+                if benign_scores.size > 0:
+                    threshold = float(np.quantile(benign_scores, safe_target_fp_rate))
+                else:
+                    threshold = float(np.quantile(scores, safe_target_fp_rate))
+                mode = "supervised_fallback_quantile"
+
+        final_metrics = _metrics_at(threshold)
+        attack_support = int(np.sum(labels == 1)) if labels is not None else 0
+        benign_support = int(np.sum(labels == 0)) if labels is not None else 0
+
+        self.if_threshold_ = float(threshold)
+        self.if_threshold_mode_ = str(mode)
+
+        return {
+            "mode": str(mode),
+            "threshold": float(threshold),
+            "target_fp_rate": float(safe_target_fp_rate),
+            "false_positive_rate": float(final_metrics.get("false_positive_rate", 0.0)),
+            "precision": float(final_metrics.get("precision", 0.0)),
+            "recall": float(final_metrics.get("recall", 0.0)),
+            "f1": float(final_metrics.get("f1", 0.0)),
+            "evaluated_points": int(evaluated_points),
+            "support_attack": int(attack_support),
+            "support_benign": int(benign_support),
+        }
+
     def predict_proba(self, X: pd.DataFrame) -> Optional[np.ndarray]:
         if self.model is None:
             raise RuntimeError("Модель не завантажена.")

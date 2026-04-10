@@ -33,6 +33,7 @@ from src.core.dataset_nature import (
 )
 from src.core.domain_schemas import get_schema, is_benign_label, normalize_column_name
 from src.core.model_engine import ModelEngine
+from src.core.threshold_policy import resolve_threshold_for_scan
 from src.services.threat_catalog import get_severity, get_severity_label, get_threat_info
 from src.ui.utils.table_helpers import with_row_number
 
@@ -190,25 +191,28 @@ def render_scanning_tab(services: dict[str, Any], root_dir: Path) -> None:
 
                 if model_pick_mode == "Автоматично":
                     active_model_name = str(st.session_state.get("active_model_name") or "").strip()
-                    if active_model_name and active_model_name in model_names:
-                        selected_model_name = active_model_name
-                        auto_selection_note = (
-                            "Автовибір моделі увімкнено: використано активну модель, "
-                            "оскільки вона сумісна з поточним файлом."
-                        )
-                    else:
-                        selected_model_name = model_names[0]
-                        auto_selection_note = (
-                            "Автовибір моделі увімкнено: використовується найкраща сумісна модель "
-                            "(ранжування за F1, Recall, Precision)."
-                        )
+                    selected_model_name, auto_selection_note = _choose_auto_model_name(
+                        ranked_models=ranked_models,
+                        active_model_name=active_model_name,
+                        inspection=inspection,
+                    )
                     st.session_state["scan_selected_model_name"] = selected_model_name
                     st.info(auto_selection_note)
                     if active_model_name and active_model_name != selected_model_name:
-                        st.caption(
-                            f"Активна модель {active_model_name} несумісна з файлом, "
-                            f"тому обрано: {selected_model_name}"
+                        active_manifest_present = any(
+                            str(manifest.get("name") or "") == active_model_name
+                            for manifest in ranked_models
                         )
+                        if active_manifest_present:
+                            st.caption(
+                                f"Активна модель {active_model_name} не пройшла quality-check для "
+                                f"авто-режиму на цьому типі файлу, тому обрано: {selected_model_name}"
+                            )
+                        else:
+                            st.caption(
+                                f"Активна модель {active_model_name} несумісна з файлом, "
+                                f"тому обрано: {selected_model_name}"
+                            )
                     else:
                         st.caption(f"Обрана автоматично модель: {selected_model_name}")
                 else:
@@ -235,6 +239,13 @@ def render_scanning_tab(services: dict[str, Any], root_dir: Path) -> None:
                 recommended_threshold_value, threshold_caption = _resolve_recommended_threshold(selected_manifest, inspection)
                 st.caption(threshold_caption)
                 st.caption(_build_model_params_hint(model_metadata))
+                if inspection and inspection.input_type == "pcap" and str(selected_manifest.get("algorithm") or "") == "XGBoost":
+                    raw_threshold = model_metadata.get("recommended_threshold")
+                    if isinstance(raw_threshold, (int, float)) and float(raw_threshold) > 0.35:
+                        st.warning(
+                            "Ця XGBoost-модель має дуже високий збережений поріг для PCAP, "
+                            "тому ризик пропуску атак підвищений. Для авто-режиму рекомендується Random Forest."
+                        )
 
                 model_nature_id = nature_for_dataset(selected_manifest.get("dataset_type"))
                 if file_nature_id and model_nature_id and not are_natures_compatible(model_nature_id, file_nature_id):
@@ -372,19 +383,26 @@ def render_scanning_tab(services: dict[str, Any], root_dir: Path) -> None:
                             allow_dataset_mismatch=bool(st.session_state.get("scan_allow_mismatch", False)),
                         )
                     result["duration_seconds"] = time.perf_counter() - started_at
-                    services["db"].save_scan(
+                    saved_scan_id = int(services["db"].save_scan(
                         filename=selected_path.name,
                         total=result["total_records"],
                         anomalies=result["anomalies_count"],
                         risk_score=result["risk_score"],
                         model_name=selected_model_name,
                         duration=result["duration_seconds"],
-                    )
+                    ))
+                    result["history_saved"] = bool(saved_scan_id >= 0)
+                    result["history_record_id"] = int(saved_scan_id) if saved_scan_id >= 0 else None
                     if settings_service is not None:
                         settings_service.set("anomaly_threshold", float(effective_sensitivity))
                     st.session_state.scan_result = result
                     st.session_state.scan_result_signature = current_signature
                     st.success("Сканування завершено.")
+                    if not bool(result.get("history_saved", False)):
+                        st.warning(
+                            "Сканування виконано, але збереження в історію не вдалося. "
+                            "Перевірте стан SQLite та права доступу до файлу БД."
+                        )
                 except Exception as exc:
                     st.session_state.scan_result = None
                     st.session_state.scan_result_signature = None
@@ -563,6 +581,93 @@ def _rank_model_manifests(manifests: list[dict[str, Any]]) -> list[dict[str, Any
     )
 
 
+def _is_model_safe_for_auto_selection(manifest: dict[str, Any], inspection: Any) -> bool:
+    if inspection is None or str(getattr(inspection, "input_type", "")) != "pcap":
+        return True
+
+    dataset_type = str(manifest.get("dataset_type") or "")
+    inspection_dataset_type = str(getattr(inspection, "dataset_type", "") or "")
+    if dataset_type != inspection_dataset_type:
+        return False
+
+    algorithm = str(manifest.get("algorithm") or "")
+    metadata = manifest.get("metadata") or {}
+
+    if algorithm == "Random Forest":
+        return True
+    if algorithm == "Isolation Forest":
+        return bool(metadata.get("trained_on_pcap_metrics", False))
+    if algorithm == "XGBoost":
+        recommended = metadata.get("recommended_threshold")
+        if isinstance(recommended, (int, float)):
+            return float(recommended) <= 0.35
+        return False
+
+    return True
+
+
+def _choose_auto_model_name(
+    ranked_models: list[dict[str, Any]],
+    active_model_name: str,
+    inspection: Any,
+) -> tuple[str, str]:
+    if not ranked_models:
+        raise ValueError("Для авто-вибору моделі потрібен непорожній список ranked_models.")
+
+    model_names = [str(manifest.get("name") or "") for manifest in ranked_models]
+    safe_ranked_models = [
+        manifest
+        for manifest in ranked_models
+        if _is_model_safe_for_auto_selection(manifest, inspection)
+    ]
+    if safe_ranked_models:
+        fallback_name = str(safe_ranked_models[0].get("name") or "")
+    else:
+        fallback_name = model_names[0]
+
+    if not active_model_name or active_model_name not in model_names:
+        if safe_ranked_models:
+            return (
+                fallback_name,
+                "Автовибір моделі увімкнено: використовується найкраща сумісна і безпечна модель "
+                "(ранжування за F1, Recall, Precision).",
+            )
+        return (
+            fallback_name,
+            "Автовибір моделі увімкнено: модель, що пройшла quality-check, не знайдена; "
+            "використовується найкраща сумісна модель за метриками.",
+        )
+
+    active_manifest = next(
+        (manifest for manifest in ranked_models if str(manifest.get("name") or "") == active_model_name),
+        None,
+    )
+    if active_manifest and _is_model_safe_for_auto_selection(active_manifest, inspection):
+        return (
+            active_model_name,
+            "Автовибір моделі увімкнено: використано активну модель, "
+            "оскільки вона сумісна з поточним файлом і пройшла quality-check.",
+        )
+
+    if not safe_ranked_models:
+        for manifest in ranked_models:
+            candidate_name = str(manifest.get("name") or "")
+            if candidate_name and candidate_name != active_model_name:
+                fallback_name = candidate_name
+                break
+        return (
+            fallback_name,
+            "Автовибір моделі увімкнено: активну модель відхилено quality-check, "
+            "але альтернативи, що пройшли quality-check, відсутні; обрано найближчий сумісний fallback.",
+        )
+
+    return (
+        fallback_name,
+        "Автовибір моделі увімкнено: активну модель пропущено через ризик "
+        "некоректної детекції на поточному типі файлу; використовується найкраща безпечна модель.",
+    )
+
+
 def _render_params_inline(params: dict[str, Any], max_items: int = 6) -> str:
     if not params:
         return "-"
@@ -587,53 +692,8 @@ def _build_model_params_hint(metadata: dict[str, Any]) -> str:
 
 
 def _resolve_recommended_threshold(manifest: dict[str, Any], inspection: Any) -> tuple[float, str]:
-    metadata = manifest.get("metadata") or {}
-    recommended_threshold = metadata.get("recommended_threshold")
-    threshold_value = float(recommended_threshold) if isinstance(recommended_threshold, (int, float)) else 0.30
-    dataset_type = str(manifest.get("dataset_type", ""))
-    algorithm = str(manifest.get("algorithm", ""))
-
-    if inspection and inspection.input_type == "pcap" and dataset_type == "CIC-IDS":
-        if algorithm == "Random Forest":
-            return 0.20, "Рекомендований поріг для цієї моделі: 0.20 (PCAP override для CIC Random Forest)"
-        if algorithm == "XGBoost":
-            hard_case_sources = metadata.get("cic_hard_case_reference_sources")
-            if isinstance(hard_case_sources, list) and hard_case_sources:
-                adjusted = max(threshold_value, 0.20)
-                return adjusted, (
-                    f"Рекомендований поріг для цієї моделі: {adjusted:.2f} "
-                    "(PCAP stability override для CIC XGBoost з hard-case референсами)"
-                )
-            return 0.05, "Рекомендований поріг для цієї моделі: 0.05 (PCAP override для CIC XGBoost)"
-
-    if inspection and inspection.input_type == "csv":
-        if dataset_type == "CIC-IDS" and algorithm in {"Random Forest", "XGBoost"}:
-            adjusted = min(threshold_value, 0.02)
-            return adjusted, (
-                f"Рекомендований поріг для цієї моделі: {adjusted:.2f} "
-                "(CIC CSV override для покриття рідкісних атак)"
-            )
-        if dataset_type == "NSL-KDD":
-            adjusted = min(threshold_value, 0.05)
-            return adjusted, (
-                f"Рекомендований поріг для цієї моделі: {adjusted:.2f} "
-                "(SIEM override для кращого покриття рідкісних атак NSL-KDD)"
-            )
-        if dataset_type == "UNSW-NB15":
-            model_name = str(manifest.get("name") or "").lower()
-            if "seed_balanced" in model_name:
-                adjusted = min(threshold_value, 0.20)
-                return adjusted, (
-                    f"Рекомендований поріг для цієї моделі: {adjusted:.2f} "
-                    "(SIEM override для стабільного покриття UNSW-NB15 seed_balanced)"
-                )
-            adjusted = min(max(threshold_value, 0.01), 0.99)
-            return adjusted, (
-                f"Рекомендований поріг для цієї моделі: {adjusted:.2f} "
-                "(використано поріг, збережений у метаданих моделі UNSW-NB15)"
-            )
-
-    return threshold_value, f"Рекомендований поріг для цієї моделі: {threshold_value:.2f}"
+    threshold_value, caption, _ = resolve_threshold_for_scan(manifest=manifest, inspection=inspection)
+    return float(threshold_value), str(caption)
 
 
 def _resolve_effective_sensitivity(
@@ -668,16 +728,37 @@ def _validate_csv_against_model(csv_path: Path, metadata: dict[str, Any]) -> str
         return "Модель не містить dataset_type у metadata."
 
     schema = get_schema(dataset_type)
-    expected = set(metadata.get("expected_features", []))
-    allowed_extras = set(schema.target_aliases) | {"target_label"}
+    expected_raw = metadata.get("expected_features")
+    if not isinstance(expected_raw, list) or not expected_raw:
+        return "Модель не містить expected_features у metadata."
+
+    expected = {
+        normalize_column_name(column)
+        for column in expected_raw
+        if str(column).strip()
+    }
+    if not expected:
+        return "Модель не містить expected_features у metadata."
+
+    allowed_extras = set(schema.target_aliases) | {
+        "target_label",
+        "src_ip",
+        "dst_ip",
+        "src_port",
+        "dst_port",
+        "protocol",
+    }
 
     candidate_features = {column for column in normalized_columns if column not in allowed_extras}
     missing = sorted(expected - candidate_features)
+    unexpected = sorted(candidate_features - expected)
 
-    if missing:
+    if missing or unexpected:
         message_parts: list[str] = []
         if missing:
             message_parts.append("відсутні: " + ", ".join(missing[:8]))
+        if unexpected:
+            message_parts.append("зайві: " + ", ".join(unexpected[:8]))
         return "CSV не збігається зі схемою моделі: " + "; ".join(message_parts) + "."
 
     return None
@@ -739,7 +820,7 @@ def _build_top_table(
     frame: pd.DataFrame,
     column: str,
     value_label: str,
-    top_n: int = 10,
+    top_n: int | None = None,
 ) -> pd.DataFrame:
     if column not in frame.columns or not _is_informative_series(frame[column]):
         return pd.DataFrame(columns=[value_label, "Кількість"])
@@ -749,7 +830,10 @@ def _build_top_table(
     if series.empty:
         return pd.DataFrame(columns=[value_label, "Кількість"])
 
-    table = series.value_counts().head(top_n).reset_index()
+    counts = series.value_counts().sort_values(ascending=False)
+    if isinstance(top_n, int) and top_n > 0:
+        counts = counts.head(top_n)
+    table = counts.reset_index()
     table.columns = [value_label, "Кількість"]
     return table
 
@@ -790,6 +874,13 @@ def _build_family_indicator_tables(
             ("Найчастіші TCP прапори", "flag", "Прапор"),
             ("Найпоширеніші типи аномалій", "attack_name", "Тип аномалії"),
         ]
+    elif family == "UNSW-NB15":
+        candidates = [
+            ("Найчастіші протоколи", "proto", "Протокол"),
+            ("Найчастіші сервіси", "service", "Сервіс"),
+            ("Найчастіші стани з'єднань", "state", "Стан"),
+            ("Найпоширеніші типи аномалій", "attack_name", "Тип аномалії"),
+        ]
     else:
         candidates = [
             ("Найбільш атаковані IP-адреси", "src_ip", "IP"),
@@ -799,11 +890,141 @@ def _build_family_indicator_tables(
         ]
 
     for title, column, value_label in candidates:
-        table = _build_top_table(alerts_only, column, value_label=value_label, top_n=10)
+        table = _build_top_table(alerts_only, column, value_label=value_label)
         if not table.empty:
             tables.append((title, table))
 
     return tables
+
+
+def _adaptive_chart_candidates(dataset_type: str) -> list[tuple[str, str, str]]:
+    family = str(dataset_type or "")
+    if family == "NSL-KDD":
+        return [
+            ("Розподіл аномалій за протоколами", "protocol_type", "Протокол"),
+            ("Розподіл аномалій за сервісами", "service", "Сервіс"),
+            ("Розподіл аномалій за TCP прапорами", "flag", "Прапор"),
+        ]
+    if family == "UNSW-NB15":
+        return [
+            ("Розподіл аномалій за протоколами", "proto", "Протокол"),
+            ("Розподіл аномалій за сервісами", "service", "Сервіс"),
+            ("Розподіл аномалій за станами сесій", "state", "Стан"),
+        ]
+    return [
+        ("Розподіл аномалій за IP джерела", "src_ip", "IP джерела"),
+        ("Розподіл аномалій за портами призначення", "dst_port", "Порт призначення"),
+        ("Розподіл аномалій за протоколами", "protocol", "Протокол"),
+    ]
+
+
+def _render_adaptive_report_charts(
+    details_df: pd.DataFrame,
+    alerts_only: pd.DataFrame,
+    dataset_type: str,
+    risk_score: float,
+) -> None:
+    if details_df is None or details_df.empty:
+        st.info("Недостатньо даних для побудови графіків.")
+        return
+
+    alerts_count = int(details_df["is_alert"].sum()) if "is_alert" in details_df.columns else int(len(alerts_only))
+    normal_count = max(int(len(details_df)) - alerts_count, 0)
+
+    summary_col1, summary_col2 = st.columns(2)
+    with summary_col1:
+        share_df = pd.DataFrame(
+            {
+                "Категорія": ["Аномалії", "Нормальні записи"],
+                "Кількість": [alerts_count, normal_count],
+            }
+        )
+        share_figure = px.pie(
+            share_df,
+            names="Категорія",
+            values="Кількість",
+            hole=0.55,
+            title="Співвідношення аномалій і нормальних записів",
+            color="Категорія",
+            color_discrete_map={"Аномалії": "#d62728", "Нормальні записи": "#2ca02c"},
+        )
+        share_figure.update_layout(margin=dict(l=10, r=10, t=50, b=10), height=360)
+        st.plotly_chart(share_figure, width="stretch")
+
+    with summary_col2:
+        if "severity" in details_df.columns and _is_informative_series(details_df["severity"]):
+            severity_order = _severity_order()
+            severity_table = (
+                details_df["severity"].astype(str).value_counts().reset_index(name="Кількість")
+            )
+            severity_table.columns = ["Критичність", "Кількість"]
+            severity_table["_rank"] = severity_table["Критичність"].map(lambda value: severity_order.get(str(value), -1))
+            severity_table = severity_table.sort_values("_rank", ascending=False).drop(columns=["_rank"])
+            severity_figure = px.bar(
+                severity_table,
+                x="Критичність",
+                y="Кількість",
+                title="Розподіл подій за критичністю",
+                text="Кількість",
+            )
+            severity_figure.update_layout(margin=dict(l=10, r=10, t=50, b=10), height=360)
+            st.plotly_chart(severity_figure, width="stretch")
+        else:
+            st.info("Немає інформативних даних критичності для побудови графіка.")
+
+    if "confidence" in details_df.columns and _is_informative_series(details_df["confidence"]):
+        confidence_frame = details_df.copy()
+        confidence_frame["Тип запису"] = "Записи"
+        if "is_alert" in confidence_frame.columns:
+            confidence_frame["Тип запису"] = np.where(
+                confidence_frame["is_alert"].astype(bool),
+                "Аномалія",
+                "Норма",
+            )
+
+        confidence_figure = px.histogram(
+            confidence_frame,
+            x="confidence",
+            color="Тип запису",
+            nbins=25,
+            opacity=0.75,
+            barmode="overlay",
+            title="Розподіл впевненості моделі",
+            labels={"confidence": "Впевненість", "count": "Кількість"},
+        )
+        confidence_figure.update_layout(margin=dict(l=10, r=10, t=50, b=10), height=360)
+        st.plotly_chart(confidence_figure, width="stretch")
+
+    st.caption(
+        f"Поточний risk score: {float(risk_score):.2f}%. Графіки вище допомагають швидко оцінити масштаб і структуру інциденту."
+    )
+
+    source_frame = alerts_only if not alerts_only.empty else details_df
+    available_charts: list[tuple[str, str, pd.DataFrame]] = []
+    for title, column, value_label in _adaptive_chart_candidates(dataset_type):
+        table = _build_top_table(source_frame, column, value_label=value_label)
+        if not table.empty:
+            available_charts.append((title, value_label, table))
+
+    if not available_charts:
+        st.info("Немає інформативних полів для доменно-адаптивних графіків у цьому звіті.")
+        return
+
+    chart_columns = st.columns(min(3, len(available_charts)))
+    for idx, (title, value_label, table) in enumerate(available_charts[:3]):
+        with chart_columns[idx]:
+            ordered_table = table.sort_values("Кількість", ascending=True).copy()
+            chart_height = int(min(760, max(360, 120 + 26 * len(ordered_table))))
+            entity_figure = px.bar(
+                ordered_table,
+                x="Кількість",
+                y=value_label,
+                orientation="h",
+                title=title,
+                text="Кількість",
+            )
+            entity_figure.update_layout(margin=dict(l=10, r=10, t=50, b=10), height=chart_height)
+            st.plotly_chart(entity_figure, width="stretch")
 
 
 def _normalize_attack_display_name(label: Any, algorithm: str | None = None) -> str:
@@ -932,6 +1153,63 @@ def _build_incident_action_plan(
                     ),
                 }
             )
+    elif family == "UNSW-NB15":
+        top_proto = _top_value_stats(alerts_only, "proto")
+        if top_proto is not None:
+            proto, count, share = top_proto
+            proto_action = {
+                "tcp": "Перевірте різкі сплески TCP-сеансів, нетипові SYN/ACK профілі та ACL для критичних сегментів.",
+                "udp": "Перевірте UDP burst-патерни та підсиліть rate-limit для сервісів із високою частотою пакетів.",
+                "icmp": "Перевірте ICMP scan/flood активність і застосуйте ICMP rate-limit на периметрі.",
+            }.get(proto.lower(), f"Перевірте аномальний профіль протоколу {proto} у SIEM/NetFlow кореляціях.")
+            plan_rows.append(
+                {
+                    "Пріоритет": "P1" if share >= 35.0 else "P2",
+                    "Дія": proto_action,
+                    "Чому це важливо зараз": (
+                        f"Протокол {proto} домінує у {count:,} подіях ({share:.1f}% аномалій)."
+                    ),
+                }
+            )
+
+        top_service = _top_value_stats(alerts_only, "service")
+        if top_service is not None:
+            service, count, share = top_service
+            sensitive_services = {"ftp", "ftp-data", "http", "https", "smtp", "dns", "ssh"}
+            if service.lower() in sensitive_services:
+                service_action = (
+                    f"Посильте контроль сервісу {service}: обмеження джерел, MFA/lockout та підвищений аудит подій доступу."
+                )
+            else:
+                service_action = f"Перевірте нетиповий профіль сервісу {service} і відповідні правила доступу."
+            plan_rows.append(
+                {
+                    "Пріоритет": "P1" if share >= 30.0 else "P2",
+                    "Дія": service_action,
+                    "Чому це важливо зараз": (
+                        f"Сервіс {service} присутній у {count:,} подіях ({share:.1f}% аномалій)."
+                    ),
+                }
+            )
+
+        top_state = _top_value_stats(alerts_only, "state")
+        if top_state is not None:
+            state, count, share = top_state
+            state_action = {
+                "CON": "Перевірте довгі/сталі з'єднання з підозрілими джерелами та обмежте lateral-path доступ.",
+                "FIN": "Перевірте аномально часті завершення сесій і кореляцію з помилками автентифікації.",
+                "INT": "Перевірте перервані сесії: можливі скани, блокування FW або спроби обходу політик.",
+                "REQ": "Перевірте масові запити до одного сервісу: можливий brute-force або reconnaissance.",
+            }.get(state.upper(), f"Перевірте аномальний стан з'єднань {state} у SIEM-кореляціях.")
+            plan_rows.append(
+                {
+                    "Пріоритет": "P1" if share >= 30.0 else "P2",
+                    "Дія": state_action,
+                    "Чому це важливо зараз": (
+                        f"Стан {state} спостерігається у {count:,} подіях ({share:.1f}% аномалій)."
+                    ),
+                }
+            )
     else:
         if "src_ip" in alerts_only.columns and _is_informative_series(alerts_only["src_ip"]):
             top_src = (
@@ -1039,6 +1317,11 @@ def _build_audience_summaries(
         soc_text = (
             "NSL-KDD: фокусуйте triage на protocol_type/service/flag та аномальних шаблонах сесій, "
             "бо IP/порт-поля часто відсутні."
+        )
+    elif str(dataset_type) == "UNSW-NB15":
+        soc_text = (
+            "UNSW-NB15: фокусуйте triage на proto/service/state, інтенсивності потоків та поведінкових патернах, "
+            "оскільки прямі IP/порт індикатори можуть бути обмежені."
         )
     else:
         soc_text = (
@@ -1338,6 +1621,11 @@ def _run_scan(
 def _render_scan_result(result: dict[str, Any]) -> None:
     st.divider()
     st.subheader("РОЗДІЛ 1 — ЗВЕДЕННЯ", anchor=False)
+    if result.get("history_saved") is False:
+        st.warning(
+            "Цей результат не був збережений в історію через помилку БД. "
+            "Дані відображаються в поточній сесії, але можуть бути втрачені після перезапуску."
+        )
     st.caption(
         f"Файл: {result['file_name']} | Датасет: {result['dataset_type']} | "
         f"Модель: {result['model_name']} | Алгоритм: {result['algorithm']}"
@@ -1417,6 +1705,11 @@ def _render_scan_result(result: dict[str, Any]) -> None:
         "src_port": "Порт джерела",
         "dst_port": "Порт призначення",
         "protocol": "Протокол",
+        "protocol_type": "Протокол (NSL)",
+        "proto": "Протокол (UNSW)",
+        "service": "Сервіс",
+        "flag": "TCP прапор",
+        "state": "Стан з'єднання",
         "attack_name": "Назва аномалії",
         "detection_reason": "Пояснення детекції",
         "confidence": "Ймовірність",
@@ -1447,7 +1740,15 @@ def _render_scan_result(result: dict[str, Any]) -> None:
     st.subheader("РОЗДІЛ 2 — ДЕТАЛІ АТАК", anchor=False)
     st.dataframe(with_row_number(details_view.head(500)), width="stretch", hide_index=True)
 
-    st.subheader("РОЗДІЛ 3 — КЛЮЧОВІ ІНДИКАТОРИ", anchor=False)
+    st.subheader("РОЗДІЛ 3 — ВІЗУАЛІЗАЦІЯ РИЗИКУ", anchor=False)
+    _render_adaptive_report_charts(
+        details_df=details_df,
+        alerts_only=alerts_only,
+        dataset_type=dataset_type,
+        risk_score=float(result.get("risk_score", 0.0)),
+    )
+
+    st.subheader("РОЗДІЛ 4 — КЛЮЧОВІ ІНДИКАТОРИ", anchor=False)
     indicator_tables = _build_family_indicator_tables(alerts_only=alerts_only, dataset_type=dataset_type)
     if indicator_tables:
         primary = indicator_tables[:3]
@@ -1466,7 +1767,7 @@ def _render_scan_result(result: dict[str, Any]) -> None:
 
     timeline_column = "timestamp" if "timestamp" in details_df.columns else ("time" if "time" in details_df.columns else None)
     if timeline_column and details_df[timeline_column].notna().any():
-        st.subheader("РОЗДІЛ 4 — ХРОНОЛОГІЯ", anchor=False)
+        st.subheader("РОЗДІЛ 5 — ХРОНОЛОГІЯ", anchor=False)
         timeline = details_df.copy()
         try:
             timeline[timeline_column] = pd.to_datetime(
@@ -1493,7 +1794,7 @@ def _render_scan_result(result: dict[str, Any]) -> None:
                 st.caption(f"Піки активності: максимум {int(timeline_counts['attacks'].max())} атак за інтервал.")
             
 
-    st.subheader("РОЗДІЛ 5 — РЕКОМЕНДАЦІЇ", anchor=False)
+    st.subheader("РОЗДІЛ 6 — РЕКОМЕНДАЦІЇ", anchor=False)
     if alerts_only.empty:
         st.success("Аномалій не виявлено. Додаткові дії не потрібні.")
     else:
@@ -1510,9 +1811,9 @@ def _render_scan_result(result: dict[str, Any]) -> None:
             st.dataframe(with_row_number(action_plan), width="stretch", hide_index=True)
 
         st.markdown("**Точкові рекомендації за типами загроз**")
-        top_attack_types = alerts_only["attack_label_raw"].astype(str).value_counts().head(5)
+        attack_types_sorted = alerts_only["attack_label_raw"].astype(str).value_counts().sort_values(ascending=False)
         rendered_lines = 0
-        for raw_attack_name in top_attack_types.index.tolist():
+        for raw_attack_name in attack_types_sorted.index.tolist():
             display_attack_name = _normalize_attack_display_name(raw_attack_name, str(result.get("algorithm", "")))
             if _is_generic_attack_name(display_attack_name):
                 continue
@@ -1524,10 +1825,13 @@ def _render_scan_result(result: dict[str, Any]) -> None:
 
         if rendered_lines == 0:
             if dataset_type == "NSL-KDD":
-                st.markdown("- Для NSL-KDD орієнтуйтесь на аномальні комбінації protocol_type/service/flag та пікові класи сервісів із розділу 3.")
+                st.markdown("- Для NSL-KDD орієнтуйтесь на аномальні комбінації protocol_type/service/flag та пікові класи сервісів із розділу 4.")
                 st.markdown("- Для user-friendly контролю: якщо ризик > 15%, варто обмежити зовнішній доступ до чутливих сервісів до завершення triage.")
+            elif dataset_type == "UNSW-NB15":
+                st.markdown("- Для UNSW-NB15 орієнтуйтесь на аномальні комбінації proto/service/state та частотні патерни з розділу 4.")
+                st.markdown("- Якщо ризик > 15%, пріоритезуйте перевірку сервісів із найбільшим внеском у аномалії та обмежте доступ до них до завершення triage.")
             else:
-                st.markdown("- Для цього набору немає надійної деталізації типів атак; пріоритезуйте дії за IP/портами та часовими піками із розділів 3-4.")
+                st.markdown("- Для цього набору немає надійної деталізації типів атак; пріоритезуйте дії за IP/портами та часовими піками із розділів 4-5.")
 
     with st.expander("Приклад результатів", expanded=False):
         preview = result.get("result_preview")
