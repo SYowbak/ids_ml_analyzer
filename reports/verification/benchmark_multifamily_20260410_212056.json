@@ -1,0 +1,17 @@
+{
+  "generated_at_utc": "2026-04-10T21:20:56.356748+00:00",
+  "rows": 29,
+  "poor_rows": 0,
+  "ok_rows": 29,
+  "families": [
+    "CIC-IDS",
+    "NSL-KDD",
+    "UNSW-NB15"
+  ],
+  "algorithms": [
+    "Isolation Forest",
+    "Random Forest",
+    "XGBoost"
+  ],
+  "report_csv": "E:\\IDS_ML_Analyzer\\reports\\verification\\benchmark_multifamily_20260410_212056.csv"
+}

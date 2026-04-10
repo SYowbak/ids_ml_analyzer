@@ -1,0 +1,30 @@
+﻿dataset_family,input_file,input_type,algorithm,model_name,threshold,total_records,anomalies,actual_risk_pct,expected_risk_pct,abs_error_pct,quality
+CIC-IDS,benchmark_mix_20pct_attack_packets.pcap,pcap,Random Forest,cic_ids_random_forest_20260410_211815.joblib,0.24,60,15,25.0,20.0,5.0,OK
+CIC-IDS,benchmark_mix_20pct_attack_packets.pcap,pcap,XGBoost,cic_ids_xgboost_20260410_211940.joblib,0.44,60,16,26.67,20.0,6.67,OK
+CIC-IDS,benchmark_mix_20pct_attack_packets.pcap,pcap,Isolation Forest,cic_ids_isolation_forest_20260410_212021.joblib,0.01,60,12,20.0,20.0,0.0,OK
+CIC-IDS,Public_Benign_HTTP.pcap,pcap,Random Forest,cic_ids_random_forest_20260410_211815.joblib,0.24,1,0,0.0,0.0,0.0,OK
+CIC-IDS,Public_Benign_HTTP.pcap,pcap,XGBoost,cic_ids_xgboost_20260410_211940.joblib,0.44,1,0,0.0,0.0,0.0,OK
+CIC-IDS,Public_Benign_HTTP.pcap,pcap,Isolation Forest,cic_ids_isolation_forest_20260410_212021.joblib,0.01,1,0,0.0,0.0,0.0,OK
+CIC-IDS,CIC-IDS2017_WebAttack_10pct_anomaly.csv,csv,Random Forest,cic_ids_random_forest_20260410_211815.joblib,0.24,1000,105,10.5,10.0,0.5,OK
+CIC-IDS,CIC-IDS2017_WebAttack_10pct_anomaly.csv,csv,XGBoost,cic_ids_xgboost_20260410_211940.joblib,0.44,1000,107,10.7,10.0,0.7,OK
+CIC-IDS,CIC-IDS2017_WebAttack_10pct_anomaly.csv,csv,Isolation Forest,cic_ids_isolation_forest_20260410_212021.joblib,0.01,1000,120,12.0,10.0,2.0,OK
+CIC-IDS,CIC-IDS2017_DDoS_50pct_anomaly.csv,csv,Random Forest,cic_ids_random_forest_20260410_211815.joblib,0.24,1000,501,50.1,50.0,0.1,OK
+CIC-IDS,CIC-IDS2017_DDoS_50pct_anomaly.csv,csv,XGBoost,cic_ids_xgboost_20260410_211940.joblib,0.44,1000,501,50.1,50.0,0.1,OK
+CIC-IDS,CIC-IDS2017_DDoS_50pct_anomaly.csv,csv,Isolation Forest,cic_ids_isolation_forest_20260410_212021.joblib,0.01,1000,422,42.2,50.0,7.8,OK
+CIC-IDS,CIC-IDS2018_FTP-BruteForce_20pct_anomaly.csv,csv,Random Forest,cic_ids_random_forest_20260410_211815.joblib,0.24,1000,212,21.2,20.0,1.2,OK
+CIC-IDS,CIC-IDS2018_FTP-BruteForce_20pct_anomaly.csv,csv,XGBoost,cic_ids_xgboost_20260410_211940.joblib,0.44,1000,228,22.8,20.0,2.8,OK
+CIC-IDS,CIC-IDS2018_FTP-BruteForce_20pct_anomaly.csv,csv,Isolation Forest,cic_ids_isolation_forest_20260410_212021.joblib,0.01,1000,120,12.0,20.0,8.0,OK
+NSL-KDD,NSL-KDD_Smurf_DoS_10pct_anomaly.csv,csv,Random Forest,nsl_kdd_random_forest_20260410_212028.joblib,0.05,500,65,13.0,10.0,3.0,OK
+NSL-KDD,NSL-KDD_Smurf_DoS_10pct_anomaly.csv,csv,XGBoost,nsl_kdd_xgboost_20260410_212033.joblib,0.05,500,61,12.2,10.0,2.2,OK
+NSL-KDD,NSL-KDD_Satan_Probe_15pct_anomaly.csv,csv,Random Forest,nsl_kdd_random_forest_20260410_212028.joblib,0.05,1000,174,17.4,15.0,2.4,OK
+NSL-KDD,NSL-KDD_Satan_Probe_15pct_anomaly.csv,csv,XGBoost,nsl_kdd_xgboost_20260410_212033.joblib,0.05,1000,168,16.8,15.0,1.8,OK
+NSL-KDD,NSL-KDD_Neptune_DoS_20pct_anomaly.csv,csv,Random Forest,nsl_kdd_random_forest_20260410_212028.joblib,0.05,1000,224,22.4,20.0,2.4,OK
+NSL-KDD,NSL-KDD_Neptune_DoS_20pct_anomaly.csv,csv,XGBoost,nsl_kdd_xgboost_20260410_212033.joblib,0.05,1000,218,21.8,20.0,1.8,OK
+UNSW-NB15,UNSW_NB15_Fuzzers_10pct_anomaly.csv,csv,Random Forest,unsw_nb15_random_forest_20260410_212042.joblib,0.86,1000,75,7.5,10.0,2.5,OK
+UNSW-NB15,UNSW_NB15_Fuzzers_10pct_anomaly.csv,csv,XGBoost,unsw_nb15_xgboost_20260410_212049.joblib,0.93,1000,70,7.0,10.0,3.0,OK
+UNSW-NB15,UNSW_NB15_DoS_20pct_anomaly.csv,csv,Random Forest,unsw_nb15_random_forest_20260410_212042.joblib,0.86,1000,207,20.7,20.0,0.7,OK
+UNSW-NB15,UNSW_NB15_DoS_20pct_anomaly.csv,csv,XGBoost,unsw_nb15_xgboost_20260410_212049.joblib,0.93,1000,203,20.3,20.0,0.3,OK
+UNSW-NB15,UNSW_NB15_Exploits_30pct_anomaly.csv,csv,Random Forest,unsw_nb15_random_forest_20260410_212042.joblib,0.86,1000,300,30.0,30.0,0.0,OK
+UNSW-NB15,UNSW_NB15_Exploits_30pct_anomaly.csv,csv,XGBoost,unsw_nb15_xgboost_20260410_212049.joblib,0.93,1000,295,29.5,30.0,0.5,OK
+UNSW-NB15,UNSW_NB15_Generic_50pct_anomaly.csv,csv,Random Forest,unsw_nb15_random_forest_20260410_212042.joblib,0.86,1000,508,50.8,50.0,0.8,OK
+UNSW-NB15,UNSW_NB15_Generic_50pct_anomaly.csv,csv,XGBoost,unsw_nb15_xgboost_20260410_212049.joblib,0.93,1000,508,50.8,50.0,0.8,OK

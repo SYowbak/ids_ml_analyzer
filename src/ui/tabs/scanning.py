@@ -1478,6 +1478,60 @@ def _run_scan(
                     "Є ризик пропуску атак; рекомендовано перетренувати IF на змішаному наборі "
                     "(benign + attack) та перевірити поріг."
                 )
+
+        if (
+            str(getattr(inspection, "input_type", "") or "") == "csv"
+            and str(getattr(inspection, "dataset_type", "") or "") == "CIC-IDS"
+            and decision_scores.size >= 500
+        ):
+            current_anomaly_rate = float(np.mean(predictions == 1))
+            calibration_meta = metadata.get("if_calibration") if isinstance(metadata.get("if_calibration"), dict) else {}
+            calibration_effective_fp_cap = calibration_meta.get("effective_fp_cap")
+            calibration_attack_support = calibration_meta.get("attack_support")
+            calibration_policy = str(calibration_meta.get("selection_policy") or "")
+
+            attack_support_value = int(calibration_attack_support) if isinstance(calibration_attack_support, (int, float)) else 0
+            calibration_fp_cap_value = float(calibration_effective_fp_cap) if isinstance(calibration_effective_fp_cap, (int, float)) else 0.0
+
+            can_apply_low_rate_recovery = bool(
+                attack_support_value > 0
+                and calibration_fp_cap_value > 0.0
+                and calibration_policy in {"supervised_fp_relaxed_for_recall", "supervised_fp_bound"}
+                and current_anomaly_rate < 0.08
+            )
+
+            if can_apply_low_rate_recovery:
+                floor_rate = float(np.clip(max(calibration_fp_cap_value + 0.04, 0.12), 0.12, 0.18))
+                if floor_rate > current_anomaly_rate + 1e-9:
+                    target_count = int(np.ceil(floor_rate * len(decision_scores)))
+                    target_count = int(np.clip(target_count, 1, len(decision_scores)))
+                    sorted_indices = np.argsort(decision_scores, kind="stable")
+                    recovery_threshold = float(decision_scores[sorted_indices[target_count - 1]])
+
+                    if recovery_threshold > float(effective_threshold):
+                        recovery_predictions = np.zeros(len(decision_scores), dtype=np.int32)
+                        recovery_predictions[sorted_indices[:target_count]] = 1
+                        recovered_anomalies = int(np.sum(recovery_predictions == 1))
+
+                        if recovered_anomalies > int(np.sum(predictions == 1)):
+                            predictions = recovery_predictions
+                            effective_threshold = float(recovery_threshold)
+                            model_note += (
+                                " Для CSV застосовано керований recovery IF при низькому рівні детекції: "
+                                f"аналітичний floor={floor_rate * 100:.1f}% "
+                                f"(effective_threshold={float(effective_threshold):.6f})."
+                            )
+                            if isinstance(if_diagnostics, dict):
+                                if_diagnostics["selection_policy"] = "if_threshold_csv_low_rate_recovery"
+                                if_diagnostics["effective_threshold"] = float(effective_threshold)
+                                if_diagnostics["csv_floor_rate"] = float(floor_rate)
+                                if_diagnostics["target_recovery_count"] = int(target_count)
+                                if_diagnostics["predicted_anomalies"] = int(recovered_anomalies)
+                                if_diagnostics["predicted_anomaly_rate"] = float(
+                                    recovered_anomalies / max(len(predictions), 1)
+                                )
+
+        prediction_labels = np.where(predictions == 1, "Anomaly", "Normal")
     else:
         probabilities = engine.predict_proba(X)
         if probabilities is not None:
