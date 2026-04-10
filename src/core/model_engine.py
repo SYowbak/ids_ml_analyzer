@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 import contextlib
 import io
 import json
@@ -581,7 +581,7 @@ class ModelEngine:
             "metadata": {
                 "manifest_version": MANIFEST_VERSION,
                 "algorithm": self.algorithm_name,
-                "saved_at": datetime.utcnow().isoformat(),
+                "saved_at": datetime.now(timezone.utc).isoformat(),
                 **extra_metadata,
                 **(metadata or {}),
             },

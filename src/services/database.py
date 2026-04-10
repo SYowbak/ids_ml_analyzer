@@ -263,14 +263,14 @@ class DatabaseService:
         db = SessionLocal()
         try:
             from src.database.models import AnalysisSession
-            from datetime import datetime
+            from datetime import datetime, timezone
             
             session = db.query(AnalysisSession).filter(AnalysisSession.id == session_id).first()
             if session:
                 if status:
                     session.status = status
                     if status in ['completed', 'error']:
-                        session.completed_at = datetime.utcnow()
+                        session.completed_at = datetime.now(timezone.utc)
                 if anomalies_found is not None:
                     session.anomalies_found = anomalies_found
                 if processing_time is not None:

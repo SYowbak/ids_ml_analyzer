@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 import time
@@ -2273,7 +2273,7 @@ def _train_supervised_model(
         "labels": label_names,
     }
 
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     model_name = f"{dataset_type.lower().replace('-', '_')}_{algorithm.lower().replace(' ', '_')}_{timestamp}.joblib"
     metadata = {
         "dataset_type": dataset_type,
@@ -2409,7 +2409,7 @@ def _train_isolation_forest(
         "if_false_positive_rate": float(if_calibration.get("false_positive_rate", 0.0)),
     }
 
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     model_name = f"{dataset_type.lower().replace('-', '_')}_isolation_forest_{timestamp}.joblib"
     if_calibration_payload = {
         **if_calibration,
