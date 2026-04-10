@@ -16,7 +16,7 @@
 - Вплив: service-path міг падати або працювати непередбачувано через відсутній метод у `ModelEngine`.
 - Доказ: service-code очікував `auto_calibrate_isolation_threshold`, якого не було в engine.
 - Рішення: додати метод у `ModelEngine` із чітким контрактом.
-- Поточний стан: ВИРІШЕНО (метод додано, покрито тестами `tests/test_model_engine_if_calibration.py`).
+- Поточний стан: ВИРІШЕНО (метод додано, перевіряється runtime smoke check-ом `scripts/runtime_smoke_quality_checks.py`).
 
 ### F-03-02: Нечіткий provenance порогу між етапами навчання і сканування
 - Severity: HIGH

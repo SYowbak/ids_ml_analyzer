@@ -3,7 +3,7 @@
 SQLAlchemy ORM
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import (
@@ -15,6 +15,10 @@ from sqlalchemy.orm import relationship
 
 
 Base = declarative_base()
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class AnalysisSession(Base):
@@ -39,12 +43,12 @@ class AnalysisSession(Base):
     risk_score = Column(Float, nullable=True)  # Anomaly percentage
     processing_time = Column(Float, nullable=True)  # Час обробки в секундах
     
-    # Model reference
+    # Посилання на модель
     model_id = Column(Integer, ForeignKey('trained_models.id'), nullable=True)
     
-    # Timestamps
-    timestamp = Column(DateTime, default=datetime.utcnow)  # Used by get_history ordering
-    created_at = Column(DateTime, default=datetime.utcnow)
+    # Часові мітки
+    timestamp = Column(DateTime, default=_utcnow)  # Used by get_history ordering
+    created_at = Column(DateTime, default=_utcnow)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     
@@ -97,8 +101,8 @@ class DetectedAnomaly(Base):
     # Деталі
     raw_data = Column(Text)  # JSON рядок з повними даними
     
-    # Timestamps
-    detected_at = Column(DateTime, default=datetime.utcnow)
+    # Часові мітки
+    detected_at = Column(DateTime, default=_utcnow)
     
     # Зв'язок
     session = relationship("AnalysisSession", back_populates="anomalies")
@@ -139,8 +143,8 @@ class TrainedModel(Base):
     # Шлях до файлу
     model_path = Column(String(500), nullable=True)
     
-    # Timestamps
-    trained_at = Column(DateTime, default=datetime.utcnow)
+    # Часові мітки
+    trained_at = Column(DateTime, default=_utcnow)
     last_used_at = Column(DateTime, nullable=True)
     
     # Стан
@@ -165,8 +169,8 @@ class Alert(Base):
     # Стан
     status = Column(String(50), default='pending')  # pending, sent, acknowledged, dismissed
     
-    # Timestamps
-    created_at = Column(DateTime, default=datetime.utcnow)
+    # Часові мітки
+    created_at = Column(DateTime, default=_utcnow)
     sent_at = Column(DateTime, nullable=True)
     acknowledged_at = Column(DateTime, nullable=True)
     
@@ -185,7 +189,7 @@ class SystemConfig(Base):
     value = Column(Text, nullable=True)
     description = Column(String(255), nullable=True)
     
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
     
     def __repr__(self):
         return f"<SystemConfig(key='{self.key}')>"

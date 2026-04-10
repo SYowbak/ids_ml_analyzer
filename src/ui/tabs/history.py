@@ -11,6 +11,11 @@ from src.ui.utils.table_helpers import with_row_number
 def render_history_tab(services: dict[str, Any], root_dir: Path) -> None:
     del root_dir
 
+    db_service = services.get("db")
+    if db_service is None:
+        st.error("Сервіс бази даних недоступний. Вкладка історії тимчасово неактивна.")
+        return
+
     confirm_generation = int(st.session_state.get("history_clear_confirm_generation", 0))
     confirm_widget_key = f"history_clear_confirm_{confirm_generation}"
 
@@ -27,7 +32,11 @@ def render_history_tab(services: dict[str, Any], root_dir: Path) -> None:
             width="stretch",
             help="Видаляє всі збережені сканування з історії.",
         ):
-            deleted_sessions = int(services["db"].clear_scan_history())
+            try:
+                deleted_sessions = int(db_service.clear_scan_history())
+            except Exception as exc:
+                st.error(f"Помилка очищення історії: {exc}")
+                deleted_sessions = -1
             if deleted_sessions >= 0:
                 st.session_state["history_clear_confirm_generation"] = confirm_generation + 1
                 st.success(f"Історію очищено. Видалено сканувань: {deleted_sessions}.")
@@ -35,7 +44,12 @@ def render_history_tab(services: dict[str, Any], root_dir: Path) -> None:
             else:
                 st.error("Не вдалося очистити історію сканувань.")
 
-    history = services["db"].get_history(limit=200)
+    try:
+        history = db_service.get_history(limit=200)
+    except Exception as exc:
+        st.error(f"Не вдалося завантажити історію сканувань: {exc}")
+        return
+
     if not history:
         st.info("Історія сканувань ще порожня.")
         return

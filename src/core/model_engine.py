@@ -107,6 +107,62 @@ class ModelEngine:
         self.algorithm_name: Optional[str] = None
         self.last_training_info: dict[str, Any] = {}
 
+    def _models_root(self) -> Path:
+        return self.models_dir.resolve()
+
+    def _safe_model_name(self, raw_name: str) -> str:
+        safe_name = Path(str(raw_name or "").strip()).name
+        if safe_name in {"", ".", ".."}:
+            raise ValueError("Некоректне ім'я файлу моделі.")
+        return safe_name
+
+    def _resolve_save_destination(self, model_name: str) -> Path:
+        models_root = self._models_root()
+        safe_name = self._safe_model_name(model_name)
+        destination = (models_root / safe_name).resolve()
+        try:
+            destination.relative_to(models_root)
+        except Exception as exc:
+            raise ValueError("Шлях збереження моделі виходить за межі каталогу models.") from exc
+
+        if destination.suffix.lower() != ".joblib":
+            destination = destination.with_suffix(".joblib")
+        return destination
+
+    def _resolve_load_path(self, model_name_or_path: str) -> Path:
+        raw_value = str(model_name_or_path or "").strip()
+        if not raw_value:
+            raise ValueError("Порожнє ім'я моделі.")
+
+        models_root = self._models_root()
+        requested = Path(raw_value)
+
+        if requested.is_absolute():
+            candidate = requested.resolve()
+            try:
+                candidate.relative_to(models_root)
+            except Exception as exc:
+                raise ValueError("Завантаження моделей дозволено лише з каталогу models.") from exc
+        else:
+            safe_name = self._safe_model_name(raw_value)
+            candidate = (models_root / safe_name).resolve()
+            try:
+                candidate.relative_to(models_root)
+            except Exception as exc:
+                raise ValueError("Шлях моделі виходить за межі каталогу models.") from exc
+
+        if candidate.suffix.lower() != ".joblib":
+            candidate_with_suffix = candidate.with_suffix(".joblib")
+            if candidate_with_suffix.exists():
+                candidate = candidate_with_suffix
+            else:
+                raise ValueError("Підтримується лише завантаження .joblib моделей.")
+
+        if not candidate.exists():
+            raise FileNotFoundError(f"Модель не знайдено: {model_name_or_path}")
+
+        return candidate
+
     def _create_base_model(self, algorithm: AlgorithmType, params: Optional[dict[str, Any]] = None) -> Any:
         params = params or {}
         default_n_jobs = _resolve_training_n_jobs()
@@ -572,19 +628,25 @@ class ModelEngine:
         if self.model is None:
             raise RuntimeError("Немає моделі для збереження.")
 
-        destination = self.models_dir / model_name
+        destination = self._resolve_save_destination(model_name)
         model_payload, extra_metadata = self._serialize_model_payload(destination)
+
+        caller_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        for reserved_key in ("manifest_version", "algorithm", "saved_at"):
+            caller_metadata.pop(reserved_key, None)
+
+        normalized_metadata = {
+            **caller_metadata,
+            **extra_metadata,
+            "manifest_version": MANIFEST_VERSION,
+            "algorithm": self.algorithm_name,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+        }
 
         bundle = {
             "model": model_payload,
             "preprocessor": preprocessor,
-            "metadata": {
-                "manifest_version": MANIFEST_VERSION,
-                "algorithm": self.algorithm_name,
-                "saved_at": datetime.now(timezone.utc).isoformat(),
-                **extra_metadata,
-                **(metadata or {}),
-            },
+            "metadata": normalized_metadata,
             "algorithm_name": self.algorithm_name,
         }
 
@@ -600,11 +662,7 @@ class ModelEngine:
         return str(destination)
 
     def load_model(self, model_name_or_path: str) -> tuple[Any, Any, dict[str, Any]]:
-        path = Path(model_name_or_path)
-        if not path.exists():
-            path = self.models_dir / model_name_or_path
-        if not path.exists():
-            raise FileNotFoundError(f"Модель не знайдено: {model_name_or_path}")
+        path = self._resolve_load_path(model_name_or_path)
 
         bundle = self._load_bundle_safely(path)
 

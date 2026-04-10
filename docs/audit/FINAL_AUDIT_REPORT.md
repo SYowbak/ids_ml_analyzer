@@ -1,49 +1,47 @@
-# Фінальний звіт аудиту (Sprint 01-08)
+# Фінальний звіт аудиту (актуалізація перед здачею)
 
-Дата: 2026-04-09
-Метод: code-path аудит + runtime перевірки + тестові прогони + візуальні артефакти.
+Дата: 2026-04-10
+Метод: архітектурний аудит + code-path ревізія + реальні runtime smoke перевірки.
 
 ## Що покрито
-- точки входу та активний runtime-потік;
-- цілісність даних і схем;
-- життєвий цикл тренування та metadata контракт;
-- логіка сканування і якість рішень;
-- візуальна стабільність UI;
-- надійність storage/service шару;
-- тестова надійність і E2E-gating.
+- Архітектура: шари UI/Core/Services, точки зв'язності, помилки інтеграції.
+- Інфраструктура: quality-gate скрипти, відтворюваність запуску, синтаксична валідація.
+- UI/UX: режими навчання, пояснення повзунків, прозорість чутливості сканування.
+- Backend/ML: тренування, калібрування порогів, модельне завантаження, strict PCAP-перевірки.
+- Storage: читання налаштувань БД, обробка fallback, UTC-таймстемпи.
 
-## Підсумок
-Ядро проекту функціонально сильне, але довіра до детекції потребує жорсткої детермінізації threshold-політик і обов'язкового E2E-контролю в CI.
+## Головні блокери, які були знайдені
+1. Непрацюючий real quality gate через посилання на видалені тести.
+2. Недостатньо інформативна діагностика помилок у scan/training flow.
+3. Відсутність ранньої валідації доступності train CSV файлів.
+4. Тихий fallback при читанні db_path з user settings.
+5. Використання `datetime.utcnow()` у моделях БД.
 
-## Найкритичніші ризики (консолідовано)
-1. Drift threshold provenance між training і scanning.
-2. Історично skippable real-PCAP E2E перевірки.
-3. Ризики auto-selection fallback у scan-потоці (частково виправлено).
-4. Storage-path і persistence гарантії (частково виправлено).
-5. Нестабільність hydration під headless visual capture.
+## Що виправлено в цій ітерації
+- Перебудовано реальний gate: [scripts/real_training_quality_gate.py](scripts/real_training_quality_gate.py) тепер запускає:
+	- bootstrap моделей;
+	- compileall-перевірку синтаксису;
+	- runtime smoke QA з strict E2E.
+- Додано новий реальний QA-скрипт: [scripts/runtime_smoke_quality_checks.py](scripts/runtime_smoke_quality_checks.py).
+- Посилено діагностику сканування у [src/ui/tabs/scanning.py](src/ui/tabs/scanning.py):
+	- логування помилок inspect/load/transform;
+	- явні повідомлення при проблемному файлі/моделі;
+	- підказка впливу порогу чутливості.
+- Посилено валідацію тренування у [src/ui/tabs/training.py](src/ui/tabs/training.py):
+	- перевірка доступності та читабельності CSV до старту навчання;
+	- логування фейлів авто/ручного тренування;
+	- покращені help-пояснення повзунків у режимі експерта.
+- Усунено тихі fallback-и для налаштувань БД у [src/services/database.py](src/services/database.py).
+- Переведено UTC-таймстемпи ORM на timezone-aware реалізацію у [src/database/models.py](src/database/models.py).
+- Прибрано абсолютні шляхи з VS Code задач у [/.vscode/tasks.json](.vscode/tasks.json) і налаштувань у [/.vscode/settings.json](.vscode/settings.json).
+- Оновлено інструкції в [README.md](README.md) під фактичний QA workflow.
 
-## Що реально виправлено в коді
-- Safe auto-fallback у scan model selection.
-- Strict E2E test mode через `IDS_STRICT_E2E`.
-- Підтвердження запису scan в історію (`history_saved`).
-- Strict CSV schema precheck.
-- IF auto-calibration API в `ModelEngine`.
-- DB path normalization + engine rebind.
+## Поточний стан готовності
+- Технічний baseline для здачі стабілізовано: gate більше не посилається на неіснуючі тести.
+- Ризики прозорості помилок у ключових потоках суттєво знижено.
+- Режим strict PCAP перевірки збережено в реальному QA сценарії.
 
-## Актуальний стан тестів
-- Останній повний прогін: `pytest -q`
-- Результат: 45 passed, 3 skipped, 1 warning.
-- Strict E2E режим підтверджено: при відсутніх обов'язкових моделях тести падають (очікувана поведінка gate).
-
-## Індекс доказів
-- `FINDINGS_SPRINT_01_FOUNDATION.md`
-- `FINDINGS_SPRINT_02_DATA_SCHEMA.md`
-- `FINDINGS_SPRINT_03_TRAINING_LIFECYCLE.md`
-- `FINDINGS_SPRINT_04_SCANNING_DECISION.md`
-- `FINDINGS_SPRINT_05_UI_VISUAL.md`
-- `FINDINGS_SPRINT_06_SERVICES_STORAGE.md`
-- `FINDINGS_SPRINT_07_TESTS_RELIABILITY.md`
-- `REMEDIATION_ROADMAP.md`
-
-## Рекомендований наступний крок
-Йти не «по документах», а по коду: завершити P0 (уніфікація threshold provenance), потім додати lifecycle integration tests і закріпити strict E2E profile у CI.
+## Що лишається зробити (рекомендація після здачі)
+1. Розбити великий [src/ui/tabs/training.py](src/ui/tabs/training.py) на модулі orchestration/render/validation.
+2. Повернути/переписати повний pytest regression matrix як окремий стабільний test-suite.
+3. Додати пагінацію історії в [src/ui/tabs/history.py](src/ui/tabs/history.py) для великих обсягів записів.

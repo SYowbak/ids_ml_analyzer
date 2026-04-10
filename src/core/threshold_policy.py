@@ -28,6 +28,7 @@ def build_threshold_provenance(
     base_threshold = clamp_threshold(recommended_threshold)
     metadata = model_metadata or {}
     metrics = recommended_metrics or {}
+    selection_policy = str(metrics.get("selection_policy") or "unspecified")
 
     thresholds_by_input_type: dict[str, float] = {}
     notes_by_input_type: dict[str, str] = {}
@@ -38,8 +39,12 @@ def build_threshold_provenance(
             # when it recommends a stricter threshold for PCAP detection.
             thresholds_by_input_type["pcap"] = clamp_threshold(max(base_threshold, 0.20))
             notes_by_input_type["pcap"] = "cic_pcap_calibrated_random_forest_floor"
-            thresholds_by_input_type["csv"] = clamp_threshold(min(base_threshold, 0.02))
-            notes_by_input_type["csv"] = "cic_csv_floor_rare_attack_coverage"
+            if selection_policy == "holdout_rate_calibrated":
+                thresholds_by_input_type["csv"] = clamp_threshold(base_threshold)
+                notes_by_input_type["csv"] = "cic_csv_holdout_rate_calibrated"
+            else:
+                thresholds_by_input_type["csv"] = clamp_threshold(min(base_threshold, 0.02))
+                notes_by_input_type["csv"] = "cic_csv_floor_rare_attack_coverage"
         elif algorithm == "XGBoost":
             hard_case_sources = metadata.get("cic_hard_case_reference_sources")
             if isinstance(hard_case_sources, list) and hard_case_sources:
@@ -48,16 +53,18 @@ def build_threshold_provenance(
             else:
                 thresholds_by_input_type["pcap"] = 0.05
                 notes_by_input_type["pcap"] = "cic_pcap_floor_xgboost"
-            thresholds_by_input_type["csv"] = clamp_threshold(min(base_threshold, 0.02))
-            notes_by_input_type["csv"] = "cic_csv_floor_rare_attack_coverage"
+            if selection_policy == "holdout_rate_calibrated":
+                thresholds_by_input_type["csv"] = clamp_threshold(base_threshold)
+                notes_by_input_type["csv"] = "cic_csv_holdout_rate_calibrated"
+            else:
+                thresholds_by_input_type["csv"] = clamp_threshold(min(base_threshold, 0.02))
+                notes_by_input_type["csv"] = "cic_csv_floor_rare_attack_coverage"
     elif dataset_type == "NSL-KDD":
         thresholds_by_input_type["csv"] = clamp_threshold(min(base_threshold, 0.05))
         notes_by_input_type["csv"] = "nsl_csv_floor_rare_attack_coverage"
     elif dataset_type == "UNSW-NB15":
         thresholds_by_input_type["csv"] = clamp_threshold(base_threshold)
         notes_by_input_type["csv"] = "unsw_csv_model_threshold"
-
-    selection_policy = str(metrics.get("selection_policy") or "unspecified")
 
     return {
         "policy_id": THRESHOLD_POLICY_ID,

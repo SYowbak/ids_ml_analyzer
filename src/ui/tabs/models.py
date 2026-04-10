@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+import json
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +17,57 @@ def _safe_float(value: Any) -> float | None:
         return float(value)
     except Exception:
         return None
+
+
+def _safe_model_path(models_dir: Path, model_name: Any) -> Path | None:
+    raw_name = str(model_name or "").strip()
+    if not raw_name:
+        return None
+
+    # Використовуємо лише basename, щоб запобігти path traversal.
+    safe_name = Path(raw_name).name
+    if safe_name in {"", ".", ".."}:
+        return None
+
+    try:
+        models_root = models_dir.resolve()
+        candidate = (models_root / safe_name).resolve()
+        candidate.relative_to(models_root)
+    except Exception:
+        return None
+
+    return candidate
+
+
+def _collect_model_artifacts(models_dir: Path, model_path: Path) -> list[Path]:
+    artifacts: list[Path] = [model_path]
+    models_root = models_dir.resolve()
+    manifest_path = model_path.with_suffix(".manifest.json")
+    artifacts.append(manifest_path)
+
+    if manifest_path.exists():
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            metadata = payload.get("metadata") if isinstance(payload, dict) else None
+            xgb_meta = metadata.get("xgb_serialization") if isinstance(metadata, dict) else None
+            booster_file = str(xgb_meta.get("booster_file") or "").strip() if isinstance(xgb_meta, dict) else ""
+            if booster_file:
+                booster_path = model_path.with_name(Path(booster_file).name).resolve()
+                booster_path.relative_to(models_root)
+                artifacts.append(booster_path)
+        except Exception:
+            # Якщо sidecar пошкоджений, продовжуємо видалення основного файлу.
+            pass
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in artifacts:
+        key = str(path).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
 
 
 def _build_model_rows(manifests: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -130,10 +181,21 @@ def render_models_tab(services: dict[str, Any], root_dir: Path) -> None:
         st.dataframe(with_row_number(comparison), width="stretch", hide_index=True)
 
     action_col1, action_col2, action_col3 = st.columns(3)
+    models_dir = (root_dir / "models").resolve()
+
+    model_names = [
+        str(name)
+        for name in filtered["name"].tolist()
+        if str(name or "").strip()
+    ]
+    if not model_names:
+        st.warning("Не вдалося сформувати список моделей для керування.")
+        return
+
     with action_col1:
         model_for_activation = st.selectbox(
             "Типова модель",
-            options=filtered["name"].tolist(),
+            options=model_names,
             help="Типова модель має пріоритет у скануванні (авто- та ручний вибір) якщо сумісна з файлом.",
         )
         if st.button("Застосувати як типову", type="primary", width="stretch"):
@@ -143,7 +205,7 @@ def render_models_tab(services: dict[str, Any], root_dir: Path) -> None:
     with action_col2:
         model_for_delete = st.selectbox(
             "Видалити модель",
-            options=filtered["name"].tolist(),
+            options=model_names,
             help="Видалення прибирає модель з каталогу models/ безповоротно.",
             key="model_delete_name",
         )
@@ -154,30 +216,53 @@ def render_models_tab(services: dict[str, Any], root_dir: Path) -> None:
         )
         delete_disabled = not bool(confirm_delete)
         if st.button("Видалити", disabled=delete_disabled, width="stretch"):
-            target_path = root_dir / "models" / model_for_delete
-            if target_path.exists():
-                target_path.unlink()
-            if st.session_state.get("active_model_name") == model_for_delete:
-                st.session_state.active_model_name = None
-            st.success(f"Модель {model_for_delete} видалено.")
-            st.rerun()
+            target_path = _safe_model_path(models_dir, model_for_delete)
+            if target_path is None:
+                st.error("Некоректне ім'я моделі для видалення.")
+            else:
+                try:
+                    artifacts = _collect_model_artifacts(models_dir, target_path)
+                    deleted_count = 0
+                    for artifact in artifacts:
+                        if artifact.exists() and artifact.is_file():
+                            artifact.unlink()
+                            deleted_count += 1
+
+                    if st.session_state.get("active_model_name") == model_for_delete:
+                        st.session_state.active_model_name = None
+
+                    if deleted_count > 0:
+                        st.success(f"Модель {model_for_delete} видалено разом з {deleted_count} файлом(ами) артефактів.")
+                        st.rerun()
+                    else:
+                        st.warning("Файли моделі для видалення не знайдено.")
+                except Exception as exc:
+                    st.error(f"Не вдалося видалити модель: {exc}")
 
     with action_col3:
         model_for_download = st.selectbox(
             "Завантажити модель",
-            options=filtered["name"].tolist(),
+            options=model_names,
             help="Завантаження файлу моделі у форматі .joblib.",
             key="model_download_name",
         )
-        model_path = root_dir / "models" / model_for_download
-        if model_path.exists():
-            st.download_button(
-                "Завантажити файл",
-                data=model_path.read_bytes(),
-                file_name=model_for_download,
-                mime="application/octet-stream",
-                width="stretch",
-            )
+        model_path = _safe_model_path(models_dir, model_for_download)
+        if model_path is None:
+            st.warning("Некоректний шлях моделі для завантаження.")
+        elif model_path.exists() and model_path.is_file():
+            try:
+                payload = model_path.read_bytes()
+                st.download_button(
+                    "Завантажити файл",
+                    data=payload,
+                    file_name=model_for_download,
+                    mime="application/octet-stream",
+                    width="stretch",
+                )
+            except Exception as exc:
+                st.error(f"Не вдалося підготувати файл для завантаження: {exc}")
+        else:
+            st.info("Файл моделі не знайдено.")
 
     if active_model:
         st.caption(f"Поточна типова модель: {active_model}")

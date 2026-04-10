@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sys
 
 import streamlit as st
+from loguru import logger
 
 
 ROOT_DIR = Path(__file__).parent.parent.parent
@@ -22,6 +24,49 @@ from src.ui.tabs.home import render_home_tab
 from src.ui.tabs.models import render_models_tab
 from src.ui.tabs.scanning import render_scanning_tab
 from src.ui.tabs.training import render_training_tab
+
+
+def _configure_runtime_logging(root_dir: Path) -> None:
+    """Configure process-level logging once for Streamlit runtime diagnostics."""
+    if os.getenv("IDS_LOGGER_CONFIGURED") == "1":
+        return
+
+    logs_dir = root_dir / "reports" / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_file = logs_dir / "runtime.log"
+
+    log_level = str(os.getenv("IDS_LOG_LEVEL", "INFO")).upper()
+    logger.remove()
+    logger.add(
+        sys.stderr,
+        level=log_level,
+        backtrace=False,
+        diagnose=False,
+        enqueue=False,
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {name}:{function}:{line} | {message}",
+    )
+    logger.add(
+        str(log_file),
+        level=log_level,
+        rotation="10 MB",
+        retention=5,
+        encoding="utf-8",
+        backtrace=False,
+        diagnose=False,
+        enqueue=False,
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {name}:{function}:{line} | {message}",
+    )
+
+    os.environ["IDS_LOGGER_CONFIGURED"] = "1"
+    logger.info(
+        "Runtime logging configured. level={} log_file={} python={}",
+        log_level,
+        log_file,
+        sys.executable,
+    )
+
+
+_configure_runtime_logging(ROOT_DIR)
 
 
 def _hide_heading_anchor_icons() -> None:

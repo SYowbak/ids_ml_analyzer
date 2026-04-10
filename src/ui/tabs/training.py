@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+import re
 import time
 import uuid
 
@@ -10,6 +11,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from loguru import logger
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, precision_score, recall_score
 from sklearn.model_selection import train_test_split
 
@@ -38,6 +40,9 @@ IMPLEMENTED_ALGORITHMS = {
 
 TRAINING_UI_MODE_BEGINNER = "Простий (рекомендовано)"
 TRAINING_UI_MODE_EXPERT = "Експертний (повний контроль)"
+
+HOLDOUT_RATE_PATTERN = re.compile(r"(\d+)pct_(?:anomaly|attack)", flags=re.IGNORECASE)
+REFERENCE_EXTENSIONS = {".csv", ".pcap", ".pcapng", ".cap"}
 
 
 def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
@@ -116,11 +121,18 @@ def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
             selected_paths.extend(selected_paths_from_datasets_page)
         selected_paths = list(dict.fromkeys(selected_paths))
 
-        inspection_rows, selected_dataset_type, selection_error = _inspect_training_files(
-            loader=loader,
-            selected_paths=selected_paths,
-            selected_nature_id=selected_nature_id,
-        )
+        paths_error = _validate_training_paths(selected_paths)
+
+        if paths_error:
+            inspection_rows: list[dict[str, Any]] = []
+            selected_dataset_type = None
+            selection_error = paths_error
+        else:
+            inspection_rows, selected_dataset_type, selection_error = _inspect_training_files(
+                loader=loader,
+                selected_paths=selected_paths,
+                selected_nature_id=selected_nature_id,
+            )
 
         if inspection_rows:
             st.dataframe(with_row_number(pd.DataFrame(inspection_rows)), width="stretch", hide_index=True)
@@ -194,6 +206,8 @@ def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
             "Профіль: "
             f"{auto_max_rows_per_file if auto_max_rows_per_file > 0 else 'без обмеження'} рядків/файл, без GridSearch."
         )
+        if str(selected_beginner_algorithm) == "Isolation Forest":
+            st.caption("IF pre-check виконується під час натискання кнопки 'Навчити модель'.")
 
         auto_disabled = not selected_paths or bool(selection_error) or not selected_dataset_type
         if training_in_progress:
@@ -210,7 +224,30 @@ def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
             width="stretch",
             key="training_auto_start",
         ):
-            if not _try_begin_training_run():
+            should_start_training = True
+            if (
+                str(selected_beginner_algorithm) == "Isolation Forest"
+                and bool(selected_dataset_type)
+                and not bool(selection_error)
+            ):
+                if_readiness = _get_if_dataset_readiness(
+                    loader=loader,
+                    selected_paths=selected_paths,
+                    dataset_type=str(selected_dataset_type),
+                    max_rows_per_file=int(auto_max_rows_per_file),
+                )
+                _render_if_dataset_readiness(if_readiness)
+                if not bool(if_readiness.get("ready", False)):
+                    should_start_training = False
+                    st.error("Навчання не запущено: IF pre-check не пройдено.")
+
+            if not should_start_training:
+                logger.warning(
+                    "[TRAIN] start blocked by IF readiness pre-check in beginner mode dataset_type={} files={}",
+                    selected_dataset_type,
+                    len(selected_paths),
+                )
+            elif not _try_begin_training_run():
                 st.warning("Запуск уже виконується або щойно стартував. Подвійний клік проігноровано.")
             else:
                 progress = st.progress(0, text="Підготовка даних...")
@@ -253,6 +290,7 @@ def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
                     st.success(f"Навчено алгоритм: {selected_beginner_algorithm}.")
                 except Exception as exc:
                     st.session_state.training_result = None
+                    logger.exception("Помилка автотренування {}: {}", selected_beginner_algorithm, exc)
                     st.error(str(exc))
                 finally:
                     _finish_training_run()
@@ -340,6 +378,8 @@ def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
                 help="Частка даних, що лишається для оцінки якості моделі.",
                 key="training_test_size",
             )
+        if str(selected_algorithm) == "Isolation Forest":
+            st.caption("IF pre-check виконується під час натискання кнопки 'Запустити навчання'.")
 
         algorithm_params = _render_algorithm_parameters(selected_algorithm)
         algorithm_params["optimize_for_pcap_detection"] = bool(optimize_for_pcap_detection)
@@ -359,7 +399,30 @@ def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
             help="Запускає навчання з обраними параметрами.",
             key="training_manual_start",
         ):
-            if not _try_begin_training_run():
+            should_start_training = True
+            if (
+                str(selected_algorithm) == "Isolation Forest"
+                and bool(selected_dataset_type)
+                and not bool(selection_error)
+            ):
+                if_readiness = _get_if_dataset_readiness(
+                    loader=loader,
+                    selected_paths=selected_paths,
+                    dataset_type=str(selected_dataset_type),
+                    max_rows_per_file=int(max_rows_per_file),
+                )
+                _render_if_dataset_readiness(if_readiness)
+                if not bool(if_readiness.get("ready", False)):
+                    should_start_training = False
+                    st.error("Навчання не запущено: IF pre-check не пройдено.")
+
+            if not should_start_training:
+                logger.warning(
+                    "[TRAIN] start blocked by IF readiness pre-check in expert mode dataset_type={} files={}",
+                    selected_dataset_type,
+                    len(selected_paths),
+                )
+            elif not _try_begin_training_run():
                 st.warning("Запуск уже виконується або щойно стартував. Подвійний клік проігноровано.")
             else:
                 progress = st.progress(0, text="Підготовка даних...")
@@ -384,6 +447,7 @@ def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
                     st.success("Ручне навчання завершено успішно.")
                 except Exception as exc:
                     st.session_state.training_result = None
+                    logger.exception("Помилка ручного тренування {}: {}", selected_algorithm, exc)
                     st.error(str(exc))
                 finally:
                     _finish_training_run()
@@ -402,10 +466,12 @@ def _init_training_state() -> None:
     st.session_state.setdefault("training_click_guard_until", 0.0)
     st.session_state.setdefault("training_beginner_auto_algorithm", None)
     st.session_state.setdefault("training_expert_defaults_signature", None)
+    st.session_state.setdefault("if_readiness_cache_key", None)
+    st.session_state.setdefault("if_readiness_cache_value", None)
 
 
 def _reset_scan_result_state() -> None:
-    # New training invalidates previous scan view and avoids stale/ghosted UI output.
+    # Нове навчання скидає попередній результат сканування, щоб уникати застарілого UI-стану.
     st.session_state["scan_result"] = None
     st.session_state["scan_result_signature"] = None
 
@@ -527,12 +593,14 @@ def _recommended_safe_algorithm_params(
         params = {
             "n_estimators": 300,
             "contamination": "auto",
-            "if_target_fp_rate": 0.02,
+            "if_target_fp_rate": 0.04,
+            "if_min_unsupervised_fp_rate": 0.08,
             "if_use_attack_references": True,
-            "if_attack_reference_files": 3,
+            "if_attack_reference_files": 4,
         }
         if bool(optimize_for_pcap_detection) and str(dataset_type) == "CIC-IDS":
-            params["if_target_fp_rate"] = 0.03
+            params["if_target_fp_rate"] = 0.08
+            params["if_min_unsupervised_fp_rate"] = 0.12
             params["if_attack_reference_files"] = 6
         params["optimize_for_pcap_detection"] = bool(optimize_for_pcap_detection)
         return params
@@ -583,14 +651,14 @@ def _recommended_supervised_control_params(
 
     if dataset_type == "NSL-KDD":
         return {
-            "nsl_use_original_references": False,
+            "nsl_use_original_references": True,
             "nsl_reference_rows_per_file": int(min(effective_rows, 12000)),
             "nsl_reference_max_share": 2.0,
         }
 
     if dataset_type == "UNSW-NB15":
         return {
-            "unsw_use_original_references": False,
+            "unsw_use_original_references": True,
             "unsw_reference_rows_per_file": int(min(effective_rows, 12000)),
             "unsw_reference_max_share": 2.0,
         }
@@ -787,7 +855,7 @@ def _build_manual_param_updates(selected_algorithm: str, params: dict[str, Any])
             updates["if_contamination"] = _quantize_float_param(contamination, 0.01, 0.30, 0.01, 0.05)
 
         if "if_target_fp_rate" in params:
-            updates["if_target_fp_rate"] = _quantize_float_param(params.get("if_target_fp_rate"), 0.01, 0.03, 0.005, 0.02)
+            updates["if_target_fp_rate"] = _quantize_float_param(params.get("if_target_fp_rate"), 0.01, 0.20, 0.005, 0.04)
         if "if_use_attack_references" in params:
             updates["if_use_attack_references"] = bool(params.get("if_use_attack_references"))
         if "if_attack_reference_files" in params:
@@ -803,18 +871,262 @@ def _persist_uploaded_files(uploaded_files: list[Any] | None, destination_dir: P
 
     cache: dict[str, str] = st.session_state["training_uploaded_cache"]
     for uploaded in uploaded_files:
-        cache_key = f"{uploaded.name}:{uploaded.size}"
+        original_name = str(getattr(uploaded, "name", "") or "uploaded_file")
+        normalized_name = Path(original_name).name
+        cache_key = f"{normalized_name}:{uploaded.size}"
         cached_path = cache.get(cache_key)
         if cached_path and Path(cached_path).exists():
             persisted.append(Path(cached_path))
             continue
 
-        safe_name = uploaded.name.replace(" ", "_")
+        safe_name = normalized_name.replace(" ", "_")
         destination = destination_dir / f"{prefix}_{uuid.uuid4().hex[:8]}_{safe_name}"
         destination.write_bytes(uploaded.getbuffer())
         cache[cache_key] = str(destination)
         persisted.append(destination)
     return persisted
+
+
+def _validate_training_paths(selected_paths: list[Path]) -> str | None:
+    if not selected_paths:
+        return None
+
+    missing_or_invalid: list[str] = []
+    unreadable: list[str] = []
+
+    for path in selected_paths:
+        if not path.exists() or not path.is_file():
+            missing_or_invalid.append(path.name)
+            continue
+        try:
+            with open(path, "rb") as file_handle:
+                file_handle.read(1)
+        except Exception:
+            unreadable.append(path.name)
+
+    if missing_or_invalid:
+        preview = ", ".join(missing_or_invalid[:5])
+        suffix = "" if len(missing_or_invalid) <= 5 else ", ..."
+        return (
+            "Деякі обрані файли недоступні або не існують: "
+            f"{preview}{suffix}. Оновіть вибір файлів перед запуском навчання."
+        )
+
+    if unreadable:
+        preview = ", ".join(unreadable[:5])
+        suffix = "" if len(unreadable) <= 5 else ", ..."
+        return (
+            "Деякі обрані файли не вдалося прочитати: "
+            f"{preview}{suffix}. Перевірте права доступу і цілісність CSV."
+        )
+
+    return None
+
+
+def _evaluate_if_dataset_readiness(
+    loader: DataLoader,
+    selected_paths: list[Path],
+    dataset_type: str,
+    max_rows_per_file: int,
+) -> dict[str, Any]:
+    if dataset_type != "CIC-IDS":
+        return {
+            "ready": False,
+            "message": "Isolation Forest доступний лише для CIC-IDS (мережевий NIDS-домен).",
+            "total_rows": 0,
+            "benign_rows": 0,
+            "attack_rows": 0,
+            "unknown_rows": 0,
+            "file_rows": [],
+        }
+
+    if not selected_paths:
+        return {
+            "ready": False,
+            "message": "Оберіть хоча б один CSV із нормальним трафіком (BENIGN/Normal) для IF.",
+            "total_rows": 0,
+            "benign_rows": 0,
+            "attack_rows": 0,
+            "unknown_rows": 0,
+            "file_rows": [],
+        }
+
+    probe_rows = int(max_rows_per_file) if int(max_rows_per_file) > 0 else 30000
+    # Readiness check should be lightweight; full-size probing causes UI stalls on every Streamlit rerun.
+    probe_rows = int(np.clip(probe_rows, 2000, 12000))
+
+    total_rows = 0
+    benign_rows = 0
+    attack_rows = 0
+    unknown_rows = 0
+    load_errors: list[str] = []
+    file_rows: list[dict[str, Any]] = []
+
+    for path in selected_paths:
+        file_started_at = float(time.perf_counter())
+        try:
+            frame = loader.load_training_frame(path, expected_dataset=dataset_type, max_rows=probe_rows)
+        except Exception as exc:
+            load_errors.append(f"{path.name}: {exc}")
+            logger.warning("[IF_READY] file={} load_failed error={}", path.name, exc)
+            continue
+
+        if frame is None or frame.empty or "target_label" not in frame.columns:
+            file_rows.append(
+                {
+                    "Файл": path.name,
+                    "Рядків": 0,
+                    "BENIGN": 0,
+                    "Attack": 0,
+                    "Unknown": 0,
+                }
+            )
+            continue
+
+        target_text = frame["target_label"].astype(str).str.strip().str.lower()
+        benign_mask = frame["target_label"].map(is_benign_label)
+        unknown_mask = target_text.isin({"unknown", "", "nan", "none"})
+
+        rows_count = int(len(frame))
+        benign_count = int(benign_mask.sum())
+        unknown_count = int(unknown_mask.sum())
+        attack_count = int(rows_count - benign_count)
+
+        total_rows += rows_count
+        benign_rows += benign_count
+        unknown_rows += unknown_count
+        attack_rows += attack_count
+
+        file_rows.append(
+            {
+                "Файл": path.name,
+                "Рядків": rows_count,
+                "BENIGN": benign_count,
+                "Attack": attack_count,
+                "Unknown": unknown_count,
+            }
+        )
+        logger.info(
+            "[IF_READY] file={} rows={} benign={} attack={} unknown={} elapsed_ms={}",
+            path.name,
+            int(rows_count),
+            int(benign_count),
+            int(attack_count),
+            int(unknown_count),
+            int((time.perf_counter() - file_started_at) * 1000),
+        )
+
+    unknown_ratio = float(unknown_rows / max(total_rows, 1))
+    ready = bool(total_rows > 0 and benign_rows >= 20)
+
+    if ready:
+        message = (
+            f"Дані готові для IF: BENIGN={benign_rows}, Attack={attack_rows}, "
+            f"Unknown={unknown_rows}, перевірено рядків={total_rows}."
+        )
+    elif total_rows <= 0:
+        message = "Не вдалося отримати валідні рядки для IF. Перевірте вибрані CSV."
+    elif benign_rows <= 0 and unknown_ratio >= 0.80:
+        message = (
+            "Блок IF: у вибірці майже немає нормального трафіку, "
+            "а target_label переважно Unknown. Потрібен CSV з явними мітками BENIGN/Normal."
+        )
+    else:
+        message = (
+            "Блок IF: недостатньо нормального трафіку для навчання. "
+            f"Потрібно щонайменше 20 BENIGN-рядків, зараз знайдено {benign_rows}."
+        )
+
+    return {
+        "ready": ready,
+        "message": message,
+        "total_rows": int(total_rows),
+        "benign_rows": int(benign_rows),
+        "attack_rows": int(attack_rows),
+        "unknown_rows": int(unknown_rows),
+        "unknown_ratio": float(unknown_ratio),
+        "load_errors": load_errors,
+        "file_rows": file_rows,
+    }
+
+
+def _build_if_readiness_cache_key(
+    selected_paths: list[Path],
+    dataset_type: str,
+    max_rows_per_file: int,
+) -> tuple[str, int, tuple[tuple[str, int, int], ...]]:
+    file_fingerprint: list[tuple[str, int, int]] = []
+    for path in selected_paths:
+        try:
+            stat_info = path.stat()
+            file_fingerprint.append(
+                (
+                    str(path.resolve()).lower(),
+                    int(stat_info.st_size),
+                    int(getattr(stat_info, "st_mtime_ns", int(stat_info.st_mtime * 1_000_000_000))),
+                )
+            )
+        except Exception:
+            file_fingerprint.append((str(path).lower(), -1, -1))
+
+    file_fingerprint.sort()
+    return (str(dataset_type), int(max_rows_per_file), tuple(file_fingerprint))
+
+
+def _get_if_dataset_readiness(
+    loader: DataLoader,
+    selected_paths: list[Path],
+    dataset_type: str,
+    max_rows_per_file: int,
+) -> dict[str, Any]:
+    cache_key = _build_if_readiness_cache_key(
+        selected_paths=selected_paths,
+        dataset_type=dataset_type,
+        max_rows_per_file=max_rows_per_file,
+    )
+
+    cached_key = st.session_state.get("if_readiness_cache_key")
+    cached_value = st.session_state.get("if_readiness_cache_value")
+    if cached_key == cache_key and isinstance(cached_value, dict):
+        return dict(cached_value)
+
+    readiness = _evaluate_if_dataset_readiness(
+        loader=loader,
+        selected_paths=selected_paths,
+        dataset_type=dataset_type,
+        max_rows_per_file=max_rows_per_file,
+    )
+    st.session_state["if_readiness_cache_key"] = cache_key
+    st.session_state["if_readiness_cache_value"] = dict(readiness)
+    return readiness
+
+
+def _render_if_dataset_readiness(readiness: dict[str, Any]) -> None:
+    if not isinstance(readiness, dict):
+        return
+
+    message = str(readiness.get("message") or "")
+    if bool(readiness.get("ready", False)):
+        st.success(message)
+    else:
+        st.error(message)
+
+    st.caption(
+        "IF pre-check: "
+        f"рядків={int(readiness.get('total_rows', 0))}, "
+        f"BENIGN={int(readiness.get('benign_rows', 0))}, "
+        f"Attack={int(readiness.get('attack_rows', 0))}, "
+        f"Unknown={int(readiness.get('unknown_rows', 0))}."
+    )
+
+    file_rows = readiness.get("file_rows")
+    if isinstance(file_rows, list) and file_rows:
+        st.dataframe(with_row_number(pd.DataFrame(file_rows)), width="stretch", hide_index=True)
+
+    load_errors = readiness.get("load_errors")
+    if isinstance(load_errors, list) and load_errors:
+        for item in load_errors[:5]:
+            st.warning(f"IF pre-check: {item}")
 
 
 def _inspect_training_files(
@@ -831,7 +1143,12 @@ def _inspect_training_files(
     detected_datasets: list[str] = []
 
     for path in selected_paths:
-        inspection = loader.inspect_file(path)
+        try:
+            inspection = loader.inspect_file(path)
+        except Exception as exc:
+            logger.exception("Помилка inspect_file для тренувального файлу {}: {}", path, exc)
+            return rows, None, f"Не вдалося проаналізувати файл {path.name}: {exc}"
+
         rows.append(
             {
                 "Файл": path.name,
@@ -864,27 +1181,91 @@ def _render_algorithm_parameters(selected_algorithm: str) -> dict[str, Any]:
     if selected_algorithm == "Random Forest":
         col1, col2, col3 = st.columns(3)
         with col1:
-            params["n_estimators"] = st.slider("К-сть дерев", 100, 600, 300, 50, key="rf_n_estimators")
+            params["n_estimators"] = st.slider(
+                "К-сть дерев",
+                100,
+                600,
+                300,
+                50,
+                key="rf_n_estimators",
+                help="Більше дерев зазвичай підвищує стабільність і якість, але збільшує час навчання.",
+            )
         with col2:
-            max_depth_value = st.slider("Макс. глибина (0 = без обмеження)", 0, 40, 0, 1, key="rf_max_depth")
+            max_depth_value = st.slider(
+                "Макс. глибина (0 = без обмеження)",
+                0,
+                40,
+                0,
+                1,
+                key="rf_max_depth",
+                help="Глибші дерева краще вчать складні шаблони, але можуть перенавчатися на шумі.",
+            )
             params["max_depth"] = None if max_depth_value == 0 else max_depth_value
         with col3:
-            params["min_samples_split"] = st.slider("Мінімум зразків для розбиття", 2, 10, 2, 1, key="rf_min_split")
+            params["min_samples_split"] = st.slider(
+                "Мінімум зразків для розбиття",
+                2,
+                10,
+                2,
+                1,
+                key="rf_min_split",
+                help="Більше значення робить модель більш узагальненою, але може знизити чутливість до рідкісних атак.",
+            )
 
     elif selected_algorithm == "XGBoost":
         col1, col2, col3, col4 = st.columns(4)
         with col1:
-            params["n_estimators"] = st.slider("К-сть бустерів", 100, 600, 300, 50, key="xgb_n_estimators")
+            params["n_estimators"] = st.slider(
+                "К-сть бустерів",
+                100,
+                600,
+                300,
+                50,
+                key="xgb_n_estimators",
+                help="Більше бустерів часто покращує recall/F1, але подовжує навчання.",
+            )
         with col2:
-            params["max_depth"] = st.slider("Макс. глибина", 3, 10, 6, 1, key="xgb_max_depth")
+            params["max_depth"] = st.slider(
+                "Макс. глибина",
+                3,
+                10,
+                6,
+                1,
+                key="xgb_max_depth",
+                help="Вища глибина підсилює складність моделі, але підвищує ризик перенавчання.",
+            )
         with col3:
-            params["learning_rate"] = st.slider("Крок навчання", 0.01, 0.30, 0.05, 0.01, key="xgb_learning_rate")
+            params["learning_rate"] = st.slider(
+                "Крок навчання",
+                0.01,
+                0.30,
+                0.05,
+                0.01,
+                key="xgb_learning_rate",
+                help="Менший крок навчання зазвичай підвищує стабільність, але потребує більше бустерів.",
+            )
         with col4:
-            params["subsample"] = st.slider("Частка підвибірки", 0.5, 1.0, 0.9, 0.05, key="xgb_subsample")
+            params["subsample"] = st.slider(
+                "Частка підвибірки",
+                0.5,
+                1.0,
+                0.9,
+                0.05,
+                key="xgb_subsample",
+                help="Менша частка додає регуляризацію та може зменшити overfit, але інколи шкодить recall.",
+            )
             params["colsample_bytree"] = params["subsample"]
 
     else:
-        params["n_estimators"] = st.slider("К-сть дерев Isolation Forest", 100, 600, 300, 50, key="if_n_estimators")
+        params["n_estimators"] = st.slider(
+            "К-сть дерев Isolation Forest",
+            100,
+            600,
+            300,
+            50,
+            key="if_n_estimators",
+            help="Більше дерев робить оцінку аномалій стабільнішою, але сповільнює навчання й інференс.",
+        )
 
         auto_contam = st.checkbox(
             "Авто Contamination (Рекомендовано)",
@@ -907,11 +1288,11 @@ def _render_algorithm_parameters(selected_algorithm: str) -> dict[str, Any]:
         params["if_target_fp_rate"] = st.slider(
             "Цільова частка хибних тривог (FP rate)",
             0.01,
-            0.03,
-            0.02,
+            0.20,
+            0.04,
             0.005,
             key="if_target_fp_rate",
-            help="Калібрує поріг IF під low-FP режим (1-3%).",
+            help="Калібрує поріг IF. Вищий FP budget підвищує recall атак, але може збільшити хибні тривоги.",
         )
         params["if_use_attack_references"] = st.checkbox(
             "Використати attack-референси (SynFlood/DDoS/PortScan) для калібрування",
@@ -927,6 +1308,7 @@ def _render_algorithm_parameters(selected_algorithm: str) -> dict[str, Any]:
                 3,
                 1,
                 key="if_attack_reference_files",
+                help="Більше attack-референсів покращує калібрування під реальні атаки, але може збільшити чутливість до шуму.",
             )
 
     return params
@@ -956,6 +1338,16 @@ def _run_training(
     algorithm_params: dict[str, Any],
     preloaded_frames: list[pd.DataFrame] | None = None,
 ) -> dict[str, Any]:
+    logger.info(
+        "[TRAIN] start algorithm={} dataset_type={} files={} max_rows_per_file={} test_size={} grid_search={}",
+        algorithm,
+        dataset_type,
+        len(selected_paths),
+        int(max_rows_per_file),
+        float(test_size),
+        bool(use_grid_search),
+    )
+
     supervised_controls = {
         "use_reference_corpus": False,
         "attack_reference_files": 0,
@@ -992,6 +1384,13 @@ def _run_training(
     dataset = pd.concat(frames, ignore_index=True)
     if dataset.empty:
         raise ValueError("Після завантаження вибірка порожня.")
+
+    logger.info(
+        "[TRAIN] loaded dataset rows={} cols={} target_present={}",
+        int(len(dataset)),
+        int(len(dataset.columns)),
+        bool("target_label" in dataset.columns),
+    )
 
     if algorithm != "Isolation Forest":
         supervised_extra_metadata["pcap_optimized_training"] = bool(
@@ -1124,6 +1523,7 @@ def _run_training(
             algorithm=algorithm,
             use_grid_search=use_grid_search,
             models_dir=models_dir,
+            loader=loader,
             algorithm_params=supervised_params,
             test_size=test_size,
             extra_metadata=supervised_extra_metadata,
@@ -1132,6 +1532,15 @@ def _run_training(
 
     result["rows_loaded"] = int(len(dataset))
     result["files_used"] = [path.name for path in selected_paths]
+    logger.info(
+        "[TRAIN] done algorithm={} model_name={} rows_loaded={} recommended_threshold={} f1={} recall={}",
+        algorithm,
+        str(result.get("model_name") or ""),
+        int(result.get("rows_loaded", 0)),
+        float(result.get("recommended_threshold", 0.0)) if isinstance(result.get("recommended_threshold"), (int, float)) else None,
+        float(result.get("metrics", {}).get("f1", 0.0)) if isinstance(result.get("metrics"), dict) else None,
+        float(result.get("metrics", {}).get("recall", 0.0)) if isinstance(result.get("metrics"), dict) else None,
+    )
     return result
 
 
@@ -1149,7 +1558,7 @@ def _ensure_supervised_training_sample(
     if initial_binary.nunique() >= 2:
         return dataset
 
-    # Fallback: top-N rows can be single-class for ordered CSV files (e.g., UNSW).
+    # Резервний шлях: верхні N-рядків у впорядкованих CSV можуть містити лише один клас (наприклад, UNSW).
     full_frames = [
         loader.load_training_frame(path, expected_dataset=dataset_type, max_rows=None)
         for path in selected_paths
@@ -1271,6 +1680,218 @@ def _find_best_threshold(y_true: pd.Series, attack_probabilities: np.ndarray) ->
     return best_threshold, best_metrics
 
 
+def _collect_holdout_rate_calibration_cases(
+    *,
+    loader: DataLoader,
+    preprocessor: Preprocessor,
+    engine: ModelEngine,
+    dataset_type: str,
+    project_root: Path,
+    max_rows_per_file: int = 4000,
+) -> list[dict[str, Any]]:
+    test_dir = project_root / "datasets" / "TEST_DATA"
+    if not test_dir.exists():
+        return []
+
+    cases: list[dict[str, Any]] = []
+    for path in sorted(test_dir.iterdir()):
+        if not path.is_file() or path.suffix.lower() not in REFERENCE_EXTENSIONS:
+            continue
+
+        expected_rate = _expected_rate_from_filename(path)
+        if expected_rate is None:
+            continue
+
+        try:
+            inspection = loader.inspect_file(str(path))
+        except Exception:
+            continue
+
+        if str(getattr(inspection, "dataset_type", "")) != str(dataset_type):
+            continue
+
+        try:
+            loaded = loader.load_file(
+                str(path),
+                max_rows=max_rows_per_file,
+                expected_dataset=dataset_type,
+            )
+        except Exception:
+            continue
+
+        frame = loaded[0] if isinstance(loaded, tuple) else loaded
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            continue
+
+        try:
+            X_holdout = preprocessor.transform(frame)
+        except Exception:
+            continue
+
+        probabilities = engine.predict_proba(X_holdout)
+        if probabilities is None:
+            continue
+
+        attack_probabilities = _compute_attack_probabilities(probabilities, preprocessor, len(frame))
+        if attack_probabilities.size == 0:
+            continue
+
+        cases.append(
+            {
+                "file": path.name,
+                "input_type": str(getattr(inspection, "input_type", "")),
+                "expected_rate": float(expected_rate),
+                "attack_probabilities": np.asarray(attack_probabilities, dtype=float),
+            }
+        )
+
+    return cases
+
+
+def _calibrate_supervised_threshold_by_holdout_rates(
+    *,
+    y_true: pd.Series,
+    attack_probabilities: np.ndarray,
+    fallback_threshold: float,
+    fallback_metrics: dict[str, Any],
+    holdout_cases: list[dict[str, Any]],
+) -> tuple[float, dict[str, Any], dict[str, Any] | None]:
+    if not holdout_cases:
+        return float(fallback_threshold), dict(fallback_metrics), None
+
+    y_true_array = np.asarray(y_true, dtype=int).reshape(-1)
+    validation_scores = np.asarray(attack_probabilities, dtype=float).reshape(-1)
+    if validation_scores.size == 0 or y_true_array.size != validation_scores.size:
+        return float(fallback_threshold), dict(fallback_metrics), None
+
+    def _validation_metrics(threshold: float) -> dict[str, float]:
+        y_pred = (validation_scores >= float(threshold)).astype(int)
+        tn = int(((y_true_array == 0) & (y_pred == 0)).sum())
+        fp = int(((y_true_array == 0) & (y_pred == 1)).sum())
+        return {
+            "precision": float(precision_score(y_true_array, y_pred, zero_division=0)),
+            "recall": float(recall_score(y_true_array, y_pred, zero_division=0)),
+            "f1": float(f1_score(y_true_array, y_pred, zero_division=0)),
+            "false_positive_rate": float(fp / max(fp + tn, 1)),
+        }
+
+    def _holdout_metrics(threshold: float) -> dict[str, Any]:
+        errors: list[float] = []
+        benign_rates: list[float] = []
+        per_case: list[dict[str, Any]] = []
+
+        for case in holdout_cases:
+            probabilities = np.asarray(case.get("attack_probabilities", np.empty(0)), dtype=float).reshape(-1)
+            if probabilities.size == 0:
+                continue
+
+            expected_rate = float(case.get("expected_rate", 0.0))
+            predicted_rate = float(np.mean(probabilities >= float(threshold)) * 100.0)
+            abs_error = abs(predicted_rate - expected_rate)
+
+            errors.append(abs_error)
+            if expected_rate <= 0.01:
+                benign_rates.append(predicted_rate)
+
+            per_case.append(
+                {
+                    "file": str(case.get("file") or ""),
+                    "input_type": str(case.get("input_type") or ""),
+                    "expected_rate": float(expected_rate),
+                    "predicted_rate": float(predicted_rate),
+                    "abs_error": float(abs_error),
+                }
+            )
+
+        return {
+            "holdout_mae": float(np.mean(errors)) if errors else 100.0,
+            "benign_max_rate": float(max(benign_rates)) if benign_rates else 0.0,
+            "per_case": per_case,
+        }
+
+    threshold_candidates = sorted(
+        {
+            float(round(value, 2))
+            for value in np.arange(0.01, 1.0, 0.01)
+        }
+        | {float(round(float(fallback_threshold), 2))}
+    )
+
+    candidates: list[dict[str, Any]] = []
+    for threshold in threshold_candidates:
+        holdout = _holdout_metrics(float(threshold))
+        validation = _validation_metrics(float(threshold))
+        candidates.append(
+            {
+                "threshold": float(threshold),
+                "holdout_mae": float(holdout["holdout_mae"]),
+                "benign_max_rate": float(holdout["benign_max_rate"]),
+                "per_case": holdout["per_case"],
+                "val_precision": float(validation["precision"]),
+                "val_recall": float(validation["recall"]),
+                "val_f1": float(validation["f1"]),
+                "val_false_positive_rate": float(validation["false_positive_rate"]),
+            }
+        )
+
+    if not candidates:
+        return float(fallback_threshold), dict(fallback_metrics), None
+
+    fallback_rounded = float(round(float(fallback_threshold), 2))
+    fallback_candidate = next(
+        (item for item in candidates if abs(float(item["threshold"]) - fallback_rounded) < 1e-9),
+        candidates[0],
+    )
+
+    strict_candidates = [item for item in candidates if float(item["benign_max_rate"]) <= 5.0]
+    pool = strict_candidates if strict_candidates else candidates
+
+    best_candidate = sorted(
+        pool,
+        key=lambda item: (
+            float(item["holdout_mae"]),
+            float(item["benign_max_rate"]),
+            -float(item["val_f1"]),
+            -float(item["val_recall"]),
+            -float(item["val_precision"]),
+        ),
+    )[0]
+
+    improved = (
+        float(best_candidate["holdout_mae"]) + 0.25 < float(fallback_candidate["holdout_mae"])
+        or float(best_candidate["benign_max_rate"]) + 1.0 < float(fallback_candidate["benign_max_rate"])
+    )
+    if not improved:
+        return float(fallback_threshold), dict(fallback_metrics), None
+
+    calibrated_metrics = dict(fallback_metrics)
+    calibrated_metrics.update(
+        {
+            "precision": float(best_candidate["val_precision"]),
+            "recall": float(best_candidate["val_recall"]),
+            "f1": float(best_candidate["val_f1"]),
+            "false_positive_rate": float(best_candidate["val_false_positive_rate"]),
+            "selection_policy": "holdout_rate_calibrated",
+            "holdout_mae": float(best_candidate["holdout_mae"]),
+            "holdout_benign_max_rate": float(best_candidate["benign_max_rate"]),
+            "holdout_cases": int(len(holdout_cases)),
+        }
+    )
+
+    diagnostics = {
+        "cases_evaluated": int(len(holdout_cases)),
+        "fallback_threshold": float(fallback_threshold),
+        "selected_threshold": float(best_candidate["threshold"]),
+        "fallback_holdout_mae": float(fallback_candidate["holdout_mae"]),
+        "selected_holdout_mae": float(best_candidate["holdout_mae"]),
+        "fallback_benign_max_rate": float(fallback_candidate["benign_max_rate"]),
+        "selected_benign_max_rate": float(best_candidate["benign_max_rate"]),
+        "selected_cases": list(best_candidate["per_case"]),
+    }
+
+    return float(best_candidate["threshold"]), calibrated_metrics, diagnostics
+
+
 def _format_params_hint(params: dict[str, Any], max_items: int = 8) -> str:
     if not params:
         return "-"
@@ -1290,18 +1911,23 @@ def _format_params_hint(params: dict[str, Any], max_items: int = 8) -> str:
 def _extract_if_model_and_control_params(algorithm_params: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     model_params = dict(algorithm_params)
     optimize_for_pcap_detection = bool(model_params.pop("optimize_for_pcap_detection", False))
-    target_fp_rate = float(np.clip(float(model_params.pop("if_target_fp_rate", 0.02)), 0.01, 0.03))
+    target_fp_rate = float(np.clip(float(model_params.pop("if_target_fp_rate", 0.04)), 0.01, 0.20))
+    min_unsupervised_fp_rate = float(
+        np.clip(float(model_params.pop("if_min_unsupervised_fp_rate", 0.08)), 0.02, 0.30)
+    )
     use_attack_references = bool(model_params.pop("if_use_attack_references", True))
     attack_reference_files = int(model_params.pop("if_attack_reference_files", 3))
     attack_reference_files = max(1, min(attack_reference_files, 6))
 
     if optimize_for_pcap_detection:
-        target_fp_rate = float(max(target_fp_rate, 0.03))
+        target_fp_rate = float(max(target_fp_rate, 0.08))
+        min_unsupervised_fp_rate = float(max(min_unsupervised_fp_rate, 0.12))
         use_attack_references = True
         attack_reference_files = max(attack_reference_files, 6)
 
     controls = {
         "target_fp_rate": target_fp_rate,
+        "min_unsupervised_fp_rate": min_unsupervised_fp_rate,
         "use_attack_references": use_attack_references,
         "attack_reference_files": attack_reference_files,
         "optimize_for_pcap_detection": optimize_for_pcap_detection,
@@ -1484,6 +2110,44 @@ def _coerce_reference_target_labels(target: pd.Series, assume_attack: bool) -> p
     return normalized.mask(unknown_mask, fallback_label)
 
 
+def _resolve_project_root_from_models_dir(models_dir: Path) -> Path:
+    resolved = models_dir.resolve()
+    for candidate in [resolved, *resolved.parents]:
+        if (candidate / "datasets").exists() and (candidate / "src").exists():
+            return candidate
+    return resolved.parent
+
+
+def _is_holdout_reference_path(path: Path, project_root: Path) -> bool:
+    try:
+        relative_parts = [part.lower() for part in path.resolve().relative_to(project_root.resolve()).parts]
+    except Exception:
+        relative_parts = [part.lower() for part in path.parts]
+
+    if "test_data" in relative_parts:
+        return True
+
+    lowered_name = path.name.lower()
+    if "benchmark_mix_" in lowered_name:
+        return True
+    if "_pct_anomaly" in lowered_name or "_pct_attack" in lowered_name:
+        return True
+
+    return False
+
+
+def _expected_rate_from_filename(path: Path) -> float | None:
+    match = HOLDOUT_RATE_PATTERN.search(path.name)
+    if match:
+        return float(match.group(1))
+
+    lowered = path.name.lower()
+    if "benign" in lowered or "нормальний" in lowered:
+        return 0.0
+
+    return None
+
+
 def _collect_cic_supervised_reference_data(
     loader: DataLoader,
     dataset_type: str,
@@ -1508,13 +2172,13 @@ def _collect_cic_supervised_reference_data(
     ):
         return None, []
 
-    root_dir = models_dir.parent
+    root_dir = _resolve_project_root_from_models_dir(models_dir)
     scan_dirs = [
         root_dir / "datasets" / "TEST_DATA",
         root_dir / "datasets" / "Processed_Scans" / "TEST_DATA",
         root_dir / "datasets" / "User_Uploads",
     ]
-    supported_ext = {".csv", ".pcap", ".pcapng", ".cap"}
+    supported_ext = set(REFERENCE_EXTENSIONS)
     selected_resolved = {path.resolve() for path in selected_paths if path.exists()}
 
     attack_candidates: list[Path] = []
@@ -1525,6 +2189,8 @@ def _collect_cic_supervised_reference_data(
             continue
         for path in sorted(folder.iterdir()):
             if not path.is_file() or path.suffix.lower() not in supported_ext:
+                continue
+            if _is_holdout_reference_path(path, root_dir):
                 continue
             try:
                 if path.resolve() in selected_resolved:
@@ -1598,6 +2264,16 @@ def _collect_cic_supervised_reference_data(
             if not isinstance(loaded, pd.DataFrame) or loaded.empty:
                 continue
 
+            target_raw = loaded["target_label"].astype(str).str.strip().str.lower()
+            unknown_ratio = float(target_raw.isin({"unknown", "", "nan", "none"}).mean())
+            if ref_path.suffix.lower() in {".pcap", ".pcapng", ".cap"} and unknown_ratio >= 0.80:
+                logger.info(
+                    "Пропущено CIC attack-референс {}: {:.1f}% Unknown target_label",
+                    ref_path.name,
+                    unknown_ratio * 100.0,
+                )
+                continue
+
             reference_frame = loaded.copy()
             reference_frame["target_label"] = _coerce_reference_target_labels(
                 reference_frame["target_label"],
@@ -1620,6 +2296,16 @@ def _collect_cic_supervised_reference_data(
                 expected_dataset=dataset_type,
             )
             if not isinstance(loaded, pd.DataFrame) or loaded.empty:
+                continue
+
+            target_raw = loaded["target_label"].astype(str).str.strip().str.lower()
+            unknown_ratio = float(target_raw.isin({"unknown", "", "nan", "none"}).mean())
+            if ref_path.suffix.lower() in {".pcap", ".pcapng", ".cap"} and unknown_ratio >= 0.80:
+                logger.info(
+                    "Пропущено CIC benign-референс {}: {:.1f}% Unknown target_label",
+                    ref_path.name,
+                    unknown_ratio * 100.0,
+                )
                 continue
 
             reference_frame = loaded.copy()
@@ -1645,7 +2331,7 @@ def _collect_cic_supervised_reference_data(
     originals_sources: list[str] = []
     if include_original_references and max_original_files > 0:
         originals_frame, originals_sources = _collect_cic_original_reference_data(
-            root_dir=models_dir.parent,
+            root_dir=root_dir,
             max_files=max_original_files,
             max_attack_rows_per_file=original_attack_rows_per_file,
             max_benign_rows_per_file=original_benign_rows_per_file,
@@ -1659,7 +2345,7 @@ def _collect_cic_supervised_reference_data(
             for source in originals_sources
         }
         hard_case_frame, hard_case_sources = _collect_cic_hard_case_reference_data(
-            root_dir=models_dir.parent,
+            root_dir=root_dir,
             max_attack_rows_per_file=hard_case_attack_rows_per_file,
             max_benign_rows_per_file=hard_case_benign_rows_per_file,
             exclude_file_names=used_original_names,
@@ -1815,7 +2501,7 @@ def _collect_cic_hard_case_reference_data(
     max_benign_rows_per_file: int,
     exclude_file_names: set[str] | None = None,
 ) -> tuple[pd.DataFrame | None, list[str]]:
-    # Target files that repeatedly showed low recall during CIC evaluations.
+    # Цільові файли, що повторно показували низький recall під час оцінок CIC.
     candidate_files = [
         root_dir / "datasets" / "CIC-IDS2017_Originals" / "Friday-WorkingHours-Morning.pcap_ISCX.csv",
         root_dir / "datasets" / "CIC-IDS2018_Originals" / "03-02-2018.csv",
@@ -1862,7 +2548,7 @@ def _collect_nsl_supervised_reference_data(
     if dataset_type != "NSL-KDD":
         return None, []
 
-    root_dir = models_dir.parent
+    root_dir = _resolve_project_root_from_models_dir(models_dir)
     originals_dir = root_dir / "datasets" / "NSL-KDD"
     candidate_files = [
         originals_dir / "kdd_train.csv",
@@ -1909,7 +2595,7 @@ def _collect_unsw_supervised_reference_data(
     if dataset_type != "UNSW-NB15":
         return None, []
 
-    root_dir = models_dir.parent
+    root_dir = _resolve_project_root_from_models_dir(models_dir)
     originals_dir = root_dir / "datasets" / "UNSW_NB15_Originals"
     candidate_files = [
         originals_dir / "UNSW_NB15_training-set.csv",
@@ -1954,23 +2640,26 @@ def _collect_if_attack_reference_data(
     selected_paths: list[Path],
     models_dir: Path,
     max_files: int,
-    max_rows_per_file: int = 20_000,
+    max_rows_per_file: int = 8_000,
 ) -> tuple[pd.DataFrame | None, np.ndarray, list[str]]:
-    root_dir = models_dir.parent
+    root_dir = _resolve_project_root_from_models_dir(models_dir)
     scan_dirs = [
         root_dir / "datasets" / "TEST_DATA",
         root_dir / "datasets" / "Processed_Scans" / "TEST_DATA",
         root_dir / "datasets" / "User_Uploads",
     ]
-    supported_ext = {".csv", ".pcap", ".pcapng", ".cap"}
+    supported_ext = set(REFERENCE_EXTENSIONS)
     selected_resolved = {path.resolve() for path in selected_paths if path.exists()}
 
-    candidate_files: list[Path] = []
+    csv_candidates: list[Path] = []
+    pcap_candidates: list[Path] = []
     for folder in scan_dirs:
         if not folder.exists():
             continue
         for path in sorted(folder.iterdir()):
             if not path.is_file() or path.suffix.lower() not in supported_ext:
+                continue
+            if _is_holdout_reference_path(path, root_dir):
                 continue
             if not _is_attack_reference_name(path):
                 continue
@@ -1979,12 +2668,13 @@ def _collect_if_attack_reference_data(
                     continue
             except Exception:
                 pass
-            candidate_files.append(path)
+            if path.suffix.lower() == ".csv":
+                csv_candidates.append(path)
+            else:
+                pcap_candidates.append(path)
 
-    def _reference_priority(path: Path) -> tuple[int, int, str]:
+    def _reference_priority(path: Path) -> tuple[int, str]:
         name = path.name.lower()
-        ext = path.suffix.lower()
-        pcap_priority = 0 if ext in {".pcap", ".pcapng", ".cap"} else 1
 
         attack_kind_priority = 3
         if "synflood" in name or "ddos" in name or "dos" in name:
@@ -1994,18 +2684,36 @@ def _collect_if_attack_reference_data(
         elif "anomaly" in name or "attack" in name or "flood" in name:
             attack_kind_priority = 2
 
-        return pcap_priority, attack_kind_priority, name
+        return attack_kind_priority, name
 
-    candidate_files = sorted(candidate_files, key=_reference_priority)
+    candidate_files = sorted(csv_candidates, key=_reference_priority)
+    candidate_mode = "csv_only"
+    if not candidate_files and pcap_candidates:
+        candidate_files = sorted(pcap_candidates, key=_reference_priority)
+        candidate_mode = "pcap_fallback"
+
+    logger.info(
+        "[IF_REF] dataset={} selected_mode={} csv_candidates={} pcap_candidates={} max_files={} max_rows_per_file={}",
+        dataset_type,
+        candidate_mode,
+        int(len(csv_candidates)),
+        int(len(pcap_candidates)),
+        int(max_files),
+        int(max_rows_per_file),
+    )
 
     if not candidate_files:
+        logger.warning("[IF_REF] no attack reference candidates found")
         return None, np.empty(0, dtype=int), []
 
     transformed_parts: list[pd.DataFrame] = []
     y_parts: list[np.ndarray] = []
     used_sources: list[str] = []
 
-    for ref_path in candidate_files[:max_files]:
+    for ref_path in candidate_files:
+        if len(used_sources) >= int(max_files):
+            break
+
         try:
             loaded = loader.load_file(
                 str(ref_path),
@@ -2013,26 +2721,61 @@ def _collect_if_attack_reference_data(
                 expected_dataset=dataset_type,
             )
             if not isinstance(loaded, pd.DataFrame) or loaded.empty:
+                logger.info("[IF_REF] source={} skipped: empty dataframe", ref_path.name)
+                continue
+
+            target_raw = loaded["target_label"].astype(str).str.strip().str.lower()
+            unknown_ratio = float(target_raw.isin({"unknown", "", "nan", "none"}).mean())
+            if unknown_ratio >= 0.95:
+                # Unknown-only PCAP референси створюють шумні псевдо-мітки та зсувають IF-поріг.
+                logger.info(
+                    "Пропущено IF attack-референс {}: {:.1f}% Unknown target_label",
+                    ref_path.name,
+                    unknown_ratio * 100.0,
+                )
                 continue
 
             y_ref = loaded["target_label"].map(lambda value: 0 if is_benign_label(value) else 1).astype(int).to_numpy()
             if y_ref.size == 0:
+                logger.info("[IF_REF] source={} skipped: no labels", ref_path.name)
                 continue
 
-            if int(np.sum(y_ref == 1)) == 0:
+            attack_count = int(np.sum(y_ref == 1))
+            benign_count = int(np.sum(y_ref == 0))
+            if attack_count == 0:
+                logger.info("[IF_REF] source={} skipped: no attack labels", ref_path.name)
                 continue
 
             X_ref = preprocessor.transform(loaded)
             transformed_parts.append(X_ref)
             y_parts.append(y_ref)
             used_sources.append(ref_path.name)
-        except Exception:
+            logger.info(
+                "[IF_REF] source={} used rows={} attack_labels={} benign_labels={} unknown_ratio={:.3f}",
+                ref_path.name,
+                int(len(y_ref)),
+                int(attack_count),
+                int(benign_count),
+                float(unknown_ratio),
+            )
+        except Exception as exc:
+            logger.warning("[IF_REF] source={} skipped due to error={}", ref_path.name, exc)
             continue
 
     if not transformed_parts:
+        logger.warning("[IF_REF] no valid attack reference sources after filtering")
         return None, np.empty(0, dtype=int), []
 
-    return pd.concat(transformed_parts, ignore_index=True), np.concatenate(y_parts), used_sources
+    merged_x = pd.concat(transformed_parts, ignore_index=True)
+    merged_y = np.concatenate(y_parts)
+    logger.info(
+        "[IF_REF] summary used_sources={} total_rows={} attack_support={} benign_support={}",
+        int(len(used_sources)),
+        int(len(merged_y)),
+        int(np.sum(merged_y == 1)),
+        int(np.sum(merged_y == 0)),
+    )
+    return merged_x, merged_y, used_sources
 
 
 def _apply_if_threshold(decision_scores: np.ndarray, threshold: float) -> np.ndarray:
@@ -2077,17 +2820,37 @@ def _calibrate_if_threshold(
     decision_scores: np.ndarray,
     y_binary: np.ndarray,
     target_fp_rate: float,
+    min_unsupervised_fp_rate: float = 0.08,
 ) -> tuple[float, dict[str, Any]]:
+    logger.info(
+        "[IF_CALIB] start scores={} labels={} target_fp_rate={} min_unsupervised_fp_rate={}",
+        int(np.asarray(decision_scores).size),
+        int(np.asarray(y_binary).size),
+        float(target_fp_rate),
+        float(min_unsupervised_fp_rate),
+    )
+
+    safe_target_fp_rate = float(np.clip(float(target_fp_rate), 0.01, 0.20))
+    safe_min_unsupervised_fp_rate = float(
+        np.clip(float(min_unsupervised_fp_rate), safe_target_fp_rate, 0.30)
+    )
+
     scores = np.asarray(decision_scores, dtype=float).reshape(-1)
     labels = np.asarray(y_binary, dtype=int).reshape(-1)
     if scores.size == 0 or labels.size != scores.size:
+        logger.warning(
+            "[IF_CALIB] invalid input scores={} labels={} -> fallback threshold=0",
+            int(scores.size),
+            int(labels.size),
+        )
         return 0.0, {
             "selection_policy": "invalid_input",
-            "target_fp_rate": float(target_fp_rate),
+            "target_fp_rate": float(safe_target_fp_rate),
             "false_positive_rate": 0.0,
             "precision": 0.0,
             "recall": 0.0,
             "f1": 0.0,
+            "effective_fp_cap": float(safe_target_fp_rate),
         }
 
     finite_mask = np.isfinite(scores)
@@ -2101,7 +2864,11 @@ def _calibrate_if_threshold(
     benign_mask = labels == 0
     attack_mask = labels == 1
     benign_scores = scores[benign_mask]
-    fallback_threshold = float(np.quantile(benign_scores, float(target_fp_rate))) if benign_scores.size else float(np.quantile(scores, 0.02))
+    fallback_threshold = (
+        float(np.quantile(benign_scores, float(safe_target_fp_rate)))
+        if benign_scores.size
+        else float(np.quantile(scores, 0.02))
+    )
 
     selected_threshold = fallback_threshold
     selected_policy = "unsupervised_fp_quantile"
@@ -2119,9 +2886,34 @@ def _calibrate_if_threshold(
 
     selected_metrics = _evaluate_threshold(selected_threshold)
 
+    if not attack_mask.any() and benign_mask.any():
+        effective_unsupervised_fp_cap = float(max(safe_target_fp_rate, safe_min_unsupervised_fp_rate))
+        selected_threshold = float(np.quantile(benign_scores, effective_unsupervised_fp_cap))
+        selected_metrics = _evaluate_threshold(selected_threshold)
+        selected_metrics["effective_fp_cap"] = float(effective_unsupervised_fp_cap)
+        if effective_unsupervised_fp_cap > safe_target_fp_rate + 1e-12:
+            selected_policy = "unsupervised_fp_quantile_guarded"
+        else:
+            selected_policy = "unsupervised_fp_quantile"
+
+        logger.info(
+            "[IF_CALIB] unsupervised branch policy={} threshold={} effective_fp_cap={} benign_support={}",
+            selected_policy,
+            float(selected_threshold),
+            float(selected_metrics.get("effective_fp_cap", safe_target_fp_rate)),
+            int(np.sum(benign_mask)),
+        )
+
     if attack_mask.any() and benign_mask.any():
-        candidate_quantiles = np.linspace(0.001, 0.995, 900)
+        quantile_grid_size = 320 if scores.size >= 20_000 else 900
+        candidate_quantiles = np.linspace(0.001, 0.995, quantile_grid_size)
         candidate_thresholds = np.unique(np.quantile(scores, candidate_quantiles))
+        logger.info(
+            "[IF_CALIB] supervised search thresholds={} grid_size={} scores={}",
+            int(len(candidate_thresholds)),
+            int(quantile_grid_size),
+            int(scores.size),
+        )
         def _search_under_fp_cap(fp_cap: float) -> tuple[float | None, dict[str, float] | None]:
             best_key: tuple[float, float, float, float] | None = None
             best_threshold: float | None = None
@@ -2146,7 +2938,7 @@ def _calibrate_if_threshold(
 
             return best_threshold, best_metrics
 
-        strict_threshold, strict_metrics = _search_under_fp_cap(float(target_fp_rate))
+        strict_threshold, strict_metrics = _search_under_fp_cap(float(safe_target_fp_rate))
         if strict_threshold is not None and strict_metrics is not None:
             selected_threshold = float(strict_threshold)
             selected_metrics = dict(strict_metrics)
@@ -2154,10 +2946,19 @@ def _calibrate_if_threshold(
 
             strict_recall = float(selected_metrics.get("recall", 0.0))
             strict_f1 = float(selected_metrics.get("f1", 0.0))
-            if strict_recall <= 0.05:
+            target_recall_floor = 0.20
+            if strict_recall < target_recall_floor:
                 relaxed_candidates: list[tuple[float, float, dict[str, float]]] = []
-                for fp_cap in (0.05, 0.08, 0.12, 0.20):
-                    if fp_cap <= float(target_fp_rate) + 1e-12:
+                relaxed_fp_caps = sorted(
+                    {
+                        float(max(float(safe_target_fp_rate) + 0.02, 0.05)),
+                        0.08,
+                        0.12,
+                        0.20,
+                    }
+                )
+                for fp_cap in relaxed_fp_caps:
+                    if fp_cap <= float(safe_target_fp_rate) + 1e-12:
                         continue
                     relaxed_threshold, relaxed_metrics = _search_under_fp_cap(fp_cap)
                     if relaxed_threshold is None or relaxed_metrics is None:
@@ -2179,7 +2980,12 @@ def _calibrate_if_threshold(
 
                     recall_gain = float(best_relaxed_metrics.get("recall", 0.0)) - strict_recall
                     f1_gain = float(best_relaxed_metrics.get("f1", 0.0)) - strict_f1
-                    if recall_gain >= 0.10 or (strict_recall <= 0.0 and f1_gain > 0.0):
+                    relaxed_recall = float(best_relaxed_metrics.get("recall", 0.0))
+                    if (
+                        (relaxed_recall >= target_recall_floor and f1_gain >= -0.03)
+                        or (recall_gain >= 0.05 and f1_gain >= -0.02)
+                        or (strict_recall <= 0.02 and relaxed_recall >= 0.10)
+                    ):
                         selected_threshold = float(best_relaxed_threshold)
                         selected_metrics = dict(best_relaxed_metrics)
                         selected_policy = "supervised_fp_relaxed_for_recall"
@@ -2190,15 +2996,16 @@ def _calibrate_if_threshold(
 
     return selected_threshold, {
         "selection_policy": selected_policy,
-        "target_fp_rate": float(target_fp_rate),
+        "target_fp_rate": float(safe_target_fp_rate),
         "false_positive_rate": float(selected_metrics.get("false_positive_rate", 0.0)),
         "precision": float(selected_metrics.get("precision", 0.0)),
         "recall": float(selected_metrics.get("recall", 0.0)),
         "f1": float(selected_metrics.get("f1", 0.0)),
-        "effective_fp_cap": float(selected_metrics.get("effective_fp_cap", target_fp_rate)),
+        "effective_fp_cap": float(selected_metrics.get("effective_fp_cap", safe_target_fp_rate)),
         "attack_support": int(np.sum(attack_mask)),
         "benign_support": int(np.sum(benign_mask)),
     }
+
 
 
 def _train_supervised_model(
@@ -2207,6 +3014,7 @@ def _train_supervised_model(
     algorithm: str,
     use_grid_search: bool,
     models_dir: Path,
+    loader: DataLoader | None,
     algorithm_params: dict[str, Any],
     test_size: float,
     extra_metadata: dict[str, Any] | None = None,
@@ -2253,9 +3061,43 @@ def _train_supervised_model(
     matrix = confusion_matrix(y_test, predictions)
     attack_probabilities = _compute_attack_probabilities(probabilities, preprocessor, len(predictions))
     recommended_threshold, recommended_threshold_metrics = _find_best_threshold(y_test, attack_probabilities)
+    holdout_rate_calibration: dict[str, Any] | None = None
+    if loader is not None:
+        project_root = _resolve_project_root_from_models_dir(models_dir)
+        holdout_cases = _collect_holdout_rate_calibration_cases(
+            loader=loader,
+            preprocessor=preprocessor,
+            engine=engine,
+            dataset_type=dataset_type,
+            project_root=project_root,
+        )
+        if holdout_cases:
+            calibrated_threshold, calibrated_metrics, calibration_diagnostics = _calibrate_supervised_threshold_by_holdout_rates(
+                y_true=y_test,
+                attack_probabilities=attack_probabilities,
+                fallback_threshold=float(recommended_threshold),
+                fallback_metrics=recommended_threshold_metrics,
+                holdout_cases=holdout_cases,
+            )
+            if calibration_diagnostics is not None:
+                recommended_threshold = float(calibrated_threshold)
+                recommended_threshold_metrics = dict(calibrated_metrics)
+                holdout_rate_calibration = dict(calibration_diagnostics)
+                logger.info(
+                    "[TRAIN] holdout threshold calibration applied dataset={} algorithm={} threshold={} holdout_mae={} cases={}",
+                    dataset_type,
+                    algorithm,
+                    float(recommended_threshold),
+                    float(recommended_threshold_metrics.get("holdout_mae", 0.0)),
+                    int(holdout_rate_calibration.get("cases_evaluated", 0)),
+                )
+
     provenance_context: dict[str, Any] = {}
     if isinstance(extra_metadata, dict) and extra_metadata:
         provenance_context.update(extra_metadata)
+    if isinstance(holdout_rate_calibration, dict):
+        provenance_context["holdout_rate_calibration"] = holdout_rate_calibration
+
     threshold_provenance = build_threshold_provenance(
         dataset_type=dataset_type,
         algorithm=algorithm,
@@ -2294,6 +3136,8 @@ def _train_supervised_model(
     }
     if isinstance(extra_metadata, dict) and extra_metadata:
         metadata.update(extra_metadata)
+    if isinstance(holdout_rate_calibration, dict):
+        metadata["holdout_rate_calibration"] = holdout_rate_calibration
     if best_params:
         metadata["best_params"] = best_params
     if isinstance(training_info.get("best_score"), (int, float)):
@@ -2311,6 +3155,7 @@ def _train_supervised_model(
         "metrics": metrics,
         "recommended_threshold": recommended_threshold,
         "recommended_threshold_metrics": recommended_threshold_metrics,
+        "holdout_rate_calibration": holdout_rate_calibration,
         "use_grid_search": bool(use_grid_search),
         "best_params": best_params,
         "configured_params": configured_params,
@@ -2340,7 +3185,35 @@ def _train_isolation_forest(
     test_size: float,
 ) -> dict[str, Any]:
     model_params, controls = _extract_if_model_and_control_params(algorithm_params)
+    logger.info(
+        "[IF_TRAIN] start dataset_type={} rows={} controls={} model_params={}",
+        dataset_type,
+        int(len(dataset)),
+        {
+            "target_fp_rate": float(controls.get("target_fp_rate", 0.0)),
+            "min_unsupervised_fp_rate": float(controls.get("min_unsupervised_fp_rate", 0.0)),
+            "use_attack_references": bool(controls.get("use_attack_references", False)),
+            "attack_reference_files": int(controls.get("attack_reference_files", 0)),
+            "optimize_for_pcap_detection": bool(controls.get("optimize_for_pcap_detection", False)),
+        },
+        dict(model_params),
+    )
+
     binary_target = dataset["target_label"].map(lambda value: 0 if is_benign_label(value) else 1).astype(int)
+    benign_total = int(np.sum(binary_target == 0))
+    if benign_total < 20:
+        target_text = dataset["target_label"].astype(str).str.strip().str.lower()
+        unknown_ratio = float(target_text.isin({"unknown", "", "nan", "none"}).mean()) if len(target_text) else 0.0
+        if unknown_ratio >= 0.80:
+            raise ValueError(
+                "Неможливо навчити Isolation Forest: у вибраних CSV майже всі мітки target_label=Unknown "
+                "і немає достатнього нормального трафіку (BENIGN/Normal)."
+            )
+        raise ValueError(
+            "Неможливо навчити Isolation Forest: недостатньо нормального трафіку "
+            f"(BENIGN={benign_total}, потрібно >=20)."
+        )
+
     has_evaluation_data = binary_target.nunique() >= 2
 
     train_df, test_df, y_train_binary, y_test_binary = train_test_split(
@@ -2353,7 +3226,10 @@ def _train_isolation_forest(
 
     benign_train = train_df.loc[y_train_binary == 0].copy()
     if len(benign_train) < 20:
-        raise ValueError("Недостатньо benign-потоків для навчання Isolation Forest.")
+        raise ValueError(
+            "Недостатньо benign-потоків у train-частині після розбиття вибірки "
+            f"(benign_train={len(benign_train)}, потрібно >=20). Збільште обсяг даних або зменште test_size."
+        )
 
     preprocessor = Preprocessor(dataset_type=dataset_type, enable_scaling=True)
     X_train_benign, _ = preprocessor.fit(benign_train, target_col=None)
@@ -2388,10 +3264,33 @@ def _train_isolation_forest(
             calib_labels = np.concatenate([calib_labels, y_ref.astype(int)])
             attack_reference_sources = list(sources)
 
+    logger.info(
+        "[IF_TRAIN] calibration input test_scores={} ref_sources={} calib_scores={} attack_support={} benign_support={}",
+        int(len(decision_scores_test)),
+        int(len(attack_reference_sources)),
+        int(len(calib_scores)),
+        int(np.sum(calib_labels == 1)),
+        int(np.sum(calib_labels == 0)),
+    )
+
+    calib_started_at = float(time.perf_counter())
     if_threshold, if_calibration = _calibrate_if_threshold(
         decision_scores=calib_scores,
         y_binary=calib_labels,
         target_fp_rate=float(controls["target_fp_rate"]),
+        min_unsupervised_fp_rate=float(controls.get("min_unsupervised_fp_rate", controls["target_fp_rate"])),
+    )
+    calibration_elapsed_seconds = float(time.perf_counter() - calib_started_at)
+
+    logger.info(
+        "[IF_TRAIN] calibrated threshold={} policy={} fp={} recall={} f1={} effective_fp_cap={} calibration_elapsed_s={}",
+        float(if_threshold),
+        str(if_calibration.get("selection_policy") or ""),
+        float(if_calibration.get("false_positive_rate", 0.0)),
+        float(if_calibration.get("recall", 0.0)),
+        float(if_calibration.get("f1", 0.0)),
+        float(if_calibration.get("effective_fp_cap", controls.get("target_fp_rate", 0.0))),
+        round(calibration_elapsed_seconds, 3),
     )
     score_stats = _summarize_if_score_distribution(calib_scores)
 
@@ -2441,6 +3340,7 @@ def _train_isolation_forest(
         "use_grid_search": False,
         "if_threshold": float(if_threshold),
         "if_target_fp_rate": float(controls["target_fp_rate"]),
+        "if_min_unsupervised_fp_rate": float(controls.get("min_unsupervised_fp_rate", controls["target_fp_rate"])),
         "if_use_attack_references": bool(controls["use_attack_references"]),
         "if_calibration": if_calibration_payload,
         "threshold_provenance": threshold_provenance,

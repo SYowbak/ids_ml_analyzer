@@ -16,7 +16,7 @@
 - Severity: HIGH
 - Вплив: потенційне збереження в неочікуване місце або злам історії між сесіями.
 - Рішення: нормалізація шляху + контроль parent dir + rebind engine.
-- Поточний стан: ВИРІШЕНО (виправлено у `src/services/database.py`, покрито `tests/test_database_path_resolution.py`).
+- Поточний стан: ВИРІШЕНО (виправлено у `src/services/database.py`, перевіряється runtime smoke quality gate).
 
 ### F-06-02: Слабка гарантія збереження scan у UI-потоці
 - Severity: HIGH

@@ -6,24 +6,23 @@
 ## Фактичний статус реалізації (на зараз)
 ### Виконано
 - P0: безпечний auto-fallback вибору моделі у `src/ui/tabs/scanning.py`.
-- P0: strict E2E gate-перемикач `IDS_STRICT_E2E` у `tests/test_pcap_real_e2e_regression.py`.
+- P0: strict E2E gate-перемикач `IDS_STRICT_E2E` у runtime QA (`scripts/runtime_smoke_quality_checks.py`).
 - P1: явне підтвердження збереження scan у history (`history_saved`).
 - P2: strict CSV precheck (missing + unexpected features).
 - P2: стабілізація DB path (`_resolve_db_path`) + rebind engine при зміні `db_path`.
 - Сумісність service-path: додано `ModelEngine.auto_calibrate_isolation_threshold(...)`.
-- Нові regression тести:
-  - `tests/test_model_engine_if_calibration.py`
-  - `tests/test_database_path_resolution.py`
-  - `tests/test_scanning_schema_precheck.py`
-  - розширено `tests/test_scanning_auto_model_choice.py`
+- Новий regression runtime контур:
+  - `scripts/runtime_smoke_quality_checks.py`
+  - `scripts/real_training_quality_gate.py`
+  - `python -m compileall -q src scripts`
 
 ### У процесі
 - P0: єдиний контракт threshold provenance між training і scanning.
-- P1: повні integration-тести lifecycle: train->save->list->load->scan.
+- P1: розширення матриці lifecycle-перевірок: train->save->list->load->scan.
 
 ### Верифікація
-- `pytest -q` => 45 passed, 3 skipped, 1 warning.
-- `IDS_STRICT_E2E=1 pytest -q tests/test_pcap_real_e2e_regression.py` => очікуваний fail за відсутності обов'язкових модельних артефактів.
+- `python scripts/real_training_quality_gate.py` => PASS.
+- `IDS_STRICT_E2E=1 python scripts/runtime_smoke_quality_checks.py` => strict fail-поведінка за відсутності обов'язкових артефактів збережена.
 
 ## P0 — Критична надійність
 1. Уніфікація threshold provenance.
@@ -31,7 +30,7 @@
 - Критерій: одна політика порогу, versioned policy id у metadata, відтворюваний effective threshold.
 
 2. Обов'язковий E2E gate у CI.
-- Ціль: `tests/test_pcap_real_e2e_regression.py`, CI pipeline
+- Ціль: `scripts/real_training_quality_gate.py`, CI pipeline
 - Критерій: CI не проходить при skip критичних real-path тестів.
 
 ## P1 — Якість високого впливу
@@ -40,7 +39,7 @@
 - Критерій: метрики вираховуються на незалежному holdout.
 
 2. Lifecycle integration tests.
-- Ціль: `tests/`
+- Ціль: `scripts/runtime_smoke_quality_checks.py` + окремий integration-suite
 - Критерій: регресія metadata/compatibility/threshold контракту ловиться автотестами.
 
 ## P2 — Операційне hardening

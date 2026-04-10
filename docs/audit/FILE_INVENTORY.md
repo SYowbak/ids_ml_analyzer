@@ -348,7 +348,6 @@
 - src/services/visualizer.py
 - src/ui/__init__.py
 - src/ui/app.py
-- src/ui/core_state.py
 - src/ui/scan_renderer.py
 - src/ui/styles.py
 - src/ui/tabs/__init__.py
@@ -365,10 +364,4 @@
 - src/ui/utils/table_helpers.py
 - src/ui/utils/training_helpers.py
 - start_app.py
-- tests/test_model_engine_parallel_jobs.py
-- tests/test_pcap_real_e2e_regression.py
-- tests/test_scanning_auto_model_choice.py
-- tests/test_scanning_file_options.py
-- tests/test_scanning_report_quality_helpers.py
-- tests/test_scanning_sensitivity_mode.py
-- tests/test_training_auto_manual_helpers.py
+- scripts/runtime_smoke_quality_checks.py

@@ -126,7 +126,14 @@ def _render_explanations_block() -> None:
 
 
 def _render_visual_summary(services: dict[str, Any]) -> None:
-    history = services["db"].get_history(limit=300)
+    db_service = services.get("db")
+    if db_service is None:
+        with st.container(border=True):
+            st.subheader("Огляд результатів", anchor=False)
+            st.info("Сервіс бази даних недоступний: графіки тимчасово вимкнені.")
+        return
+
+    history = db_service.get_history(limit=300)
     if not history:
         with st.container(border=True):
             st.subheader("Огляд результатів", anchor=False)
@@ -197,13 +204,17 @@ def _render_visual_summary(services: dict[str, Any]) -> None:
 def render_home_tab(services: dict[str, Any], root_dir: Path) -> None:
     engine = ModelEngine(models_dir=str(root_dir / "models"))
     models_count = len(engine.list_models())
-    scans_count = int(services["db"].get_scans_count())
+    db_service = services.get("db")
+    scans_count = int(db_service.get_scans_count()) if db_service is not None else 0
 
     metrics_col1, metrics_col2 = st.columns(2)
     with metrics_col1:
         st.metric("Збережені сумісні моделі", models_count)
     with metrics_col2:
         st.metric("Виконані сканування", scans_count)
+
+    if db_service is None:
+        st.warning("Сервіс бази даних недоступний. Частина метрик і графіків може бути недоступною.")
 
     _render_system_overview_block()
     _render_target_users_block()

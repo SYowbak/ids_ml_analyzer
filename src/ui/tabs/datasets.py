@@ -81,13 +81,15 @@ def _persist_uploaded_files(uploaded_files: list[Any] | None, destination_dir: P
     destination_dir.mkdir(parents=True, exist_ok=True)
 
     for uploaded in uploaded_files:
-        cache_key = f"{uploaded.name}:{uploaded.size}"
+        original_name = str(getattr(uploaded, "name", "") or "uploaded_file")
+        normalized_name = Path(original_name).name
+        cache_key = f"{normalized_name}:{uploaded.size}"
         cached_path = cache.get(cache_key)
         if cached_path and Path(cached_path).exists():
             persisted.append(Path(cached_path))
             continue
 
-        safe_name = uploaded.name.replace(" ", "_")
+        safe_name = normalized_name.replace(" ", "_")
         destination = destination_dir / f"dataset_{uuid.uuid4().hex[:8]}_{safe_name}"
         destination.write_bytes(uploaded.getbuffer())
         cache[cache_key] = str(destination)

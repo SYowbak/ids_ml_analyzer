@@ -21,6 +21,7 @@ models/
 **/*.ubj
 **/*.pkl
 reports/verification/models/
+reports/verification/runtime_gate_models/
 
 # Database
 *.db

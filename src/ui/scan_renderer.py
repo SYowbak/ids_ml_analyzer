@@ -1,33 +1,34 @@
 """
-IDS ML Analyzer — Scan Result Renderer
+IDS ML Analyzer — Рендерер результатів сканування
 
-Renders the comprehensive scan dashboard.
+Відображає комплексну панель результатів сканування.
 
-Security Architecture
----------------------
-ALL data-derived values that flow into unsafe_allow_html=True blocks
-MUST pass through escape_html() before interpolation.
+Архітектура безпеки
+-------------------
+Усі значення, отримані з даних і вставлені в блоки з
+unsafe_allow_html=True, обов'язково проходять через escape_html().
 
-Rule: if the value comes from a file, a dataset column, a model output,
-or ANY external source — it is untrusted and must be escaped.
+Правило: якщо значення походить із файлу, колонки датасету, виходу моделі
+або будь-якого зовнішнього джерела, воно вважається недовіреним і має
+бути екрановане.
 
-Static HTML template strings (CSS classes, hardcoded labels, color codes)
-are exempt from escaping, but MUST be reviewed on every change.
+Статичні HTML-шаблони (CSS-класи, хардкод-ярлики, коди кольорів)
+не потребують екранування, але мають перевірятися при кожній зміні.
 
-XSS Audit Status: CLEAN (reviewed 2026-04-04)
-  - threat_name  : escaped
-  - description  : escaped
-  - impact       : escaped
-  - action items : escaped
-  - sev_label    : escaped (sourced from threat_catalog, defensive)
-  - sev_icon     : escaped (Unicode emoji — defensive)
-  - sev_name     : hardcoded dict key — exempt, escaped defensively
-  - sev_color    : hardcoded hex string — exempt
+Статус XSS-аудиту: CLEAN (перевірено 2026-04-04)
+    - threat_name  : escaped
+    - description  : escaped
+    - impact       : escaped
+    - action items : escaped
+    - sev_label    : escaped (джерело threat_catalog, захисно)
+    - sev_icon     : escaped (Unicode emoji, захисно)
+    - sev_name     : hardcoded dict key — exempt, escaped defensively
+    - sev_color    : hardcoded hex string — exempt
 
-Dataframe size protection
---------------------------
-st.dataframe ALWAYS renders at most _DATAFRAME_UI_LIMIT rows.
-This protects the UI from freezing on very large datasets.
+Захист за розміром DataFrame
+----------------------------
+st.dataframe завжди відображає не більше _DATAFRAME_UI_LIMIT рядків.
+Це захищає UI від зависань на дуже великих датасетах.
 """
 
 from __future__ import annotations
@@ -50,7 +51,7 @@ from src.services.threat_catalog import (
 from src.ui.utils.table_helpers import with_row_number
 
 # ---------------------------------------------------------------------------
-# Constants
+# Константи
 # ---------------------------------------------------------------------------
 
 PLOTLY_CONFIG_LIGHT = {
@@ -61,17 +62,17 @@ PLOTLY_CONFIG_LIGHT = {
     "staticPlot": True,
 }
 
-# Maximum rows rendered in any st.dataframe / st.table call.
-# Prevents UI freeze on large anomaly sets.
+# Максимальна кількість рядків для будь-якого st.dataframe / st.table.
+# Запобігає зависанню UI на великих наборах аномалій.
 _DATAFRAME_UI_LIMIT = 1000
 
-# Maximum rows sampled for Plotly visualizations.
+# Максимальна кількість рядків вибірки для Plotly-візуалізацій.
 _VIZ_SAMPLE_LIGHT = 80_000
 _VIZ_SAMPLE_FULL = 160_000
 
 
 # ---------------------------------------------------------------------------
-# Security: HTML escaping
+# Безпека: екранування HTML
 # ---------------------------------------------------------------------------
 
 
@@ -85,7 +86,7 @@ def escape_html(value: Any) -> str:
     Characters escaped: & < > " '
     Unicode emoji characters are NOT escaped (they are safe in HTML context).
 
-    Edge Case 1 test: '<<img src=x onerror=alert("HACKED")>>' →
+    Перевірка крайового випадку: '<<img src=x onerror=alert("HACKED")>>' →
         '&lt;&lt;img src=x onerror=alert(&quot;HACKED&quot;)&gt;&gt;'
 
     Args:
@@ -98,7 +99,7 @@ def escape_html(value: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Static HTML/CSS templates (no user data — no escaping required)
+# Статичні HTML/CSS шаблони (без даних користувача — екранування не потрібне)
 # ---------------------------------------------------------------------------
 
 DASHBOARD_CSS = """
@@ -161,7 +162,7 @@ DASHBOARD_CSS = """
 
 
 # ---------------------------------------------------------------------------
-# Threat Detail Card HTML builders (Security-critical functions)
+# Побудовники HTML-карток загроз (критично для безпеки)
 # ---------------------------------------------------------------------------
 
 
@@ -184,7 +185,7 @@ def _build_severity_chips_html(severity_summary: dict[str, int]) -> str:
         if sev_name not in severity_summary:
             continue
         count = severity_summary[sev_name]
-        # sev_name and sev_color are hardcoded — escaped defensively.
+        # sev_name і sev_color захардкожені; все одно екрануємо захисно.
         safe_name = escape_html(sev_name)
         safe_color = escape_html(sev_color)
         chips.append(
@@ -226,11 +227,11 @@ def _build_threat_card_html(
 
     pct = (threat_count / anomalies_count * 100) if anomalies_count > 0 else 0.0
 
-    # All untrusted values escaped.
+    # Усі недовірені значення екрануються.
     safe_icon = escape_html(sev_icon)
     safe_name = escape_html(threat_name)
     safe_sev_label = escape_html(sev_label)
-    # CSS class suffix: only allow [a-z] chars to prevent class injection.
+    # Суфікс CSS-класу: дозволяємо лише [a-z], щоб уникнути class-injection.
     safe_sev_cls = re.sub(r"[^a-z]", "", sev.lower())
 
     parts: list[str] = [
@@ -270,7 +271,7 @@ def _build_threat_card_html(
 
 
 # ---------------------------------------------------------------------------
-# Dataframe display helper
+# Допоміжне відображення DataFrame
 # ---------------------------------------------------------------------------
 
 
@@ -319,7 +320,7 @@ def _safe_dataframe(
 
 
 # ---------------------------------------------------------------------------
-# Utility functions (no HTML output — no XSS risk)
+# Утилітарні функції (без HTML-виводу — без XSS-ризику)
 # ---------------------------------------------------------------------------
 
 
@@ -552,13 +553,13 @@ def _ensure_figure_readability(fig):
 
 
 # ---------------------------------------------------------------------------
-# Section header helpers (static HTML — no user data)
+# Допоміжні функції заголовків секцій (статичний HTML — без даних користувача)
 # ---------------------------------------------------------------------------
 
 
 def _render_section_card(title: str) -> None:
     """Render a static section header card. title is a programmer-controlled constant."""
-    # title is always a hardcoded string literal in calling code.
+    # title завжди передається як захардкожений рядковий літерал.
     st.markdown(
         f'<div class="section-card"><div class="section-title">{title}</div></div>',
         unsafe_allow_html=True,
@@ -584,7 +585,7 @@ def _render_card_header(roman: str, bg: str, color: str, title: str, subtitle: s
 
 
 # ---------------------------------------------------------------------------
-# Main renderer
+# Основний рендерер
 # ---------------------------------------------------------------------------
 
 
@@ -605,7 +606,7 @@ def render_comprehensive_dashboard(
     risk_score = float(metrics.get("risk_score", 0))
     network_context_data: dict = {}
 
-    # Session state defaults.
+    # Значення session state за замовчуванням.
     for key, default in [
         ("scan_light_mode", True),
         ("scan_show_detailed_charts", False),
@@ -614,7 +615,7 @@ def render_comprehensive_dashboard(
         if key not in st.session_state:
             st.session_state[key] = default
 
-    # ── KPI Row ──────────────────────────────────────────────────────────
+    # ── Рядок KPI ────────────────────────────────────────────────────────
     _render_section_card("Підсумок аналізу")
 
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
@@ -631,7 +632,7 @@ def render_comprehensive_dashboard(
     with kpi4:
         st.metric("Рівень ризику", f"{risk_score:.2f}%", _risk_label(risk_score))
 
-    # Quick threat count for summary.
+    # Швидкий підрахунок загроз для підсумку.
     _quick_threats: dict = {}
     if anomalies_count > 0 and "prediction" in anomalies.columns:
         for lbl, cnt in anomalies["prediction"].value_counts(dropna=False).head(5).items():
@@ -640,7 +641,7 @@ def render_comprehensive_dashboard(
                 _quick_threats[clean] = int(cnt)
     st.info(_plain_summary(total, anomalies_count, risk_score, threat_counts=_quick_threats))
 
-    # ── Visual mode selector ──────────────────────────────────────────────
+    # ── Перемикач режиму візуалізації ────────────────────────────────────
     visual_mode_options = ["Авто (рекомендовано)", "Швидкий", "Детальний"]
     if st.session_state.get("scan_visual_mode") not in set(visual_mode_options):
         st.session_state["scan_visual_mode"] = "Авто (рекомендовано)"
@@ -680,7 +681,7 @@ def render_comprehensive_dashboard(
             return "Невідомий тип"
         return text
 
-    # Edge Case 3: 0 anomalies → empty threat_counts dict.
+    # Крайовий випадок 3: 0 аномалій -> порожній threat_counts.
     if anomalies_count > 0:
         raw_counts = anomalies["prediction"].value_counts(dropna=False).to_dict()
         threat_counts: dict[str, int] = {}
@@ -690,7 +691,7 @@ def render_comprehensive_dashboard(
     else:
         threat_counts = {}
 
-    # ── I. Traffic Composition ────────────────────────────────────────────
+    # ── I. Склад трафіку ─────────────────────────────────────────────────
     st.markdown("---")
     _render_card_header(
         "I", "#3b82f615", "#3b82f6",
@@ -708,7 +709,7 @@ def render_comprehensive_dashboard(
         else:
             st.info("Атак не виявлено — трафік чистий.")
 
-    # ── II. Attack Timeline ───────────────────────────────────────────────
+    # ── II. Часова лінія атак ────────────────────────────────────────────
     st.markdown("---")
     _render_card_header(
         "II", "#f59e0b15", "#f59e0b",
@@ -752,7 +753,7 @@ def render_comprehensive_dashboard(
     else:
         st.info("Немає даних для побудови часової лінії.")
 
-    # ── Threat Distribution ───────────────────────────────────────────────
+    # ── Розподіл загроз ──────────────────────────────────────────────────
     st.markdown("---")
     _render_section_card("Розподіл загроз")
 
@@ -767,8 +768,8 @@ def render_comprehensive_dashboard(
     else:
         st.info("Розподіл загроз недоступний: атак не виявлено.")
 
-    # ── III. Threat Detail Cards ──────────────────────────────────────────
-    # Edge Case 3: threat_counts is empty → this block is skipped entirely.
+    # ── III. Картки деталей загроз ───────────────────────────────────────
+    # Крайовий випадок 3: якщо threat_counts порожній, блок повністю пропускається.
     if threat_counts and anomalies_count > 0:
         st.markdown("---")
         _render_card_header(
@@ -776,7 +777,7 @@ def render_comprehensive_dashboard(
             "Деталі виявлених загроз", "Інформація про загрози та рекомендації",
         )
 
-        # Severity summary chips.
+        # Чіпи зведення за критичністю.
         severity_summary: dict[str, int] = {}
         if "severity_label" in anomalies.columns:
             for sev_lbl, cnt in anomalies["severity_label"].value_counts().items():
@@ -789,7 +790,7 @@ def render_comprehensive_dashboard(
             if chips_html:
                 st.markdown(chips_html, unsafe_allow_html=True)
 
-        # Threat cards — top 8.
+        # Картки загроз — топ 8.
         sorted_threats = sorted(threat_counts.items(), key=lambda x: x[1], reverse=True)
         for threat_name, threat_count in sorted_threats[:8]:
             info = get_threat_info(threat_name)
@@ -799,22 +800,22 @@ def render_comprehensive_dashboard(
                 anomalies_count=anomalies_count,
                 info=info,
             )
-            # All variables inside card_html are escaped by _build_threat_card_html.
+            # Усі змінні всередині card_html екрануються в _build_threat_card_html.
             st.markdown(card_html, unsafe_allow_html=True)
 
-    # ── Risk Gauge ────────────────────────────────────────────────────────
+    # ── Індикатор ризику ─────────────────────────────────────────────────
     gauge_fig = viz.create_risk_gauge(risk_score, "Рівень ризику системи")
     st.plotly_chart(_ensure_figure_readability(gauge_fig), use_container_width=True, config=PLOTLY_CONFIG_LIGHT)
 
-    # ── IV. Network Incident Details ──────────────────────────────────────
+    # ── IV. Мережеві деталі інциденту ────────────────────────────────────
     st.markdown("---")
     _render_section_card("Мережеві деталі інциденту")
 
-    # Edge Case 3: 0 anomalies.
+    # Крайовий випадок 3: 0 аномалій.
     if anomalies_count <= 0:
         st.info("Аномалій не виявлено — мережеві деталі інциденту відсутні.")
     else:
-        # Resolve network columns.
+        # Визначаємо мережеві колонки.
         src_ip_col = _first_existing_column(anomalies, ["src_ip", "source_ip", "ip_src", "src", "srcaddr", "src address", "srcip"])
         dst_ip_col = _first_existing_column(anomalies, ["dst_ip", "destination_ip", "ip_dst", "dst", "dstaddr", "dst address", "dstip"])
         src_port_col = _first_existing_column(anomalies, ["src_port", "source_port", "sport", "tcp_src_port", "udp_src_port"])
@@ -833,7 +834,7 @@ def render_comprehensive_dashboard(
         if proto_col:
             network_context_data["top_protocols"] = _top_value_table(anomalies, proto_col).to_dict("records")
 
-        # Edge Case 2: dataset has no IP/port columns.
+        # Крайовий випадок 2: у датасеті немає IP/port колонок.
         missing_fields = []
         if not src_ip_col:  missing_fields.append("IP джерела")
         if not dst_ip_col:  missing_fields.append("IP призначення")
@@ -849,7 +850,7 @@ def render_comprehensive_dashboard(
             )
         st.caption("Нижче наведені найчастіші джерела/порти/протоколи серед виявлених аномалій.")
 
-        # Top-N tables (safe: data is aggregated counts, not raw strings in HTML).
+        # Top-N таблиці (безпечно: це агреговані лічильники, а не сирі HTML-рядки).
         info_cols = st.columns(3)
         with info_cols[0]:
             if src_ip_col:
@@ -872,7 +873,7 @@ def render_comprehensive_dashboard(
                 st.markdown("**Найчастіші протоколи (аномалії)**")
                 _safe_dataframe(pd.DataFrame(network_context_data["top_protocols"]), key="top_protocols")
 
-        # Detail table — HARD LIMIT via _safe_dataframe.
+        # Таблиця деталей — жорсткий ліміт через _safe_dataframe.
         time_col_details = _resolve_time_column(anomalies)
         detail_columns = []
         for name in [
@@ -896,7 +897,7 @@ def render_comprehensive_dashboard(
         else:
             st.info("У виявлених аномаліях немає колонок з IP/портами/протоколом.")
 
-    # ── Detailed Analytics (optional) ─────────────────────────────────────
+    # ── Детальна аналітика (опційно) ─────────────────────────────────────
     if show_detailed:
         st.markdown("---")
         _render_section_card("Детальна аналітика")

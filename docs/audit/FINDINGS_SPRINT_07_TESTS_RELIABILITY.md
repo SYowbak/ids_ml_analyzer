@@ -2,7 +2,8 @@
 
 Дата: 2026-04-09
 Обсяг перевірки:
-- `tests/` (unit, integration, e2e)
+- `scripts/real_training_quality_gate.py`
+- `scripts/runtime_smoke_quality_checks.py`
 - сценарії strict/non-strict профілів
 
 ## Підсумок спринту
@@ -10,28 +11,28 @@
 
 ## Знахідки
 
-### F-07-01: E2E-реалістичні тести могли бути формально «зеленими» через skip
+### F-07-01: E2E-реалістичні перевірки могли бути формально «зеленими» через skip
 - Severity: CRITICAL
 - Вплив: CI міг не ловити деградацію на реальних PCAP/модельних артефактах.
 - Рішення: strict profile через `IDS_STRICT_E2E`.
-- Поточний стан: ВИРІШЕНО (реалізовано у `tests/test_pcap_real_e2e_regression.py`).
+- Поточний стан: ВИРІШЕНО (реалізовано через strict runtime gate, `IDS_STRICT_E2E=1`).
 
 ### F-07-02: Недостатнє покриття негативних шляхів scan-логіки
 - Severity: HIGH
 - Вплив: регресії fallback/schema-check могли прослизати.
-- Рішення: цільові тести fallback і strict schema precheck.
-- Поточний стан: ЧАСТКОВО ВИРІШЕНО (додані тести, потрібне подальше розширення integration-перевірок).
+- Рішення: runtime smoke перевірки fallback і strict schema precheck + розширення інтеграційних сценаріїв.
+- Поточний стан: ЧАСТКОВО ВИРІШЕНО (базові сценарії покрито, потрібне подальше розширення).
 
-### F-07-03: Відсутність наскрізного lifecycle-контракт тесту
+### F-07-03: Відсутність повного матричного lifecycle-контракт покриття
 - Severity: MEDIUM
 - Вплив: train/save/load/scan дрейф може виявлятися запізно.
-- Рішення: додати end-to-end lifecycle integration тести.
+- Рішення: розширити runtime smoke matrix і додати окремий інтеграційний regression suite.
 - Поточний стан: ВІДКРИТО.
 
 ## Фактичні результати
-- `pytest -q`: 45 passed, 3 skipped, 1 warning.
-- Strict E2E профіль: очікуване fail-поведінка за відсутніх обов'язкових артефактів (gate працює).
+- `python scripts/real_training_quality_gate.py`: PASS (bootstrap + compileall + runtime smoke).
+- `IDS_STRICT_E2E=1 python scripts/runtime_smoke_quality_checks.py`: strict профіль активний, відсутні обов'язкові артефакти трактуються як fail.
 
 ## Висновок Sprint 07
-Тестова база вже ловить важливі регресії, але потрібні додаткові lifecycle integration тести для завершення P1.
+Runtime QA-контур уже ловить критичні регресії перед релізом, але для повного P1 потрібен додатковий інтеграційний regression suite.
 

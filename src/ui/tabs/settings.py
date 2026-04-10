@@ -9,7 +9,10 @@ import streamlit as st
 def render_settings_tab(services: dict[str, Any], root_dir: Path) -> None:
     del root_dir
 
-    settings = services["settings"]
+    settings = services.get("settings")
+    if settings is None:
+        st.error("Сервіс налаштувань недоступний. Збереження параметрів тимчасово вимкнено.")
+        return
 
     current_threshold = float(settings.get("anomaly_threshold", 0.30) or 0.30)
 
@@ -27,12 +30,15 @@ def render_settings_tab(services: dict[str, Any], root_dir: Path) -> None:
 
     save_disabled = False
     if st.button("Зберегти налаштування", type="primary", disabled=save_disabled, width="stretch"):
-        settings.set("anomaly_threshold", float(threshold))
-        settings.set("ui_language", "Українська")
-        settings.set("ui_theme", "light")
+        try:
+            settings.set("anomaly_threshold", float(threshold))
+            settings.set("ui_language", "Українська")
+            settings.set("ui_theme", "light")
 
-        st.session_state.scan_sensitivity = float(threshold)
-        st.success("Налаштування збережено.")
+            st.session_state.scan_sensitivity = float(threshold)
+            st.success("Налаштування збережено.")
+        except Exception as exc:
+            st.error(f"Не вдалося зберегти налаштування: {exc}")
 
     st.markdown("**Сервісні дії**")
     clear_col1, clear_col2 = st.columns(2)

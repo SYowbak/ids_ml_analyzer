@@ -12,7 +12,7 @@ def is_port_in_use(port):
 
 def start():
     print("===========================================")
-    print("   IDS ML Analyzer - STARTING")
+    print("   IDS ML Analyzer - ЗАПУСК")
     print("===========================================")
     
     root_dir = Path(__file__).parent.absolute()
@@ -20,21 +20,21 @@ def start():
     
     venv_python = root_dir / ".venv" / "Scripts" / "python.exe"
     if not venv_python.exists():
-        print(f"[ERROR] .venv not found at {venv_python}")
+        print(f"[ПОМИЛКА] .venv не знайдено за шляхом: {venv_python}")
         return
 
-    # Check if port 8501 is already taken
+    # Перевіряємо, чи зайнятий порт Streamlit.
     if is_port_in_use(8501):
-        print("[INFO] Port 8501 is busy. Attempting to kill old process...")
+        print("[ІНФО] Порт 8501 зайнятий. Пробуємо завершити попередній процес...")
         try:
-            # Simple windows command to kill whatever is on the port
+            # Акуратно зупиняємо процес, що слухає 8501, щоб уникнути конфлікту запуску.
             subprocess.run('for /f "tokens=5" %a in (\'netstat -aon ^| findstr :8501 ^| findstr LISTENING\') do taskkill /F /PID %a', shell=True, capture_output=True)
             time.sleep(1)
-        except:
-            pass
+        except Exception as exc:
+            print(f"[ПОПЕРЕДЖЕННЯ] Не вдалося звільнити порт 8501: {exc}")
 
-    print("[1/2] Starting Streamlit server...")
-    # Hide window for the subprocess if possible, or just run it background
+    print("[1/2] Запускаємо Streamlit сервер...")
+    # Запускаємо Streamlit окремим процесом.
     cmd = [
         str(venv_python), "-m", "streamlit", "run", 
         "src/ui/app.py", 
@@ -43,25 +43,25 @@ def start():
         "--browser.gatherUsageStats", "false"
     ]
     
-    # Remove CREATE_NO_WINDOW so the user can see Streamlit logs/tracebacks in the console
+    # Логи/traceback залишаються в консолі, щоб спростити діагностику.
     process = subprocess.Popen(cmd)
     
-    print("[2/2] Opening browser...")
+    print("[2/2] Відкриваємо браузер...")
     url = "http://localhost:8501"
     
-    # Try to wait until port is open
+    # Чекаємо підняття порту перед відкриттям браузера.
     for i in range(15):
         if is_port_in_use(8501):
             break
         print(".", end="", flush=True)
         time.sleep(1)
     
-    print(f"\n[INFO] Launching {url}")
+    print(f"\n[ІНФО] Відкриваємо {url}")
     webbrowser.open(url)
     
-    print("\n[READY] Application launched successfully!")
-    print("You can close this black window now if you want,")
-    print("but the server will stay running in the background.")
+    print("\n[ГОТОВО] Застосунок успішно запущено!")
+    print("За потреби це вікно можна закрити,")
+    print("сервер продовжить працювати у фоні.")
     print("===========================================")
     time.sleep(5)
 

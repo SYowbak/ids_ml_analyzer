@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 import sys
@@ -10,6 +11,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from loguru import logger
 
 
 _current_path = Path(__file__).resolve() if "__file__" in globals() else Path.cwd()
@@ -49,7 +51,8 @@ def render_scanning_tab(services: dict[str, Any], root_dir: Path) -> None:
     if settings_service is not None:
         try:
             default_threshold = float(settings_service.get("anomaly_threshold", 0.30) or 0.30)
-        except Exception:
+        except Exception as exc:
+            logger.warning("Не вдалося зчитати anomaly_threshold із налаштувань: {}", exc)
             default_threshold = 0.30
     default_threshold = min(max(default_threshold, 0.01), 0.99)
 
@@ -78,55 +81,67 @@ def render_scanning_tab(services: dict[str, Any], root_dir: Path) -> None:
         )
 
         inspection = None
+        inspection_error: str | None = None
         pcap_profile: dict[str, Any] | None = None
         file_nature_id = None
         if selected_path:
-            inspection = loader.inspect_file(selected_path)
-            file_nature_id = nature_for_dataset(inspection.dataset_type)
-
-            if inspection.input_type == "pcap":
-                pcap_profile = _inspect_pcap_capability(str(selected_path), sample_limit=8000)
-
-            nature_confidence = float(inspection.confidence)
-            if selected_path.suffix.lower() == ".csv":
-                try:
-                    header = pd.read_csv(selected_path, nrows=0)
-                    detected_nature_id, detected_confidence = detect_nature_from_columns(header.columns)
-                    if detected_nature_id:
-                        file_nature_id = detected_nature_id
-                        nature_confidence = max(nature_confidence, detected_confidence)
-                except Exception:
-                    pass
-
-            st.dataframe(
-                with_row_number(
-                    pd.DataFrame(
-                        [
-                            {
-                                "Файл": selected_path.name,
-                                "Формат": inspection.input_type.upper(),
-                                "Датасет": inspection.dataset_type,
-                                "Природа": nature_label(file_nature_id),
-                                "Режим": inspection.analysis_mode,
-                                "Впевненість детектора": f"{nature_confidence:.2f}",
-                            }
-                        ]
-                    )
-                ),
-                width="stretch",
-                hide_index=True,
-            )
-
-            if pcap_profile is not None and pcap_profile.get("status") == "ok":
-                has_ip = bool(pcap_profile.get("has_ip", False))
-                has_arp = bool(pcap_profile.get("has_arp", False))
-                sampled_packets = int(pcap_profile.get("sampled_packets", 0))
-                st.caption(
-                    "PCAP pre-check: "
-                    f"IP-потоки={'так' if has_ip else 'ні'}, "
-                    f"ARP-пакети={'так' if has_arp else 'ні'}, "
-                    f"перевірено пакетів={sampled_packets}."
+            try:
+                inspection = loader.inspect_file(selected_path)
+            except Exception as exc:
+                inspection_error = (
+                    "Не вдалося проаналізувати вибраний файл. "
+                    "Перевірте, що файл не пошкоджений і має підтримуваний формат."
                 )
+                logger.exception("Помилка inspect_file для {}: {}", selected_path, exc)
+
+            if inspection is None:
+                st.error(inspection_error or "Не вдалося визначити тип вибраного файлу.")
+            else:
+                file_nature_id = nature_for_dataset(inspection.dataset_type)
+
+                if inspection.input_type == "pcap":
+                    pcap_profile = _inspect_pcap_capability(str(selected_path), sample_limit=8000)
+
+                nature_confidence = float(inspection.confidence)
+                if selected_path.suffix.lower() == ".csv":
+                    try:
+                        header = pd.read_csv(selected_path, nrows=0)
+                        detected_nature_id, detected_confidence = detect_nature_from_columns(header.columns)
+                        if detected_nature_id:
+                            file_nature_id = detected_nature_id
+                            nature_confidence = max(nature_confidence, detected_confidence)
+                    except Exception as exc:
+                        logger.warning("Не вдалося зчитати заголовок CSV {}: {}", selected_path, exc)
+
+                st.dataframe(
+                    with_row_number(
+                        pd.DataFrame(
+                            [
+                                {
+                                    "Файл": selected_path.name,
+                                    "Формат": inspection.input_type.upper(),
+                                    "Датасет": inspection.dataset_type,
+                                    "Природа": nature_label(file_nature_id),
+                                    "Режим": inspection.analysis_mode,
+                                    "Впевненість детектора": f"{nature_confidence:.2f}",
+                                }
+                            ]
+                        )
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+                if pcap_profile is not None and pcap_profile.get("status") == "ok":
+                    has_ip = bool(pcap_profile.get("has_ip", False))
+                    has_arp = bool(pcap_profile.get("has_arp", False))
+                    sampled_packets = int(pcap_profile.get("sampled_packets", 0))
+                    st.caption(
+                        "PCAP pre-check: "
+                        f"IP-потоки={'так' if has_ip else 'ні'}, "
+                        f"ARP-пакети={'так' if has_arp else 'ні'}, "
+                        f"перевірено пакетів={sampled_packets}."
+                    )
         else:
             st.info("Завантажте файл для сканування.")
 
@@ -142,6 +157,7 @@ def render_scanning_tab(services: dict[str, Any], root_dir: Path) -> None:
         mismatch_warning = None
         selected_model_name: str | None = None
         model_metadata: dict[str, Any] | None = None
+        auto_quality_block_reason: str | None = None
 
         show_only_compatible = st.checkbox(
             "Показувати лише сумісні моделі",
@@ -159,7 +175,10 @@ def render_scanning_tab(services: dict[str, Any], root_dir: Path) -> None:
         )
 
         if not inspection:
-            st.info("Спершу оберіть файл.")
+            if inspection_error:
+                st.warning(inspection_error)
+            else:
+                st.info("Спершу оберіть файл.")
         else:
             selectable_models = compatible_models if show_only_compatible else model_manifests
             if not selectable_models:
@@ -235,6 +254,13 @@ def render_scanning_tab(services: dict[str, Any], root_dir: Path) -> None:
                     ranked_models[0],
                 )
                 model_metadata = selected_manifest["metadata"]
+
+                if model_pick_mode == "Автоматично" and not _is_model_safe_for_auto_selection(selected_manifest, inspection):
+                    auto_quality_block_reason = (
+                        "Авто-режим заблоковано: обрана модель не пройшла quality-check для цього PCAP "
+                        "(ризик пропуску атак). Перейдіть у ручний режим або перевчіть модель."
+                    )
+                    st.error(auto_quality_block_reason)
 
                 recommended_threshold_value, threshold_caption = _resolve_recommended_threshold(selected_manifest, inspection)
                 st.caption(threshold_caption)
@@ -331,6 +357,7 @@ def render_scanning_tab(services: dict[str, Any], root_dir: Path) -> None:
                     f"Вручну застосовано поріг: {effective_sensitivity:.2f}. "
                     f"Рекомендований поріг моделі ({float(recommended_threshold_value):.2f}) зараз не використовується."
                 )
+            st.caption(_sensitivity_tradeoff_hint(float(effective_sensitivity)))
         with note_col:
             pcap_requires_ip_flow = bool(
                 inspection
@@ -361,6 +388,7 @@ def render_scanning_tab(services: dict[str, Any], root_dir: Path) -> None:
             and not schema_error
             and not mismatch_blocked
             and not pcap_blocked
+            and not auto_quality_block_reason
         )
         scan_start_label = "Сканування виконується..." if scan_in_progress else "Запустити сканування"
         if st.button(scan_start_label, width="stretch", type="primary", disabled=(not can_scan) or scan_in_progress):
@@ -383,14 +411,27 @@ def render_scanning_tab(services: dict[str, Any], root_dir: Path) -> None:
                             allow_dataset_mismatch=bool(st.session_state.get("scan_allow_mismatch", False)),
                         )
                     result["duration_seconds"] = time.perf_counter() - started_at
-                    saved_scan_id = int(services["db"].save_scan(
-                        filename=selected_path.name,
-                        total=result["total_records"],
-                        anomalies=result["anomalies_count"],
-                        risk_score=result["risk_score"],
-                        model_name=selected_model_name,
-                        duration=result["duration_seconds"],
-                    ))
+                    saved_scan_id = -1
+                    db_service = services.get("db")
+                    if db_service is None:
+                        logger.warning("Сервіс бази даних недоступний: результат сканування не буде збережено в історію.")
+                    else:
+                        try:
+                            saved_scan_id = int(db_service.save_scan(
+                                filename=selected_path.name,
+                                total=result["total_records"],
+                                anomalies=result["anomalies_count"],
+                                risk_score=result["risk_score"],
+                                model_name=selected_model_name,
+                                duration=result["duration_seconds"],
+                            ))
+                        except Exception as exc:
+                            logger.exception(
+                                "Помилка збереження результату сканування {} в історію: {}",
+                                selected_path.name,
+                                exc,
+                            )
+                            saved_scan_id = -1
                     result["history_saved"] = bool(saved_scan_id >= 0)
                     result["history_record_id"] = int(saved_scan_id) if saved_scan_id >= 0 else None
                     if settings_service is not None:
@@ -406,7 +447,8 @@ def render_scanning_tab(services: dict[str, Any], root_dir: Path) -> None:
                 except Exception as exc:
                     st.session_state.scan_result = None
                     st.session_state.scan_result_signature = None
-                    st.error(str(exc))
+                    logger.exception("Помилка під час виконання сканування файлу {}: {}", selected_path, exc)
+                    st.error(f"Помилка сканування: {exc}")
                 finally:
                     _finish_scan_run()
 
@@ -486,12 +528,15 @@ def _build_scan_file_options(root_dir: Path) -> dict[str, Path]:
 def _resolve_selected_scan_path(uploaded_file: Any, upload_dir: Path) -> Path | None:
     if uploaded_file is not None:
         cache: dict[str, str] = st.session_state["scan_uploaded_cache"]
-        cache_key = f"{uploaded_file.name}:{uploaded_file.size}"
+        original_name = str(getattr(uploaded_file, "name", "") or "uploaded_file")
+        normalized_name = Path(original_name).name
+        cache_key = f"{normalized_name}:{uploaded_file.size}"
         cached_path = cache.get(cache_key)
         if cached_path and Path(cached_path).exists():
             return Path(cached_path)
 
-        destination = upload_dir / f"scan_{uuid.uuid4().hex[:8]}_{uploaded_file.name.replace(' ', '_')}"
+        safe_name = normalized_name.replace(" ", "_")
+        destination = upload_dir / f"scan_{uuid.uuid4().hex[:8]}_{safe_name}"
         destination.write_bytes(uploaded_file.getbuffer())
         cache[cache_key] = str(destination)
         return destination
@@ -502,7 +547,8 @@ def _resolve_selected_scan_path(uploaded_file: Any, upload_dir: Path) -> Path | 
 def _inspect_pcap_capability(path: str, sample_limit: int = 5000) -> dict[str, Any]:
     try:
         from scapy.all import ARP, IP, PcapReader  # type: ignore
-    except Exception:
+    except Exception as exc:
+        logger.warning("Scapy недоступний для PCAP pre-check: {}", exc)
         return {
             "status": "unavailable",
             "has_ip": False,
@@ -525,7 +571,8 @@ def _inspect_pcap_capability(path: str, sample_limit: int = 5000) -> dict[str, A
                     has_arp = True
                 if sampled_packets >= safe_limit or (has_ip and has_arp and sampled_packets >= 500):
                     break
-    except Exception:
+    except Exception as exc:
+        logger.warning("Помилка читання PCAP pre-check для {}: {}", path, exc)
         return {
             "status": "error",
             "has_ip": False,
@@ -594,9 +641,28 @@ def _is_model_safe_for_auto_selection(manifest: dict[str, Any], inspection: Any)
     metadata = manifest.get("metadata") or {}
 
     if algorithm == "Random Forest":
+        recommended = metadata.get("recommended_threshold")
+        if isinstance(recommended, (int, float)):
+            return float(recommended) <= 0.35
         return True
     if algorithm == "Isolation Forest":
-        return bool(metadata.get("trained_on_pcap_metrics", False))
+        if not bool(metadata.get("trained_on_pcap_metrics", False)):
+            return False
+
+        calibration = metadata.get("if_calibration") if isinstance(metadata.get("if_calibration"), dict) else {}
+        attack_support = calibration.get("attack_support")
+        if isinstance(attack_support, (int, float)) and int(attack_support) <= 0:
+            return False
+
+        recall_value = calibration.get("recall")
+        if isinstance(recall_value, (int, float)) and float(recall_value) < 0.05:
+            return False
+
+        policy = str(calibration.get("selection_policy") or "")
+        if policy in {"invalid_input", "fp_quantile_fallback"} or policy.startswith("unsupervised"):
+            return False
+
+        return True
     if algorithm == "XGBoost":
         recommended = metadata.get("recommended_threshold")
         if isinstance(recommended, (int, float)):
@@ -620,6 +686,37 @@ def _choose_auto_model_name(
         for manifest in ranked_models
         if _is_model_safe_for_auto_selection(manifest, inspection)
     ]
+
+    input_type = str(getattr(inspection, "input_type", "") or "")
+    dataset_type = str(getattr(inspection, "dataset_type", "") or "")
+    if input_type == "pcap" and dataset_type == "CIC-IDS" and safe_ranked_models:
+        safe_if_models = [
+            manifest
+            for manifest in safe_ranked_models
+            if str(manifest.get("algorithm") or "") == "Isolation Forest"
+        ]
+        if safe_if_models:
+            def _if_threshold_value(item: dict[str, Any]) -> float:
+                metadata = item.get("metadata") or {}
+                value = metadata.get("if_threshold")
+                return float(value) if isinstance(value, (int, float)) else 1.0
+
+            def _if_recall_value(item: dict[str, Any]) -> float:
+                metadata = item.get("metadata") or {}
+                calibration = metadata.get("if_calibration") if isinstance(metadata.get("if_calibration"), dict) else {}
+                value = calibration.get("recall")
+                return float(value) if isinstance(value, (int, float)) else 0.0
+
+            safe_if_models = sorted(
+                safe_if_models,
+                key=lambda item: (
+                    _if_threshold_value(item),
+                    -_if_recall_value(item),
+                    str((item.get("metadata") or {}).get("saved_at") or ""),
+                ),
+            )
+            safe_ranked_models = safe_if_models
+
     if safe_ranked_models:
         fallback_name = str(safe_ranked_models[0].get("name") or "")
     else:
@@ -708,6 +805,23 @@ def _resolve_effective_sensitivity(
     return min(max(selected, 0.01), 0.99)
 
 
+def _sensitivity_tradeoff_hint(effective_sensitivity: float) -> str:
+    threshold = min(max(float(effective_sensitivity), 0.01), 0.99)
+    if threshold <= 0.20:
+        profile = "Дуже висока чутливість"
+        impact = "зростає шанс виявити більше атак, але помітно зростає частка хибних тривог."
+    elif threshold <= 0.40:
+        profile = "Висока чутливість"
+        impact = "краще покриття аномалій з помірним ризиком зайвих спрацювань."
+    elif threshold <= 0.70:
+        profile = "Збалансований режим"
+        impact = "компроміс між пропуском атак і кількістю хибних тривог."
+    else:
+        profile = "Консервативний режим"
+        impact = "менше хибних тривог, але вищий ризик пропустити частину атак."
+    return f"{profile}: поріг {threshold:.2f} - {impact}"
+
+
 def _build_scan_signature(selected_path: Path | None, selected_model_name: str | None) -> str | None:
     if not selected_path or not selected_model_name:
         return None
@@ -721,7 +835,12 @@ def _extract_metric(manifest: dict[str, Any], metric_name: str) -> str:
 
 
 def _validate_csv_against_model(csv_path: Path, metadata: dict[str, Any]) -> str | None:
-    header = pd.read_csv(csv_path, nrows=0)
+    try:
+        header = pd.read_csv(csv_path, nrows=0)
+    except Exception as exc:
+        logger.warning("Не вдалося прочитати CSV заголовок {}: {}", csv_path, exc)
+        return f"Не вдалося прочитати CSV-файл {csv_path.name}: {exc}"
+
     normalized_columns = {normalize_column_name(column) for column in header.columns}
     dataset_type = metadata.get("dataset_type")
     if not dataset_type:
@@ -1051,7 +1170,7 @@ def _normalize_attack_display_name(label: Any, algorithm: str | None = None) -> 
     threat = get_threat_info(text)
     name_uk = str(threat.get("name_uk") or "").strip()
     if name_uk and name_uk.lower() != text.lower():
-        # Show localized name while preserving original model label for international consistency.
+        # Показуємо локалізовану назву, зберігаючи оригінальний ярлик моделі для міжнародної консистентності.
         return f"{name_uk} ({text})"
     return text
 
@@ -1341,8 +1460,30 @@ def _run_scan(
     sensitivity: float,
     allow_dataset_mismatch: bool = False,
 ) -> dict[str, Any]:
+    logger.info(
+        "[SCAN] start file={} input_type={} dataset={} model={} sensitivity={} row_limit={} allow_mismatch={}",
+        selected_path.name,
+        str(getattr(inspection, "input_type", "")),
+        str(getattr(inspection, "dataset_type", "")),
+        selected_model_name,
+        float(sensitivity),
+        int(row_limit),
+        bool(allow_dataset_mismatch),
+    )
+
     engine = ModelEngine(models_dir=str(models_dir))
-    model, preprocessor, metadata = engine.load_model(selected_model_name)
+    try:
+        model, preprocessor, metadata = engine.load_model(selected_model_name)
+    except FileNotFoundError as exc:
+        raise ValueError(
+            f"Файл моделі {selected_model_name} не знайдено. Оновіть список моделей або перевчіть модель."
+        ) from exc
+    except Exception as exc:
+        logger.exception("Не вдалося завантажити модель {}: {}", selected_model_name, exc)
+        raise ValueError(
+            f"Не вдалося завантажити модель {selected_model_name}. "
+            "Ймовірно файл пошкоджений або несумісний з поточною версією залежностей."
+        ) from exc
     del model
 
     expected_dataset = None if allow_dataset_mismatch else inspection.dataset_type
@@ -1367,16 +1508,33 @@ def _run_scan(
         raise ValueError("Очікувався tuple(DataFrame, context) під час сканування.")
     dataset, context = loaded
 
+    logger.info(
+        "[SCAN] loaded file={} rows={} cols={} context_cols={}",
+        selected_path.name,
+        int(len(dataset)),
+        int(len(dataset.columns)),
+        int(len(context.columns)) if isinstance(context, pd.DataFrame) else 0,
+    )
+
     try:
         X = preprocessor.transform(dataset)
     except Exception as exc:
+        logger.exception(
+            "Помилка transform під час сканування файлу {} моделлю {}: {}",
+            selected_path,
+            selected_model_name,
+            exc,
+        )
         if allow_dataset_mismatch:
             raise ValueError(
                 "Несумісність схеми при примусовому запуску. "
                 "Модель і файл мають різну природу/контракт ознак. "
                 f"Деталі: {exc}"
             ) from exc
-        raise
+        raise ValueError(
+            "Модель не змогла перетворити ознаки файлу для інференсу. "
+            "Перевірте сумісність схеми CSV/PCAP і контракт ознак моделі."
+        ) from exc
 
     predictions = engine.predict(X)
     algorithm = str(metadata.get("algorithm"))
@@ -1449,6 +1607,19 @@ def _run_scan(
             "score_quantiles": quantile_map,
         }
 
+        logger.info(
+            "[IF_SCAN] model={} base_threshold={} effective_threshold={} sensitivity={} score_min={} score_max={} score_std={} predicted_anomalies={}/{}",
+            selected_model_name,
+            float(threshold_base),
+            float(effective_threshold),
+            float(sensitivity),
+            float(np.min(decision_scores)) if decision_scores.size else 0.0,
+            float(np.max(decision_scores)) if decision_scores.size else 0.0,
+            float(score_std),
+            int(predicted_anomalies),
+            int(len(predictions)),
+        )
+
         if threshold_from_model is not None:
             model_note = (
                 "Обрану модель застосовано для інференсу. "
@@ -1465,18 +1636,109 @@ def _run_scan(
             )
 
         scores = np.maximum(-decision_scores, 0.0)
-        prediction_labels = np.where(predictions == 1, "Anomaly", "Normal")
         score_values = scores
         score_column_name = "anomaly_score"
         score_metric_label = "Середня оцінка аномалії"
 
-        if len(predictions) >= 200 and int(np.sum(predictions == 1)) == 0:
+        if int(np.sum(predictions == 1)) == 0:
             span = float(np.max(decision_scores) - np.min(decision_scores)) if len(decision_scores) else 0.0
-            if span <= 1e-6:
+            score_min = float(np.min(decision_scores)) if len(decision_scores) else 0.0
+            threshold_gap = float(score_min - effective_threshold)
+            recovery_applied = False
+
+            if threshold_gap > max(adaptive_scale * 0.5, 0.02):
+                calibration_meta = metadata.get("if_calibration") if isinstance(metadata.get("if_calibration"), dict) else {}
+                calibration_effective_fp_cap = calibration_meta.get("effective_fp_cap")
+                calibration_attack_support = calibration_meta.get("attack_support")
+                calibration_policy = str(calibration_meta.get("selection_policy") or "")
+
+                attack_support_value = int(calibration_attack_support) if isinstance(calibration_attack_support, (int, float)) else 0
+                calibration_fp_cap_value = float(calibration_effective_fp_cap) if isinstance(calibration_effective_fp_cap, (int, float)) else 0.0
+                can_apply_shift_recovery = bool(
+                    calibration_fp_cap_value > 0.0
+                    and decision_scores.size >= 20
+                    and (
+                        attack_support_value <= 0
+                        or calibration_policy.startswith("unsupervised")
+                        or calibration_policy in {"supervised_fp_relaxed_for_recall", "supervised_fp_bound"}
+                    )
+                )
+
+                logger.info(
+                    "[IF_SCAN] zero-anomaly detected threshold_gap={} adaptive_scale={} calibration_policy={} attack_support={} effective_fp_cap={} recovery_allowed={}",
+                    float(threshold_gap),
+                    float(adaptive_scale),
+                    calibration_policy,
+                    int(attack_support_value),
+                    float(calibration_fp_cap_value),
+                    bool(can_apply_shift_recovery),
+                )
+
+                if can_apply_shift_recovery:
+                    base_recovery_fp_cap = float(np.clip(calibration_fp_cap_value, 0.03, 0.20))
+                    gap_ratio = float(threshold_gap / max(adaptive_scale, 1e-6))
+
+                    recovery_bonus = 0.0
+                    if gap_ratio >= 2.2:
+                        recovery_bonus = 0.12
+                    elif gap_ratio >= 1.6:
+                        recovery_bonus = 0.08
+                    elif gap_ratio >= 1.2:
+                        recovery_bonus = 0.05
+
+                    recovery_fp_cap = float(np.clip(base_recovery_fp_cap + recovery_bonus, 0.03, 0.20))
+                    target_recovery_count = int(np.ceil(recovery_fp_cap * len(decision_scores)))
+                    target_recovery_count = int(np.clip(target_recovery_count, 1, len(decision_scores)))
+                    sorted_indices = np.argsort(decision_scores, kind="stable")
+                    recovery_threshold = float(decision_scores[sorted_indices[target_recovery_count - 1]])
+
+                    if recovery_threshold > float(effective_threshold):
+                        recovery_predictions = np.zeros(len(decision_scores), dtype=np.int32)
+                        recovery_predictions[sorted_indices[:target_recovery_count]] = 1
+                        recovered_anomalies = int(np.sum(recovery_predictions == 1))
+                        if recovered_anomalies > 0:
+                            predictions = recovery_predictions
+                            effective_threshold = float(recovery_threshold)
+                            recovery_applied = True
+                            model_note += (
+                                " Виявлено зсув розподілу IF під час сканування. "
+                                f"Застосовано recovery-поріг q{int(round(recovery_fp_cap * 100)):02d} "
+                                f"({float(effective_threshold):.6f}) для відновлення детекції аномалій."
+                            )
+                            if isinstance(if_diagnostics, dict):
+                                if_diagnostics["selection_policy"] = "if_threshold_shift_recovery"
+                                if_diagnostics["effective_threshold"] = float(effective_threshold)
+                                if_diagnostics["gap_ratio"] = float(gap_ratio)
+                                if_diagnostics["base_recovery_fp_cap"] = float(base_recovery_fp_cap)
+                                if_diagnostics["recovery_fp_cap"] = float(recovery_fp_cap)
+                                if_diagnostics["target_recovery_count"] = int(target_recovery_count)
+                                if_diagnostics["predicted_anomalies"] = int(recovered_anomalies)
+                                if_diagnostics["predicted_anomaly_rate"] = float(
+                                    recovered_anomalies / max(len(predictions), 1)
+                                )
+                            logger.info(
+                                "[IF_SCAN] recovery applied policy=if_threshold_shift_recovery gap_ratio={} recovery_fp_cap={} recovery_threshold={} target_count={} recovered_anomalies={}/{}",
+                                float(gap_ratio),
+                                float(recovery_fp_cap),
+                                float(effective_threshold),
+                                int(target_recovery_count),
+                                int(recovered_anomalies),
+                                int(len(predictions)),
+                            )
+
+            if not recovery_applied and span <= 1e-6:
                 model_note += (
                     " Рішення Isolation Forest майже константні для цього PCAP. "
                     "Є ризик пропуску атак; рекомендовано перетренувати IF на змішаному наборі "
                     "(benign + attack) та перевірити поріг."
+                )
+            elif not recovery_applied and threshold_gap > max(adaptive_scale * 0.5, 0.02):
+                model_note += (
+                    " Поріг IF нижчий за весь діапазон рішень цього PCAP "
+                    f"(min_score={score_min:.6f} > threshold={float(effective_threshold):.6f}). "
+                    "Це типова ознака зсуву калібрування між train/calibration і реальним PCAP; "
+                    "рекомендовано перевчити IF на репрезентативних benign+attack flow-ознаках "
+                    "та повторно перевірити sensitivity."
                 )
 
         if (
@@ -1501,6 +1763,7 @@ def _run_scan(
             )
 
             if can_apply_low_rate_recovery:
+                # Guarded floor for severe CSV under-detection on supervised-calibrated IF models.
                 floor_rate = float(np.clip(max(calibration_fp_cap_value + 0.04, 0.12), 0.12, 0.18))
                 if floor_rate > current_anomaly_rate + 1e-9:
                     target_count = int(np.ceil(floor_rate * len(decision_scores)))
@@ -1530,16 +1793,24 @@ def _run_scan(
                                 if_diagnostics["predicted_anomaly_rate"] = float(
                                     recovered_anomalies / max(len(predictions), 1)
                                 )
+                            logger.info(
+                                "[IF_SCAN] csv low-rate recovery applied policy=if_threshold_csv_low_rate_recovery floor_rate={} recovery_threshold={} target_count={} recovered_anomalies={}/{}",
+                                float(floor_rate),
+                                float(effective_threshold),
+                                int(target_count),
+                                int(recovered_anomalies),
+                                int(len(predictions)),
+                            )
 
         prediction_labels = np.where(predictions == 1, "Anomaly", "Normal")
     else:
         probabilities = engine.predict_proba(X)
         if probabilities is not None:
             classes = list(preprocessor.target_encoder.classes_)
-            # Find exact index of the normal/benign class
+            # Знаходимо точний індекс нормального/benign класу.
             benign_idx = next((i for i, c in enumerate(classes) if is_benign_label(c)), -1)
 
-            # Calculate attack probability (1.0 minus normal probability)
+            # Обчислюємо ймовірність атаки (1.0 мінус ймовірність нормального класу).
             if benign_idx != -1 and probabilities.shape[1] > 1:
                 attack_probs = 1.0 - probabilities[:, benign_idx]
             elif probabilities.shape[1] > 1:
@@ -1547,7 +1818,7 @@ def _run_scan(
             else:
                 attack_probs = probabilities[:, 0]
 
-            # Apply user sensitivity threshold
+            # Застосовуємо обраний користувачем поріг чутливості.
             raw_preds = np.argmax(probabilities, axis=1)
             if benign_idx != -1:
                 if probabilities.shape[1] > 1:
@@ -1574,6 +1845,18 @@ def _run_scan(
     anomalies_count = int(anomalies_mask.sum())
     risk_score = round((anomalies_count / max(total_records, 1)) * 100, 2)
     risk_level = _risk_level(risk_score)
+
+    logger.info(
+        "[SCAN] done file={} model={} algorithm={} total_records={} anomalies={} risk_score={} risk_level={} if_policy={}",
+        selected_path.name,
+        selected_model_name,
+        algorithm,
+        int(total_records),
+        int(anomalies_count),
+        float(risk_score),
+        risk_level,
+        str((if_diagnostics or {}).get("selection_policy") or ""),
+    )
 
     preview_columns = [
         column
@@ -1886,6 +2169,50 @@ def _render_scan_result(result: dict[str, Any]) -> None:
                 st.markdown("- Якщо ризик > 15%, пріоритезуйте перевірку сервісів із найбільшим внеском у аномалії та обмежте доступ до них до завершення triage.")
             else:
                 st.markdown("- Для цього набору немає надійної деталізації типів атак; пріоритезуйте дії за IP/портами та часовими піками із розділів 4-5.")
+
+    st.subheader("РОЗДІЛ 7 — ЕКСПОРТ ЗВІТУ", anchor=False)
+    report_stamp = time.strftime("%Y%m%d_%H%M%S")
+    top_anomalies = (
+        alerts_only["attack_name"].astype(str).value_counts().head(10).to_dict()
+        if (not alerts_only.empty and "attack_name" in alerts_only.columns)
+        else {}
+    )
+    report_payload = {
+        "generated_at": report_stamp,
+        "file_name": str(result.get("file_name", "")),
+        "dataset_type": str(result.get("dataset_type", "")),
+        "model_name": str(result.get("model_name", "")),
+        "algorithm": str(result.get("algorithm", "")),
+        "total_records": int(result.get("total_records", 0)),
+        "anomalies_count": int(result.get("anomalies_count", 0)),
+        "risk_score": float(result.get("risk_score", 0.0)),
+        "risk_level": str(result.get("risk_level", "")),
+        "top_anomalies": {str(key): int(value) for key, value in top_anomalies.items()},
+        "if_diagnostics": result.get("if_diagnostics") if isinstance(result.get("if_diagnostics"), dict) else None,
+    }
+
+    export_col1, export_col2 = st.columns(2)
+    with export_col1:
+        st.download_button(
+            "Завантажити звіт (JSON)",
+            data=json.dumps(report_payload, ensure_ascii=False, indent=2),
+            file_name=f"scan_report_{report_stamp}.json",
+            mime="application/json",
+            width="stretch",
+        )
+
+    with export_col2:
+        anomalies_export = alerts_only.drop(columns=["severity_rank"], errors="ignore").copy()
+        if anomalies_export.empty:
+            st.caption("Аномалій не виявлено: CSV звіту недоступний.")
+        else:
+            st.download_button(
+                "Завантажити аномалії (CSV)",
+                data=anomalies_export.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"anomalies_report_{report_stamp}.csv",
+                mime="text/csv",
+                width="stretch",
+            )
 
     with st.expander("Приклад результатів", expanded=False):
         preview = result.get("result_preview")

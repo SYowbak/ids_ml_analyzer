@@ -8,11 +8,12 @@ from typing import Generator, Optional
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
+from loguru import logger
 
 from src.database.models import Base
 import json
 
-# Створення engine
+# Створення рушія БД
 _engine = None
 _engine_db_path: Optional[Path] = None
 _SessionLocal = None
@@ -36,8 +37,8 @@ def _read_db_path_setting(settings_path: Optional[Path] = None, default: str = "
             if isinstance(data, dict):
                 value = str(data.get("db_path", default)).strip()
                 return value or str(default)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Не вдалося зчитати db_path із {}: {}", path, exc)
     return str(default)
 
 
@@ -60,8 +61,8 @@ def get_engine():
     if _engine is not None and _engine_db_path is not None and _engine_db_path != resolved_db_path:
         try:
             _engine.dispose()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Не вдалося коректно закрити попередній engine SQLite: {}", exc)
         _engine = None
         _SessionLocal = None
 
@@ -137,7 +138,6 @@ def init_db():
     # Створення таблиць
     Base.metadata.create_all(bind=engine)
 
-    from loguru import logger
     logger.info("Базу даних ініціалізовано: {}", str(_engine_db_path) if _engine_db_path else "unknown")
 
 def drop_db():
@@ -207,7 +207,7 @@ def get_attack_distribution():
 
 class DatabaseService:
     """
-    Клас-обгортка для роботи з базою даних з UI (core_state)
+    Клас-обгортка для роботи з базою даних у UI runtime.
     """
     
     def __init__(self):
@@ -215,8 +215,7 @@ class DatabaseService:
         try:
             init_db()
         except Exception as e:
-            from loguru import logger
-            logger.error(f"Failed to initialize database: {e}")
+            logger.exception("Failed to initialize database: {}", e)
             
     def get_session_count(self) -> int:
         return get_session_count()
@@ -246,9 +245,8 @@ class DatabaseService:
             db.commit()
             db.refresh(session)
             return session.id
-        except Exception as e:
-            from loguru import logger
-            logger.error(f"Failed to save analysis session: {e}")
+        except Exception as exc:
+            logger.error("Failed to save analysis session: {}", exc)
             db.rollback()
             return -1
         finally:
@@ -277,9 +275,8 @@ class DatabaseService:
                     session.processing_time = processing_time
                     
                 db.commit()
-        except Exception as e:
-            from loguru import logger
-            logger.error(f"Failed to update analysis session: {e}")
+        except Exception as exc:
+            logger.error("Failed to update analysis session: {}", exc)
             db.rollback()
         finally:
             db.close()
@@ -313,9 +310,8 @@ class DatabaseService:
                     'model_name': model_name
                 })
             return result
-        except Exception as e:
-            from loguru import logger
-            logger.error(f"Failed to fetch scan history: {e}")
+        except Exception as exc:
+            logger.error("Failed to fetch scan history: {}", exc)
             return []
         finally:
             db.close()
@@ -345,7 +341,7 @@ class DatabaseService:
 
             session = AnalysisSession(
                 filename=filename,
-                file_type=filename.split('.')[-1].lower() if '.' in filename else 'unknown',
+                file_type=(Path(filename).suffix.lstrip('.').lower() or 'unknown'),
                 total_records=total,
                 anomalies_found=anomalies,
                 risk_score=risk_score,
@@ -357,9 +353,8 @@ class DatabaseService:
             db.commit()
             db.refresh(session)
             return session.id
-        except Exception as e:
-            from loguru import logger
-            logger.error(f"Failed to save scan: {e}")
+        except Exception as exc:
+            logger.error("Failed to save scan: {}", exc)
             db.rollback()
             return -1
         finally:
@@ -379,9 +374,8 @@ class DatabaseService:
 
             db.commit()
             return int(deleted_sessions)
-        except Exception as e:
-            from loguru import logger
-            logger.error(f"Failed to clear scan history: {e}")
+        except Exception as exc:
+            logger.error("Failed to clear scan history: {}", exc)
             db.rollback()
             return -1
         finally:

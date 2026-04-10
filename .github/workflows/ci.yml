@@ -7,6 +7,7 @@ on:
 jobs:
   regression:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,15 +22,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run regression tests
+      - name: Run regression checks
         run: |
-          pytest -q \
-            tests/test_threshold_provenance_policy.py \
-            tests/test_training_scanning_lifecycle_integration.py \
-            tests/test_scanning_schema_precheck.py \
-            tests/test_scanning_auto_model_choice.py \
-            tests/test_model_engine_if_calibration.py \
-            tests/test_database_path_resolution.py
+          python -m compileall -q src scripts
+          python scripts/runtime_smoke_quality_checks.py
 
   strict-e2e:
     runs-on: ubuntu-latest
@@ -49,10 +45,5 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Bootstrap required model artifacts
-        run: python scripts/bootstrap_required_models.py
-
-      - name: Run strict PCAP E2E gate
-        env:
-          IDS_STRICT_E2E: "1"
-        run: pytest -q -rs tests/test_pcap_real_e2e_regression.py
+      - name: Run strict real quality gate
+        run: python scripts/real_training_quality_gate.py

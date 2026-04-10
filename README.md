@@ -36,7 +36,7 @@ IDS ML Analyzer — застосунок для навчання та аналі
 - `PCAP` у поточному UI використовується для сканування/детекції (інференс), а не як прямий формат навчання.
 
 ## Вимоги
-- Python 3.10+
+- Python 3.11+ (офіційно перевіряється в CI)
 - Windows/Linux/macOS
 
 ## Встановлення
@@ -69,12 +69,26 @@ streamlit run src/ui/app.py
 - `datasets/`: навчальні/тестові CSV, PCAP, user uploads.
 - `models/`: збережені моделі.
 
+## Портативність шляхів
+- У проєкті не використовуються жорстко зашиті абсолютні шляхи до робочої папки.
+- Скрипти визначають корінь проєкту динамічно через шлях поточного файлу.
+- VS Code задачі налаштовані через `${workspaceFolder}`, тому проєкт переноситься між папками/ПК без ручного редагування шляхів.
+
 ## Важливо про серіалізацію XGBoost
 Для XGBoost використовується збереження бустера у форматі `.ubj` (через `save_model`) замість зберігання повного об'єкта у pickle/joblib. Це знижує ризики несумісності між версіями бібліотек.
 
 ## Тестування
+
+Базова перевірка синтаксису:
+
 ```bash
-pytest -v
+python -m compileall -q src scripts
+```
+
+Реальний runtime smoke QA (навчання, калібрування, пороги, PCAP-детекція):
+
+```bash
+python scripts/runtime_smoke_quality_checks.py
 ```
 
 ## Реальний quality gate навчання
@@ -84,15 +98,21 @@ pytest -v
 python scripts/real_training_quality_gate.py
 ```
 
+На Windows рекомендовано явний запуск через інтерпретатор проєктного віртуального середовища:
+
+```powershell
+.\.venv\Scripts\python.exe scripts/real_training_quality_gate.py
+```
+
 Цей скрипт виконує:
 - bootstrap обов'язкових CIC моделей з наявних датасетів;
-- регресійні тести навчання/калібрування;
+- compileall-перевірку синтаксису (`src/`, `scripts/`);
+- runtime smoke QA перевірки навчання/калібрування/порогів;
 - strict real-PCAP E2E перевірку (`IDS_STRICT_E2E=1`).
 
-Примітка: частина real-PCAP E2E тестів залежить від наявності вже навчених моделей у `models/`.
 Для strict-профілю (щоб відсутні моделі/файли не skip-ались, а падали):
 
 ```powershell
 $env:IDS_STRICT_E2E=1
-pytest -q -rs tests/test_pcap_real_e2e_regression.py
+python scripts/runtime_smoke_quality_checks.py
 ```
