@@ -12,6 +12,7 @@ import gc
 from typing import Any, Optional, Callable
 from pathlib import Path
 from datetime import datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
 import numpy as np
@@ -24,6 +25,24 @@ from src.core.model_engine import ModelEngine
 from src.core.two_stage_model import TwoStageModel
 
 logger = logging.getLogger(__name__)
+KYIV_TIMEZONE_NAME = "Europe/Kyiv"
+
+
+def _smart_model_timestamp_kyiv() -> str:
+    try:
+        return datetime.now(ZoneInfo(KYIV_TIMEZONE_NAME)).strftime("%H%M%S_%d%m%Y")
+    except ZoneInfoNotFoundError:
+        logger.warning(
+            "[TIMEZONE] %s not found; fallback to local system time for model naming",
+            KYIV_TIMEZONE_NAME,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[TIMEZONE] Failed to resolve %s (%s); fallback to local system time",
+            KYIV_TIMEZONE_NAME,
+            exc,
+        )
+    return datetime.now().strftime("%H%M%S_%d%m%Y")
 
 
 class SmartTrainingResult:
@@ -326,7 +345,7 @@ class TrainingService:
             return {'created': False, 'error': 'Failed to train any model'}
         
         # Save model
-        timestamp = datetime.now().strftime("%H%M%S_%d%m%Y")
+        timestamp = _smart_model_timestamp_kyiv()
         model_name = f"ids_model_smart_tabular_{timestamp}.joblib"
         
         engine.model = best_model
@@ -449,7 +468,7 @@ class TrainingService:
             log_callback("IF calibration: unsupervised fallback")
         
         # Save model
-        timestamp = datetime.now().strftime("%H%M%S_%d%m%Y")
+        timestamp = _smart_model_timestamp_kyiv()
         model_name = f"ids_model_smart_if_{timestamp}.joblib"
         
         metadata = {

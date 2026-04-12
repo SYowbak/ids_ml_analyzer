@@ -39,12 +39,8 @@ def build_threshold_provenance(
             # when it recommends a stricter threshold for PCAP detection.
             thresholds_by_input_type["pcap"] = clamp_threshold(max(base_threshold, 0.20))
             notes_by_input_type["pcap"] = "cic_pcap_calibrated_random_forest_floor"
-            if selection_policy == "holdout_rate_calibrated":
-                thresholds_by_input_type["csv"] = clamp_threshold(base_threshold)
-                notes_by_input_type["csv"] = "cic_csv_holdout_rate_calibrated"
-            else:
-                thresholds_by_input_type["csv"] = clamp_threshold(min(base_threshold, 0.02))
-                notes_by_input_type["csv"] = "cic_csv_floor_rare_attack_coverage"
+            thresholds_by_input_type["csv"] = clamp_threshold(max(base_threshold, 0.30))
+            notes_by_input_type["csv"] = "cic_csv_random_forest_guardrail_030"
         elif algorithm == "XGBoost":
             hard_case_sources = metadata.get("cic_hard_case_reference_sources")
             if isinstance(hard_case_sources, list) and hard_case_sources:
@@ -60,8 +56,9 @@ def build_threshold_provenance(
                 thresholds_by_input_type["csv"] = clamp_threshold(min(base_threshold, 0.02))
                 notes_by_input_type["csv"] = "cic_csv_floor_rare_attack_coverage"
     elif dataset_type == "NSL-KDD":
-        thresholds_by_input_type["csv"] = clamp_threshold(min(base_threshold, 0.05))
-        notes_by_input_type["csv"] = "nsl_csv_floor_rare_attack_coverage"
+        # NSL auto-threshold guardrail: keep balanced scan sensitivity to avoid FP spikes.
+        thresholds_by_input_type["csv"] = 0.30
+        notes_by_input_type["csv"] = "nsl_csv_balanced_guardrail_030"
     elif dataset_type == "UNSW-NB15":
         thresholds_by_input_type["csv"] = clamp_threshold(base_threshold)
         notes_by_input_type["csv"] = "unsw_csv_model_threshold"
@@ -140,30 +137,44 @@ def _resolve_legacy_threshold(manifest: dict[str, Any], inspection: Any) -> tupl
             )
 
     if input_type == "csv":
-        if dataset_type == "CIC-IDS" and algorithm in {"Random Forest", "XGBoost"}:
+        if dataset_type == "CIC-IDS" and algorithm == "Random Forest":
+            adjusted = clamp_threshold(max(threshold_value, 0.30))
+            return (
+                adjusted,
+                "Рекомендований поріг для цієї моделі: "
+                f"{adjusted:.2f} (legacy CIC RF CSV guardrail)",
+                {
+                    "policy_id": LEGACY_POLICY_ID,
+                    "source": "legacy_runtime_override",
+                    "rule": "cic_csv_random_forest_guardrail_030",
+                    "input_type": input_type,
+                    "threshold": float(adjusted),
+                },
+            )
+        if dataset_type == "CIC-IDS" and algorithm == "XGBoost":
             adjusted = clamp_threshold(min(threshold_value, 0.02))
             return (
                 adjusted,
                 "Рекомендований поріг для цієї моделі: "
-                f"{adjusted:.2f} (legacy CIC CSV override)",
+                f"{adjusted:.2f} (legacy CIC XGBoost CSV override)",
                 {
                     "policy_id": LEGACY_POLICY_ID,
                     "source": "legacy_runtime_override",
-                    "rule": "cic_csv_supervised",
+                    "rule": "cic_csv_xgboost",
                     "input_type": input_type,
                     "threshold": float(adjusted),
                 },
             )
         if dataset_type == "NSL-KDD":
-            adjusted = clamp_threshold(min(threshold_value, 0.05))
+            adjusted = 0.30
             return (
                 adjusted,
                 "Рекомендований поріг для цієї моделі: "
-                f"{adjusted:.2f} (legacy NSL CSV override)",
+                f"{adjusted:.2f} (legacy NSL CSV guardrail)",
                 {
                     "policy_id": LEGACY_POLICY_ID,
                     "source": "legacy_runtime_override",
-                    "rule": "nsl_csv",
+                    "rule": "nsl_csv_guardrail_030",
                     "input_type": input_type,
                     "threshold": float(adjusted),
                 },
@@ -254,6 +265,25 @@ def resolve_threshold_for_scan(
             resolved = clamp_threshold(max(float(base_threshold), 0.20))
             selected_rule = "pcap_calibrated_floor"
             note = "runtime_upgrade_from_static_pcap_floor"
+
+        if (
+            input_type == "csv"
+            and dataset_type == "NSL-KDD"
+            and float(resolved) < 0.30
+        ):
+            resolved = 0.30
+            selected_rule = "nsl_csv_runtime_guardrail_030"
+            note = "runtime_upgrade_from_low_nsl_threshold"
+
+        if (
+            input_type == "csv"
+            and dataset_type == "CIC-IDS"
+            and algorithm == "Random Forest"
+            and float(resolved) < 0.30
+        ):
+            resolved = 0.30
+            selected_rule = "cic_csv_rf_runtime_guardrail_030"
+            note = "runtime_upgrade_from_low_cic_rf_threshold"
 
         caption = (
             f"Рекомендований поріг для цієї моделі: {resolved:.2f} "

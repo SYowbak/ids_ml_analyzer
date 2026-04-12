@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import json
 from pathlib import Path
 from typing import Any
@@ -872,13 +873,19 @@ def _validate_csv_against_model(csv_path: Path, metadata: dict[str, Any]) -> str
     missing = sorted(expected - candidate_features)
     unexpected = sorted(candidate_features - expected)
 
-    if missing or unexpected:
+    if missing:
         message_parts: list[str] = []
-        if missing:
-            message_parts.append("відсутні: " + ", ".join(missing[:8]))
         if unexpected:
-            message_parts.append("зайві: " + ", ".join(unexpected[:8]))
+            message_parts.append("зайві (будуть проігноровані): " + ", ".join(unexpected[:8]))
+        message_parts.insert(0, "відсутні: " + ", ".join(missing[:8]))
         return "CSV не збігається зі схемою моделі: " + "; ".join(message_parts) + "."
+
+    if unexpected:
+        logger.info(
+            "CSV {} містить {} зайвих колонок, їх буде проігноровано під час завантаження.",
+            csv_path.name,
+            len(unexpected),
+        )
 
     return None
 
@@ -920,8 +927,29 @@ def _severity_order() -> dict[str, int]:
         "Високий": 3,
         "Помірний": 2,
         "Низький": 1,
-        "Безпечно": 0,
+        "Безпечний": 0,
     }
+
+
+def _severity_color_map() -> dict[str, str]:
+    return {
+        "Критичний": "#c62828",
+        "Високий": "#ef6c00",
+        "Помірний": "#f9a825",
+        "Низький": "#546e7a",
+        "Безпечний": "#2e7d32",
+    }
+
+
+_UNLABELED_SERVICE_DISPLAY = "Без позначки"
+_UNLABELED_SERVICE_TOKENS = {"", "-", "nan", "none", "null", "unknown", "невідомо", "н/д"}
+
+
+def _normalize_service_display(value: Any) -> str:
+    text = str(value).strip()
+    if text.lower() in _UNLABELED_SERVICE_TOKENS:
+        return _UNLABELED_SERVICE_DISPLAY
+    return text
 
 
 def _is_informative_series(series: pd.Series) -> bool:
@@ -945,6 +973,8 @@ def _build_top_table(
         return pd.DataFrame(columns=[value_label, "Кількість"])
 
     series = frame[column].dropna().astype(str).str.strip()
+    if column == "service":
+        series = series.map(_normalize_service_display)
     series = series[(series != "") & (series.str.lower() != "н/д") & (series.str.lower() != "nan")]
     if series.empty:
         return pd.DataFrame(columns=[value_label, "Кількість"])
@@ -962,6 +992,8 @@ def _top_value_stats(frame: pd.DataFrame, column: str) -> tuple[str, int, float]
         return None
 
     series = frame[column].dropna().astype(str).str.strip()
+    if column == "service":
+        series = series.map(_normalize_service_display)
     series = series[(series != "") & (series.str.lower() != "н/д") & (series.str.lower() != "nan")]
     if series.empty:
         return None
@@ -979,12 +1011,12 @@ def _top_value_stats(frame: pd.DataFrame, column: str) -> tuple[str, int, float]
 def _build_family_indicator_tables(
     alerts_only: pd.DataFrame,
     dataset_type: str,
-) -> list[tuple[str, pd.DataFrame]]:
+) -> list[tuple[str, str, pd.DataFrame]]:
     if alerts_only is None or alerts_only.empty:
         return []
 
     family = str(dataset_type or "")
-    tables: list[tuple[str, pd.DataFrame]] = []
+    tables: list[tuple[str, str, pd.DataFrame]] = []
 
     if family == "NSL-KDD":
         candidates = [
@@ -1011,7 +1043,7 @@ def _build_family_indicator_tables(
     for title, column, value_label in candidates:
         table = _build_top_table(alerts_only, column, value_label=value_label)
         if not table.empty:
-            tables.append((title, table))
+            tables.append((title, column, table))
 
     return tables
 
@@ -1035,6 +1067,95 @@ def _adaptive_chart_candidates(dataset_type: str) -> list[tuple[str, str, str]]:
         ("Розподіл аномалій за портами призначення", "dst_port", "Порт призначення"),
         ("Розподіл аномалій за протоколами", "protocol", "Протокол"),
     ]
+
+
+def _adaptive_chart_palette(column: str) -> list[str]:
+    palettes: dict[str, list[str]] = {
+        # Protocol-family charts.
+        "protocol_type": ["#1565c0", "#1e88e5", "#42a5f5", "#90caf9", "#0d47a1"],
+        "proto": ["#1565c0", "#1e88e5", "#42a5f5", "#90caf9", "#0d47a1"],
+        "protocol": ["#1565c0", "#1e88e5", "#42a5f5", "#90caf9", "#0d47a1"],
+        # Service-family charts.
+        "service": ["#00897b", "#26a69a", "#4db6ac", "#80cbc4", "#00695c"],
+        # Session/flag-family charts.
+        "flag": ["#ef6c00", "#fb8c00", "#ffb74d", "#ffe0b2", "#e65100"],
+        "state": ["#8e24aa", "#ab47bc", "#ba68c8", "#ce93d8", "#6a1b9a"],
+        # Network IOC-family charts.
+        "src_ip": ["#2e7d32", "#43a047", "#66bb6a", "#81c784", "#1b5e20"],
+        "dst_port": ["#c62828", "#e53935", "#ef5350", "#ef9a9a", "#b71c1c"],
+    }
+    return palettes.get(column, ["#455a64", "#607d8b", "#78909c", "#90a4ae", "#37474f"])
+
+
+def _hex_to_rgb(color: str) -> tuple[int, int, int]:
+    cleaned = str(color).strip().lstrip("#")
+    if len(cleaned) != 6:
+        return (69, 90, 100)
+    try:
+        return (int(cleaned[0:2], 16), int(cleaned[2:4], 16), int(cleaned[4:6], 16))
+    except ValueError:
+        return (69, 90, 100)
+
+
+def _rgba(color: str, alpha: float) -> str:
+    red, green, blue = _hex_to_rgb(color)
+    alpha_value = float(np.clip(alpha, 0.0, 1.0))
+    return f"rgba({red}, {green}, {blue}, {alpha_value:.3f})"
+
+
+def _indicator_table_column_config() -> dict[str, Any]:
+    return {
+        "№": st.column_config.TextColumn("№", width="small"),
+    }
+
+
+def _style_indicator_table(table: pd.DataFrame, family_column: str):
+    view = with_row_number(table)
+    if "№" in view.columns:
+        view["№"] = view["№"].astype(str)
+    accent_color = _adaptive_chart_palette(family_column)[0]
+    value_columns = [name for name in view.columns if name not in {"№", "Кількість"}]
+    value_column = value_columns[0] if value_columns else None
+
+    if "Кількість" in view.columns and not view["Кількість"].empty:
+        max_count = float(pd.to_numeric(view["Кількість"], errors="coerce").fillna(0.0).max())
+    else:
+        max_count = 1.0
+    max_count = max(max_count, 1.0)
+
+    def _style_row(row: pd.Series) -> list[str]:
+        styles = [""] * len(view.columns)
+
+        if "№" in view.columns:
+            number_index = int(view.columns.get_loc("№"))
+            styles[number_index] = (
+                "text-align: center; "
+                "font-variant-numeric: tabular-nums; "
+                f"color: {_rgba(accent_color, 0.95)};"
+            )
+
+        if value_column and value_column in view.columns:
+            value_index = int(view.columns.get_loc(value_column))
+            styles[value_index] = (
+                f"background-color: {_rgba(accent_color, 0.10)}; "
+                f"border-left: 3px solid {accent_color}; "
+                "font-weight: 600;"
+            )
+
+        if "Кількість" in view.columns:
+            count_index = int(view.columns.get_loc("Кількість"))
+            parsed_count = pd.to_numeric(row.get("Кількість"), errors="coerce")
+            count_value = float(parsed_count) if not pd.isna(parsed_count) else 0.0
+            ratio = float(np.clip(count_value / max_count, 0.0, 1.0))
+            count_alpha = 0.12 + 0.30 * ratio
+            styles[count_index] = (
+                f"background-color: {_rgba(accent_color, count_alpha)}; "
+                "font-weight: 600;"
+            )
+
+        return styles
+
+    return view.style.apply(_style_row, axis=1)
 
 
 def _render_adaptive_report_charts(
@@ -1079,14 +1200,53 @@ def _render_adaptive_report_charts(
             severity_table.columns = ["Критичність", "Кількість"]
             severity_table["_rank"] = severity_table["Критичність"].map(lambda value: severity_order.get(str(value), -1))
             severity_table = severity_table.sort_values("_rank", ascending=False).drop(columns=["_rank"])
+
+            total_with_severity = int(severity_table["Кількість"].sum())
+            if total_with_severity > 0:
+                severity_table["Частка, %"] = severity_table["Кількість"].astype(float) / float(total_with_severity) * 100.0
+            else:
+                severity_table["Частка, %"] = 0.0
+            severity_table["Підпис"] = severity_table.apply(
+                lambda row: f"{int(row['Кількість']):,} ({float(row['Частка, %']):.1f}%)".replace(",", " "),
+                axis=1,
+            )
+
+            ordered_levels = sorted(
+                severity_table["Критичність"].astype(str).tolist(),
+                key=lambda value: severity_order.get(value, -1),
+                reverse=True,
+            )
             severity_figure = px.bar(
                 severity_table,
                 x="Критичність",
                 y="Кількість",
+                color="Критичність",
+                category_orders={"Критичність": ordered_levels},
+                color_discrete_map=_severity_color_map(),
                 title="Розподіл подій за критичністю",
-                text="Кількість",
+                text="Підпис",
             )
-            severity_figure.update_layout(margin=dict(l=10, r=10, t=50, b=10), height=360)
+            severity_figure.update_traces(
+                textposition="outside",
+                cliponaxis=False,
+                marker_line_color="rgba(15, 23, 42, 0.25)",
+                marker_line_width=1,
+                customdata=severity_table[["Частка, %"]].to_numpy(),
+                hovertemplate="<b>%{x}</b><br>Кількість: %{y:,.0f}<br>Частка: %{customdata[0]:.1f}%<extra></extra>",
+            )
+            severity_figure.update_layout(
+                margin=dict(l=10, r=10, t=50, b=10),
+                height=360,
+                showlegend=False,
+                plot_bgcolor="rgba(0, 0, 0, 0)",
+                paper_bgcolor="rgba(0, 0, 0, 0)",
+                yaxis_title="Кількість",
+                xaxis_title="Критичність",
+                uniformtext_minsize=10,
+                uniformtext_mode="show",
+            )
+            severity_figure.update_xaxes(categoryorder="array", categoryarray=ordered_levels)
+            severity_figure.update_yaxes(gridcolor="rgba(148, 163, 184, 0.25)")
             st.plotly_chart(severity_figure, width="stretch")
         else:
             st.info("Немає інформативних даних критичності для побудови графіка.")
@@ -1119,20 +1279,23 @@ def _render_adaptive_report_charts(
     )
 
     source_frame = alerts_only if not alerts_only.empty else details_df
-    available_charts: list[tuple[str, str, pd.DataFrame]] = []
+    available_charts: list[tuple[str, str, str, pd.DataFrame]] = []
     for title, column, value_label in _adaptive_chart_candidates(dataset_type):
         table = _build_top_table(source_frame, column, value_label=value_label)
         if not table.empty:
-            available_charts.append((title, value_label, table))
+            available_charts.append((title, column, value_label, table))
 
     if not available_charts:
         st.info("Немає інформативних полів для доменно-адаптивних графіків у цьому звіті.")
         return
 
     chart_columns = st.columns(min(3, len(available_charts)))
-    for idx, (title, value_label, table) in enumerate(available_charts[:3]):
+    for idx, (title, column, value_label, table) in enumerate(available_charts[:3]):
         with chart_columns[idx]:
-            ordered_table = table.sort_values("Кількість", ascending=True).copy()
+            ordered_table = table.sort_values("Кількість", ascending=False).copy()
+            # Plotly draws horizontal category axes from bottom to top; invert category array
+            # so that the largest bars are shown at the top in natural reading order.
+            category_array = ordered_table[value_label].astype(str).tolist()[::-1]
             chart_height = int(min(760, max(360, 120 + 26 * len(ordered_table))))
             entity_figure = px.bar(
                 ordered_table,
@@ -1141,8 +1304,23 @@ def _render_adaptive_report_charts(
                 orientation="h",
                 title=title,
                 text="Кількість",
+                color=value_label,
+                color_discrete_sequence=_adaptive_chart_palette(column),
             )
-            entity_figure.update_layout(margin=dict(l=10, r=10, t=50, b=10), height=chart_height)
+            entity_figure.update_traces(
+                marker_line_color="rgba(15, 23, 42, 0.20)",
+                marker_line_width=1,
+                hovertemplate="<b>%{y}</b><br>Кількість: %{x:,.0f}<extra></extra>",
+            )
+            entity_figure.update_layout(
+                margin=dict(l=10, r=10, t=50, b=10),
+                height=chart_height,
+                showlegend=False,
+                plot_bgcolor="rgba(0, 0, 0, 0)",
+                paper_bgcolor="rgba(0, 0, 0, 0)",
+            )
+            entity_figure.update_xaxes(gridcolor="rgba(148, 163, 184, 0.25)")
+            entity_figure.update_yaxes(categoryorder="array", categoryarray=category_array)
             st.plotly_chart(entity_figure, width="stretch")
 
 
@@ -1448,6 +1626,240 @@ def _build_audience_summaries(
         )
 
     return user_text, soc_text
+
+
+def _format_count(value: int) -> str:
+    return f"{int(value):,}".replace(",", " ")
+
+
+def _risk_level_meta(risk_score: float) -> tuple[str, str, str]:
+    risk = float(risk_score)
+    if risk >= 40.0:
+        return (
+            "Критичний",
+            "#c62828",
+            "Потрібна негайна реакція: локалізація джерел і обмеження доступу без зволікань.",
+        )
+    if risk >= 25.0:
+        return (
+            "Високий",
+            "#ef6c00",
+            "Інцидент суттєвий: дії варто виконати протягом найближчих 15 хвилин.",
+        )
+    if risk >= 10.0:
+        return (
+            "Помірний",
+            "#f9a825",
+            "Є ознаки проблеми: потрібен контроль і підтвердження на сирих логах.",
+        )
+    return (
+        "Низький",
+        "#2e7d32",
+        "Критичного сигналу немає, але варто зберегти моніторинг та верифікацію трендів.",
+    )
+
+
+def _recommendation_focus_fields(dataset_type: str) -> list[tuple[str, str]]:
+    family = str(dataset_type or "")
+    if family == "NSL-KDD":
+        return [
+            ("Протокол", "protocol_type"),
+            ("Сервіс", "service"),
+            ("TCP прапор", "flag"),
+        ]
+    if family == "UNSW-NB15":
+        return [
+            ("Протокол", "proto"),
+            ("Сервіс", "service"),
+            ("Стан сесії", "state"),
+        ]
+    return [
+        ("IP джерела", "src_ip"),
+        ("Порт призначення", "dst_port"),
+        ("Протокол", "protocol"),
+    ]
+
+
+def _collect_recommendation_focus(
+    alerts_only: pd.DataFrame,
+    dataset_type: str,
+) -> list[dict[str, Any]]:
+    focus_items: list[dict[str, Any]] = []
+    for label, column in _recommendation_focus_fields(dataset_type):
+        stats = _top_value_stats(alerts_only, column)
+        if stats is None:
+            continue
+        value, count, share = stats
+        focus_items.append(
+            {
+                "label": label,
+                "value": str(value),
+                "count": int(count),
+                "share": float(share),
+            }
+        )
+    return focus_items
+
+
+def _render_family_recommendation_text(
+    alerts_only: pd.DataFrame,
+    details_df: pd.DataFrame,
+    dataset_type: str,
+    risk_score: float,
+    algorithm: str,
+    action_plan: pd.DataFrame,
+) -> None:
+    if alerts_only is None or alerts_only.empty:
+        return
+
+    total_records = int(len(details_df)) if isinstance(details_df, pd.DataFrame) and not details_df.empty else int(len(alerts_only))
+    anomalies_count = int(len(alerts_only))
+    anomaly_share = float((anomalies_count / max(total_records, 1)) * 100.0)
+
+    risk_label, risk_color, risk_hint = _risk_level_meta(risk_score)
+    family = str(dataset_type or "")
+    family_display = {
+        "NSL-KDD": "NSL-KDD (поведінкові ознаки)",
+        "UNSW-NB15": "UNSW-NB15 (сучасний мережевий профіль)",
+        "CIC-IDS": "CIC-IDS (мережеві IOC: IP/порти)",
+    }.get(family, "мережевий датасет")
+
+    top_attack = "Аномалія (тип не визначено)"
+    if "attack_name" in alerts_only.columns and _is_informative_series(alerts_only["attack_name"]):
+        top_attacks = alerts_only["attack_name"].astype(str).str.strip().value_counts()
+        if not top_attacks.empty:
+            top_attack = _normalize_attack_display_name(top_attacks.index[0], algorithm)
+
+    focus_items = _collect_recommendation_focus(alerts_only, family)
+    if focus_items:
+        main_focus = focus_items[0]
+        main_focus_text = (
+            f"Найсильніший сигнал: {html.escape(main_focus['label'])} «{html.escape(main_focus['value'])}» - "
+            f"{_format_count(main_focus['count'])} подій ({main_focus['share']:.1f}%)."
+        )
+    else:
+        main_focus_text = "Вираженого домінуючого індикатора не знайдено, варто орієнтуватись на сумарний тренд ризику."
+
+    if family == "NSL-KDD":
+        family_problem = (
+            "Проблема формується поведінковими ознаками protocol/service/flag, "
+            "тому важливо відслідковувати шаблони сесій, а не лише IP/порти."
+        )
+    elif family == "UNSW-NB15":
+        family_problem = (
+            "Проблема проявляється через комбінації proto/service/state, "
+            "що зазвичай означає масові або нетипові сценарії взаємодії сервісів."
+        )
+    else:
+        family_problem = (
+            "Проблема найбільш помітна у мережевих IOC (IP джерела, порти, протоколи), "
+            "тож локалізація джерела атаки зазвичай дає найшвидший ефект."
+        )
+
+    st.markdown(
+        (
+            f"<div style='border-left:4px solid {risk_color}; background-color:{_rgba(risk_color, 0.09)}; "
+            "padding:12px 14px; border-radius:8px; margin-bottom:10px;'>"
+            "<div style='font-weight:700; margin-bottom:6px;'>Що відбувається простою мовою</div>"
+            f"<div><b>Сімейство:</b> {html.escape(family_display)}. "
+            f"<b>Топ-загроза:</b> {html.escape(top_attack)}.</div>"
+            f"<div style='margin-top:4px;'>{html.escape(family_problem)}</div>"
+            f"<div style='margin-top:4px;'>{html.escape(main_focus_text)}</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        (
+            f"<div style='border-left:4px solid {risk_color}; background-color:{_rgba(risk_color, 0.13)}; "
+            "padding:12px 14px; border-radius:8px; margin-bottom:10px;'>"
+            "<div style='font-weight:700; margin-bottom:6px;'>Наскільки це погано</div>"
+            f"<div><b>Рівень ризику:</b> {html.escape(risk_label)} ({float(risk_score):.1f}%).</div>"
+            f"<div><b>Аномальні записи:</b> {_format_count(anomalies_count)} із {_format_count(total_records)} "
+            f"({anomaly_share:.1f}%).</div>"
+            f"<div style='margin-top:4px;'>{html.escape(risk_hint)}</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+    focus_list_html = ""
+    for item in focus_items[:3]:
+        focus_list_html += (
+            "<li>"
+            f"<b>{html.escape(item['label'])}:</b> {html.escape(item['value'])} - "
+            f"{_format_count(item['count'])} подій ({item['share']:.1f}%)."
+            "</li>"
+        )
+    if not focus_list_html:
+        focus_list_html = "<li>Фокус-індикатори відсутні, орієнтуйтесь на загальний risk score та динаміку в часі.</li>"
+
+    st.markdown(
+        (
+            f"<div style='border-left:4px solid {risk_color}; background-color:{_rgba(risk_color, 0.07)}; "
+            "padding:12px 14px; border-radius:8px; margin-bottom:10px;'>"
+            "<div style='font-weight:700; margin-bottom:6px;'>На чому фокусувати triage у цьому сімействі</div>"
+            f"<ul style='margin:0 0 0 18px;'>{focus_list_html}</ul>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+    action_items_html = ""
+    if isinstance(action_plan, pd.DataFrame) and not action_plan.empty:
+        for _, row in action_plan.head(3).iterrows():
+            priority = html.escape(str(row.get("Пріоритет", "P2")))
+            action_text = html.escape(str(row.get("Дія", "")).strip())
+            reason_text = html.escape(str(row.get("Чому це важливо зараз", "")).strip())
+            action_items_html += (
+                "<li>"
+                f"<b>{priority}</b>: {action_text}"
+                f"<div style='color:#475569; margin-top:2px;'>{reason_text}</div>"
+                "</li>"
+            )
+    else:
+        if family == "NSL-KDD":
+            action_items_html = (
+                "<li><b>P1</b>: Перевірте комбінації protocol_type/service/flag у SIEM та тимчасово обмежте найбільш підозрілі сервіси.</li>"
+                "<li><b>P2</b>: Підсиліть логування невдалих сесій та аномальних reset/deny подій.</li>"
+            )
+        elif family == "UNSW-NB15":
+            action_items_html = (
+                "<li><b>P1</b>: Перевірте домінуючі proto/service/state та відсікайте нетипові джерела доступу.</li>"
+                "<li><b>P2</b>: Введіть rate-limit для сервісів із різким сплеском аномалій.</li>"
+            )
+        else:
+            action_items_html = (
+                "<li><b>P1</b>: Ізолюйте top source IP або порт з найбільшим внеском у аномалії.</li>"
+                "<li><b>P2</b>: Перевірте правила FW/IPS для домінуючого протоколу і закрийте зайвий доступ.</li>"
+            )
+
+    target_anomaly_share = max(0.5, anomaly_share - max(5.0, anomaly_share * 0.3))
+    if focus_items:
+        top_share = float(focus_items[0]["share"])
+        target_top_share = max(20.0, top_share - max(10.0, top_share * 0.25))
+        success_text = (
+            f"Ціль на 15 хв: знизити частку аномалій до <= {target_anomaly_share:.1f}% "
+            f"та частку домінуючого індикатора до <= {target_top_share:.1f}%."
+        )
+    else:
+        success_text = (
+            f"Ціль на 15 хв: знизити частку аномалій до <= {target_anomaly_share:.1f}% "
+            "і прибрати різкі піки у Хронології."
+        )
+
+    st.markdown(
+        (
+            f"<div style='border-left:4px solid {risk_color}; background-color:{_rgba(risk_color, 0.10)}; "
+            "padding:12px 14px; border-radius:8px; margin-bottom:8px;'>"
+            "<div style='font-weight:700; margin-bottom:6px;'>Що робити зараз</div>"
+            f"<ul style='margin:0 0 0 18px;'>{action_items_html}</ul>"
+            f"<div style='margin-top:8px; color:#334155;'><b>Як зрозуміти, що стало краще:</b> {html.escape(success_text)}</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
 
 
 def _run_scan(
@@ -1957,7 +2369,7 @@ def _run_scan(
 
 def _render_scan_result(result: dict[str, Any]) -> None:
     st.divider()
-    st.subheader("РОЗДІЛ 1 — ЗВЕДЕННЯ", anchor=False)
+    st.subheader("Зведення", anchor=False)
     if result.get("history_saved") is False:
         st.warning(
             "Цей результат не був збережений в історію через помилку БД. "
@@ -2003,6 +2415,8 @@ def _render_scan_result(result: dict[str, Any]) -> None:
     details_df["attack_name"] = details_df["attack_label_raw"].map(
         lambda value: _normalize_attack_display_name(value, str(result.get("algorithm", "")))
     )
+    if "service" in details_df.columns:
+        details_df["service"] = details_df["service"].map(_normalize_service_display)
 
     alerts_only = details_df[details_df["is_alert"]].copy()
     dataset_type = str(result.get("dataset_type", ""))
@@ -2074,10 +2488,10 @@ def _render_scan_result(result: dict[str, Any]) -> None:
     if alerts_only.empty:
         st.info("Аномалій не виявлено. Нижче показано загальні записи для контролю якості даних.")
 
-    st.subheader("РОЗДІЛ 2 — ДЕТАЛІ АТАК", anchor=False)
+    st.subheader("Деталі атак", anchor=False)
     st.dataframe(with_row_number(details_view.head(500)), width="stretch", hide_index=True)
 
-    st.subheader("РОЗДІЛ 3 — ВІЗУАЛІЗАЦІЯ РИЗИКУ", anchor=False)
+    st.subheader("Візуалізація ризику", anchor=False)
     _render_adaptive_report_charts(
         details_df=details_df,
         alerts_only=alerts_only,
@@ -2085,26 +2499,36 @@ def _render_scan_result(result: dict[str, Any]) -> None:
         risk_score=float(result.get("risk_score", 0.0)),
     )
 
-    st.subheader("РОЗДІЛ 4 — КЛЮЧОВІ ІНДИКАТОРИ", anchor=False)
+    st.subheader("Ключові індикатори", anchor=False)
     indicator_tables = _build_family_indicator_tables(alerts_only=alerts_only, dataset_type=dataset_type)
     if indicator_tables:
         primary = indicator_tables[:3]
         secondary = indicator_tables[3:]
         cols = st.columns(len(primary))
-        for idx, (title, table) in enumerate(primary):
+        for idx, (title, family_column, table) in enumerate(primary):
             with cols[idx]:
                 st.markdown(f"**{title}**")
-                st.dataframe(with_row_number(table), width="stretch", hide_index=True)
+                st.dataframe(
+                    _style_indicator_table(table, family_column),
+                    width="stretch",
+                    hide_index=True,
+                    column_config=_indicator_table_column_config(),
+                )
 
-        for title, table in secondary:
+        for title, family_column, table in secondary:
             with st.expander(title, expanded=False):
-                st.dataframe(with_row_number(table), width="stretch", hide_index=True)
+                st.dataframe(
+                    _style_indicator_table(table, family_column),
+                    width="stretch",
+                    hide_index=True,
+                    column_config=_indicator_table_column_config(),
+                )
     else:
         st.info("У цьому результаті немає інформативних полів для побудови ключових індикаторів.")
 
     timeline_column = "timestamp" if "timestamp" in details_df.columns else ("time" if "time" in details_df.columns else None)
     if timeline_column and details_df[timeline_column].notna().any():
-        st.subheader("РОЗДІЛ 5 — ХРОНОЛОГІЯ", anchor=False)
+        st.subheader("Хронологія", anchor=False)
         timeline = details_df.copy()
         try:
             timeline[timeline_column] = pd.to_datetime(
@@ -2131,21 +2555,31 @@ def _render_scan_result(result: dict[str, Any]) -> None:
                 st.caption(f"Піки активності: максимум {int(timeline_counts['attacks'].max())} атак за інтервал.")
             
 
-    st.subheader("РОЗДІЛ 6 — РЕКОМЕНДАЦІЇ", anchor=False)
+    st.subheader("Рекомендації", anchor=False)
     if alerts_only.empty:
         st.success("Аномалій не виявлено. Додаткові дії не потрібні.")
     else:
-        st.markdown("**План дій на найближчі 15 хвилин**")
         action_plan = _build_incident_action_plan(
             alerts_only=alerts_only,
             risk_score=float(result.get("risk_score", 0.0)),
             algorithm=str(result.get("algorithm", "")),
             dataset_type=dataset_type,
         )
-        if action_plan.empty:
-            st.info("Для цього набору поки недостатньо індикаторів для автоматичного плану дій.")
-        else:
-            st.dataframe(with_row_number(action_plan), width="stretch", hide_index=True)
+
+        _render_family_recommendation_text(
+            alerts_only=alerts_only,
+            details_df=details_df,
+            dataset_type=dataset_type,
+            risk_score=float(result.get("risk_score", 0.0)),
+            algorithm=str(result.get("algorithm", "")),
+            action_plan=action_plan,
+        )
+
+        with st.expander("Детальний технічний план (таблиця)", expanded=False):
+            if action_plan.empty:
+                st.info("Для цього набору поки недостатньо індикаторів для автоматичного плану дій.")
+            else:
+                st.dataframe(with_row_number(action_plan), width="stretch", hide_index=True)
 
         st.markdown("**Точкові рекомендації за типами загроз**")
         attack_types_sorted = alerts_only["attack_label_raw"].astype(str).value_counts().sort_values(ascending=False)
@@ -2162,15 +2596,15 @@ def _render_scan_result(result: dict[str, Any]) -> None:
 
         if rendered_lines == 0:
             if dataset_type == "NSL-KDD":
-                st.markdown("- Для NSL-KDD орієнтуйтесь на аномальні комбінації protocol_type/service/flag та пікові класи сервісів із розділу 4.")
+                st.markdown("- Для NSL-KDD орієнтуйтесь на аномальні комбінації protocol_type/service/flag та пікові класи сервісів із блоку Ключові індикатори.")
                 st.markdown("- Для user-friendly контролю: якщо ризик > 15%, варто обмежити зовнішній доступ до чутливих сервісів до завершення triage.")
             elif dataset_type == "UNSW-NB15":
-                st.markdown("- Для UNSW-NB15 орієнтуйтесь на аномальні комбінації proto/service/state та частотні патерни з розділу 4.")
+                st.markdown("- Для UNSW-NB15 орієнтуйтесь на аномальні комбінації proto/service/state та частотні патерни з блоку Ключові індикатори.")
                 st.markdown("- Якщо ризик > 15%, пріоритезуйте перевірку сервісів із найбільшим внеском у аномалії та обмежте доступ до них до завершення triage.")
             else:
-                st.markdown("- Для цього набору немає надійної деталізації типів атак; пріоритезуйте дії за IP/портами та часовими піками із розділів 4-5.")
+                st.markdown("- Для цього набору немає надійної деталізації типів атак; пріоритезуйте дії за IP/портами та часовими піками з блоків Ключові індикатори і Хронологія.")
 
-    st.subheader("РОЗДІЛ 7 — ЕКСПОРТ ЗВІТУ", anchor=False)
+    st.subheader("Експорт звіту", anchor=False)
     report_stamp = time.strftime("%Y%m%d_%H%M%S")
     top_anomalies = (
         alerts_only["attack_name"].astype(str).value_counts().head(10).to_dict()

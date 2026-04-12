@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 import re
 import time
 import uuid
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import numpy as np
 import pandas as pd
@@ -43,6 +44,24 @@ TRAINING_UI_MODE_EXPERT = "Експертний (повний контроль)"
 
 HOLDOUT_RATE_PATTERN = re.compile(r"(\d+)pct_(?:anomaly|attack)", flags=re.IGNORECASE)
 REFERENCE_EXTENSIONS = {".csv", ".pcap", ".pcapng", ".cap"}
+KYIV_TIMEZONE_NAME = "Europe/Kyiv"
+
+
+def _model_timestamp_kyiv() -> str:
+    try:
+        return datetime.now(ZoneInfo(KYIV_TIMEZONE_NAME)).strftime("%Y%m%d_%H%M%S")
+    except ZoneInfoNotFoundError:
+        logger.warning(
+            "[TIMEZONE] {} not found; fallback to local system time for model naming",
+            KYIV_TIMEZONE_NAME,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[TIMEZONE] Failed to resolve {} ({}); fallback to local system time",
+            KYIV_TIMEZONE_NAME,
+            exc,
+        )
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
@@ -136,6 +155,8 @@ def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
 
         if inspection_rows:
             st.dataframe(with_row_number(pd.DataFrame(inspection_rows)), width="stretch", hide_index=True)
+        elif st.session_state.get("training_uploaded_files"):
+            st.info("CSV ще завантажується. Дочекайтеся завершення завантаження (100%).")
         else:
             st.info("Оберіть хоча б один CSV для навчання.")
 
@@ -170,20 +191,21 @@ def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
     is_expert_mode = training_ui_mode == TRAINING_UI_MODE_EXPERT
 
     pcap_optimization_available = bool(selected_dataset_type == "CIC-IDS")
-    optimize_for_pcap_detection = st.checkbox(
-        "Оптимізувати навчання для виявлення у PCAP",
-        value=bool(st.session_state.get("training_optimize_for_pcap", False)),
-        key="training_optimize_for_pcap",
-        disabled=not pcap_optimization_available,
-        help=(
-            "Додає PCAP-орієнтовані референси та жорсткіший профіль підбору даних для CIC-IDS, "
-            "щоб покращити детекцію атак у офлайн PCAP."
-        ),
-    )
-    if optimize_for_pcap_detection:
-        st.caption("PCAP-оптимізація увімкнена.")
-    elif selected_dataset_type and selected_dataset_type != "CIC-IDS":
-        st.caption("PCAP-оптимізація доступна лише для домену CIC-IDS.")
+    optimize_for_pcap_detection = False
+    if pcap_optimization_available:
+        optimize_for_pcap_detection = st.checkbox(
+            "Оптимізувати навчання для виявлення у PCAP",
+            value=bool(st.session_state.get("training_optimize_for_pcap", False)),
+            key="training_optimize_for_pcap",
+            help=(
+                "Додає PCAP-орієнтовані референси та жорсткіший профіль підбору даних для CIC-IDS, "
+                "щоб покращити детекцію атак у офлайн PCAP."
+            ),
+        )
+        if optimize_for_pcap_detection:
+            st.caption("PCAP-оптимізація увімкнена.")
+    else:
+        st.session_state["training_optimize_for_pcap"] = False
 
     if not is_expert_mode:
         default_beginner_algorithm = _default_simple_auto_algorithm(
@@ -314,7 +336,11 @@ def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
             use_grid_search = st.checkbox(
                 "Використати GridSearchCV",
                 value=False,
-                help="Працює для Random Forest та XGBoost.",
+                help=(
+                    "Автоматично перебирає комбінації гіперпараметрів і обирає найкращу за F1 "
+                    "через крос-валідацію. Зазвичай покращує якість, але помітно збільшує час навчання. "
+                    "Працює лише для Random Forest та XGBoost."
+                ),
                 key="training_use_grid_search",
             )
         else:
@@ -378,6 +404,22 @@ def render_training_tab(services: dict[str, Any], root_dir: Path) -> None:
                 help="Частка даних, що лишається для оцінки якості моделі.",
                 key="training_test_size",
             )
+
+        recommended_unlimited_guard = int(_resolve_beginner_row_limit(selected_paths))
+        if selected_paths and int(max_rows_per_file) == 0 and recommended_unlimited_guard > 0:
+            st.warning(
+                "Без ліміту (0) на великих CSV навчання може бути довшим і важчим по пам'яті. "
+                "Для стабільності можна швидко застосувати безпечний ліміт."
+            )
+            if st.button(
+                "Застосувати рекомендований ліміт 30000 рядків/CSV",
+                disabled=training_in_progress,
+                width="stretch",
+                key="training_apply_recommended_row_limit_30000",
+            ):
+                st.session_state["training_max_rows_per_file"] = 30000
+                st.rerun()
+
         if str(selected_algorithm) == "Isolation Forest":
             st.caption("IF pre-check виконується під час натискання кнопки 'Запустити навчання'.")
 
@@ -728,7 +770,7 @@ def _expert_default_widget_updates(
         optimize_for_pcap_detection=bool(optimize_for_pcap_detection),
     )
     updates = _build_manual_param_updates(selected_algorithm, algorithm_params)
-    updates["training_max_rows_per_file"] = int(max(default_row_limit, 0))
+    updates["training_max_rows_per_file"] = 0
     updates["training_test_size"] = 0.20
     updates["training_use_grid_search"] = False
     return updates
@@ -740,12 +782,14 @@ def _apply_expert_defaults_if_needed(
     selected_paths: list[Path],
     optimize_for_pcap_detection: bool,
 ) -> None:
+    defaults_version = "v2_row_limit_zero"
     dataset_label = str(dataset_type or "unknown")
     signature = (
         str(selected_algorithm),
         dataset_label,
         int(bool(optimize_for_pcap_detection)),
         len(selected_paths),
+        defaults_version,
     )
     if st.session_state.get("training_expert_defaults_signature") == signature:
         return
@@ -873,7 +917,8 @@ def _persist_uploaded_files(uploaded_files: list[Any] | None, destination_dir: P
     for uploaded in uploaded_files:
         original_name = str(getattr(uploaded, "name", "") or "uploaded_file")
         normalized_name = Path(original_name).name
-        cache_key = f"{normalized_name}:{uploaded.size}"
+        size_value = int(getattr(uploaded, "size", 0) or 0)
+        cache_key = f"{normalized_name}:{size_value}"
         cached_path = cache.get(cache_key)
         if cached_path and Path(cached_path).exists():
             persisted.append(Path(cached_path))
@@ -881,7 +926,12 @@ def _persist_uploaded_files(uploaded_files: list[Any] | None, destination_dir: P
 
         safe_name = normalized_name.replace(" ", "_")
         destination = destination_dir / f"{prefix}_{uuid.uuid4().hex[:8]}_{safe_name}"
-        destination.write_bytes(uploaded.getbuffer())
+        try:
+            payload = uploaded.getbuffer()
+            destination.write_bytes(payload)
+        except Exception as exc:
+            logger.exception("[TRAIN_UPLOAD] failed to persist {}: {}", normalized_name, exc)
+            raise
         cache[cache_key] = str(destination)
         persisted.append(destination)
     return persisted
@@ -1169,6 +1219,7 @@ def _inspect_training_files(
         )
 
     unique_datasets = sorted(set(detected_datasets))
+
     if len(unique_datasets) > 1:
         return rows, None, "Не можна тренувати одну модель на суміші NSL-KDD та UNSW-NB15."
 
@@ -3115,7 +3166,7 @@ def _train_supervised_model(
         "labels": label_names,
     }
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    timestamp = _model_timestamp_kyiv()
     model_name = f"{dataset_type.lower().replace('-', '_')}_{algorithm.lower().replace(' ', '_')}_{timestamp}.joblib"
     metadata = {
         "dataset_type": dataset_type,
@@ -3159,20 +3210,50 @@ def _train_supervised_model(
         "use_grid_search": bool(use_grid_search),
         "best_params": best_params,
         "configured_params": configured_params,
-        "prediction_preview": pd.DataFrame(
-            {
-                "фактичний клас": test_df["binary_target_label"].reset_index(drop=True),
-                "початкова мітка": test_df["target_label"].reset_index(drop=True),
-                "прогноз": pd.Series(decoded_predictions).reset_index(drop=True),
-                "ймовірність атаки": pd.Series(attack_probabilities, dtype=float).reset_index(drop=True),
-            }
-        ).head(200),
+        "prediction_preview": _build_supervised_prediction_preview(
+            actual_labels=test_df["binary_target_label"],
+            original_labels=test_df["target_label"],
+            predicted_labels=decoded_predictions,
+            attack_probabilities=attack_probabilities,
+            max_rows=200,
+        ),
         "cic_reference_sources": list((extra_metadata or {}).get("cic_reference_sources", [])),
         "cic_hard_case_reference_sources": list((extra_metadata or {}).get("cic_hard_case_reference_sources", [])),
         "nsl_reference_sources": list((extra_metadata or {}).get("nsl_reference_sources", [])),
         "unsw_reference_sources": list((extra_metadata or {}).get("unsw_reference_sources", [])),
         "reference_sources": list((extra_metadata or {}).get("reference_sources", [])),
     }
+
+
+def _build_supervised_prediction_preview(
+    actual_labels: pd.Series,
+    original_labels: pd.Series,
+    predicted_labels: Any,
+    attack_probabilities: Any,
+    max_rows: int = 200,
+) -> pd.DataFrame:
+    preview = pd.DataFrame(
+        {
+            "фактичний клас": pd.Series(actual_labels).reset_index(drop=True),
+            "початкова мітка": pd.Series(original_labels).reset_index(drop=True),
+            "прогноз": pd.Series(predicted_labels).reset_index(drop=True),
+            "ймовірність атаки": pd.Series(attack_probabilities, dtype=float).reset_index(drop=True),
+        }
+    )
+    preview["__is_error"] = preview["фактичний клас"].astype(str) != preview["прогноз"].astype(str)
+
+    if not bool(preview["__is_error"].any()):
+        return preview.drop(columns=["__is_error"]).head(max_rows).reset_index(drop=True)
+
+    error_rows = preview.loc[preview["__is_error"]]
+    correct_rows = preview.loc[~preview["__is_error"]]
+    if len(error_rows) >= max_rows:
+        prioritized = error_rows.head(max_rows)
+    else:
+        remainder = int(max_rows - len(error_rows))
+        prioritized = pd.concat([error_rows, correct_rows.head(remainder)], axis=0)
+
+    return prioritized.drop(columns=["__is_error"]).reset_index(drop=True)
 
 
 def _train_isolation_forest(
@@ -3308,7 +3389,7 @@ def _train_isolation_forest(
         "if_false_positive_rate": float(if_calibration.get("false_positive_rate", 0.0)),
     }
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    timestamp = _model_timestamp_kyiv()
     model_name = f"{dataset_type.lower().replace('-', '_')}_isolation_forest_{timestamp}.joblib"
     if_calibration_payload = {
         **if_calibration,
@@ -3469,7 +3550,6 @@ def _render_training_result(result: dict[str, Any]) -> None:
             ),
             width="stretch",
         )
-        _render_confusion_terms_help(metrics["labels"])
     with preview_col:
         st.markdown("**Файли у тренуванні**")
         for file_name in result["files_used"]:
@@ -3478,7 +3558,119 @@ def _render_training_result(result: dict[str, Any]) -> None:
         st.code(result["save_path"])
 
     with st.expander("Попередній перегляд прогнозів", expanded=False):
-        st.dataframe(with_row_number(result["prediction_preview"]), width="stretch", hide_index=True)
+        prediction_preview = result.get("prediction_preview")
+        if not isinstance(prediction_preview, pd.DataFrame) or prediction_preview.empty:
+            st.info("Попередній перегляд прогнозів відсутній для цього запуску.")
+        else:
+            preview_df = prediction_preview.copy()
+            actual_col = "фактичний клас"
+            predicted_col = "прогноз"
+            attack_prob_col = "ймовірність атаки"
+
+            has_error_analysis = actual_col in preview_df.columns and predicted_col in preview_df.columns
+            if not has_error_analysis:
+                st.dataframe(with_row_number(preview_df), width="stretch", hide_index=True)
+            else:
+                labels = metrics.get("labels")
+                negative_label: str | None = None
+                positive_label: str | None = None
+                if isinstance(labels, list) and len(labels) >= 2:
+                    negative_label = str(labels[0])
+                    positive_label = str(labels[1])
+
+                preview_df["тип результату"] = [
+                    _classify_prediction_row(
+                        actual_value=row.get(actual_col),
+                        predicted_value=row.get(predicted_col),
+                        negative_label=negative_label,
+                        positive_label=positive_label,
+                    )
+                    for _, row in preview_df.iterrows()
+                ]
+
+                fp_count = int((preview_df["тип результату"] == "FP").sum())
+                fn_count = int((preview_df["тип результату"] == "FN").sum())
+                error_count = int((preview_df["тип результату"] != "OK").sum())
+                st.caption(
+                    f"Контроль помилок: FP={fp_count}, FN={fn_count}, "
+                    f"усього помилок={error_count} з {len(preview_df)} рядків."
+                )
+
+                filter_col, sort_col = st.columns(2)
+                with filter_col:
+                    preview_filter_mode = st.selectbox(
+                        "Показати рядки",
+                        options=["Усі", "Лише помилки (FP/FN)", "Лише FP", "Лише FN"],
+                        index=0,
+                        key="training_preview_filter_mode",
+                    )
+
+                sort_options = ["Початковий порядок"]
+                if attack_prob_col in preview_df.columns:
+                    sort_options.extend(["Ймовірність атаки (спад.)", "Ймовірність атаки (зрост.)"])
+                with sort_col:
+                    preview_sort_mode = st.selectbox(
+                        "Сортування",
+                        options=sort_options,
+                        index=0,
+                        key="training_preview_sort_mode",
+                    )
+
+                if preview_filter_mode == "Лише помилки (FP/FN)":
+                    preview_df = preview_df.loc[preview_df["тип результату"].isin(["FP", "FN"])].copy()
+                elif preview_filter_mode == "Лише FP":
+                    preview_df = preview_df.loc[preview_df["тип результату"] == "FP"].copy()
+                elif preview_filter_mode == "Лише FN":
+                    preview_df = preview_df.loc[preview_df["тип результату"] == "FN"].copy()
+
+                if preview_sort_mode != "Початковий порядок" and attack_prob_col in preview_df.columns:
+                    sort_series = pd.to_numeric(preview_df[attack_prob_col], errors="coerce")
+                    ascending = preview_sort_mode == "Ймовірність атаки (зрост.)"
+                    preview_df = (
+                        preview_df.assign(_preview_sort_key=sort_series)
+                        .sort_values("_preview_sort_key", ascending=ascending, na_position="last")
+                        .drop(columns=["_preview_sort_key"])
+                    )
+
+                if preview_df.empty:
+                    st.info("За обраним фільтром рядків немає.")
+                else:
+                    styled_preview = with_row_number(preview_df).style.apply(
+                        _highlight_prediction_preview_rows,
+                        axis=1,
+                    )
+                    st.dataframe(styled_preview, width="stretch", hide_index=True)
+
+
+def _classify_prediction_row(
+    actual_value: Any,
+    predicted_value: Any,
+    negative_label: str | None,
+    positive_label: str | None,
+) -> str:
+    actual = str(actual_value)
+    predicted = str(predicted_value)
+    if actual == predicted:
+        return "OK"
+    if negative_label is not None and positive_label is not None:
+        if actual == negative_label and predicted == positive_label:
+            return "FP"
+        if actual == positive_label and predicted == negative_label:
+            return "FN"
+    return "Помилка"
+
+
+def _highlight_prediction_preview_rows(row: pd.Series) -> list[str]:
+    status = str(row.get("тип результату", ""))
+    if status == "FP":
+        style = "background-color: rgba(255, 99, 71, 0.18)"
+    elif status == "FN":
+        style = "background-color: rgba(255, 165, 0, 0.22)"
+    elif status == "Помилка":
+        style = "background-color: rgba(255, 196, 0, 0.18)"
+    else:
+        style = ""
+    return [style] * len(row)
 
 
 def _build_confusion_matrix_figure(
@@ -3504,6 +3696,13 @@ def _build_confusion_matrix_figure(
     if row_count == 2 and col_count == 2:
         aliases = [["TN", "FP"], ["FN", "TP"]]
 
+    alias_explanations = {
+        "TN": "TN: правильно визначено нормальний трафік.",
+        "FP": "FP: хибна тривога, норму позначено як атаку.",
+        "FN": "FN: пропущена атака, атаку позначено як норму.",
+        "TP": "TP: правильно виявлено атаку.",
+    }
+
     z_values = matrix_array.copy()
     title = "Матриця помилок"
     colorbar_title = "Кількість"
@@ -3515,8 +3714,10 @@ def _build_confusion_matrix_figure(
         colorbar_title = "%"
 
     text_values: list[list[str]] = []
+    hover_values: list[list[str]] = []
     for row_index in range(row_count):
         text_row: list[str] = []
+        hover_row: list[str] = []
         for col_index in range(col_count):
             count_value = int(matrix_array[row_index, col_index])
             if normalize_rows:
@@ -3526,13 +3727,24 @@ def _build_confusion_matrix_figure(
 
             alias_text = aliases[row_index][col_index] if aliases is not None else ""
             text_row.append(f"{alias_text}<br>{base_text}" if alias_text else base_text)
-        text_values.append(text_row)
+            if alias_text:
+                explanation = alias_explanations.get(alias_text, "")
+            elif row_index == col_index:
+                explanation = "Правильна класифікація: прогноз збігається з фактичним класом."
+            else:
+                explanation = "Помилка класифікації: прогноз не збігається з фактичним класом."
 
-    hover_template = (
-        "Фактичний клас: %{y}<br>Спрогнозований клас: %{x}<br>"
-        + ("Частка: %{z:.1%}" if normalize_rows else "Кількість: %{z:.0f}")
-        + "<extra></extra>"
-    )
+            hover_parts = [
+                explanation,
+                f"Фактичний клас: {axis_labels[row_index]}",
+                f"Спрогнозований клас: {axis_labels[col_index]}",
+                f"Кількість: {count_value}",
+            ]
+            if normalize_rows:
+                hover_parts.append(f"Частка в рядку: {z_values[row_index, col_index] * 100:.1f}%")
+            hover_row.append("<br>".join(hover_parts))
+        text_values.append(text_row)
+        hover_values.append(hover_row)
 
     figure = go.Figure(
         data=go.Heatmap(
@@ -3542,7 +3754,8 @@ def _build_confusion_matrix_figure(
             colorscale="Blues",
             text=text_values,
             texttemplate="%{text}",
-            hovertemplate=hover_template,
+            hovertext=hover_values,
+            hovertemplate="%{hovertext}<extra></extra>",
             colorbar=dict(title=colorbar_title),
             zmin=0.0 if normalize_rows else None,
             zmax=1.0 if normalize_rows else None,
@@ -3556,24 +3769,3 @@ def _build_confusion_matrix_figure(
         height=420,
     )
     return figure
-
-
-def _render_confusion_terms_help(labels: list[str]) -> None:
-    if len(labels) != 2:
-        return
-
-    negative_label = str(labels[0])
-    positive_label = str(labels[1])
-
-    with st.expander("Що означають TN / FP / FN / TP", expanded=False):
-        st.markdown(
-            "1. TN (True Negative): фактичний клас — "
-            f"{negative_label}, прогноз моделі — {negative_label}. Це правильне визначення норми.\n"
-            "2. FP (False Positive): фактичний клас — "
-            f"{negative_label}, прогноз моделі — {positive_label}. Це хибна тривога.\n"
-            "3. FN (False Negative): фактичний клас — "
-            f"{positive_label}, прогноз моделі — {negative_label}. Це пропущена атака.\n"
-            "4. TP (True Positive): фактичний клас — "
-            f"{positive_label}, прогноз моделі — {positive_label}. Це правильне виявлення атаки."
-        )
-        st.caption("Похідні метрики: Precision = TP/(TP+FP), Recall = TP/(TP+FN), FPR = FP/(FP+TN).")
