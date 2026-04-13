@@ -100,8 +100,7 @@ def get_session_local():
 
 def get_db() -> Generator[Session, None, None]:
     """
-    Отримання сесії бази даних
-    Використовувати як dependency в FastAPI
+    Отримання сесії бази даних через контекстний менеджер.
     """
     SessionLocal = get_session_local()
     db = SessionLocal()

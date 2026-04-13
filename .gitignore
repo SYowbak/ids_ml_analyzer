@@ -52,6 +52,7 @@ skills/
 # Temporary
 *.tmp
 *.bak
+reports/*.log
 reports/logs/*.log
 
 # Tuned params (local state)

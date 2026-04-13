@@ -185,7 +185,7 @@ def _render_visual_summary(services: dict[str, Any]) -> None:
                 .head(10)
                 .reset_index()
             )
-            model_summary["model_name"] = model_summary["model_name"].fillna("Unknown")
+            model_summary["model_name"] = model_summary["model_name"].fillna("Невідомо")
             anomalies_figure = px.bar(
                 model_summary,
                 x="model_name",

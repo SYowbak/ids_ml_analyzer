@@ -248,7 +248,7 @@ def compute_scan_readiness_diagnostics(
         loader = DataLoader()
         df_preview = loader.load_file(file_path, max_rows=3000, align_to_schema=align_to_schema)
         report['checks']['preview_rows'] = int(len(df_preview))
-        # ── Check if file has attack labels (before dropping) ──
+        # ── Перевірка наявності міток атак у файлі (до видалення колонки) ──
         file_has_attack_labels = False
         file_attack_label_count = 0
         label_col = None
@@ -365,7 +365,7 @@ def compute_scan_readiness_diagnostics(
                 report['issues'].append("Надто висока частка аномалій у preview: можливий ризик FP.")
                 quality_score -= 15
 
-            # ── Warning: model detects 0 anomalies on file with attack labels ──
+            # ── Увага: модель не виявляє аномалій у файлі з мітками атак ──
             if file_ext in TABULAR_EXTENSIONS and anomaly_rate < 0.001:
                 if file_has_attack_labels:
                     pct = (file_attack_label_count / max(1, len(df_preview))) * 100

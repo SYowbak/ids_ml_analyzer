@@ -61,6 +61,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 import logging
+import unicodedata
 
 import numpy as np
 import pandas as pd
@@ -457,6 +458,8 @@ class DataLoader:
             target = resolve_target_labels(frame, dataset_type)
             features = frame.loc[:, list(schema.feature_columns)].copy()
             features["target_label"] = target
+            # Clean display labels to avoid replacement-char artifacts in downstream UI
+            self._clean_display_labels(features)
             return self._sample_frame_with_class_guard(features, max_rows=int(max_rows), random_state=42)
 
         try:
@@ -481,6 +484,8 @@ class DataLoader:
         target = resolve_target_labels(frame, dataset_type)
         features = frame.loc[:, list(schema.feature_columns)].copy()
         features["target_label"] = target
+        # Clean display labels to avoid replacement-char artifacts in downstream UI
+        self._clean_display_labels(features)
         return features
 
     @staticmethod
@@ -694,6 +699,55 @@ class DataLoader:
                 s = s.replace(ch, "")
             cleaned.append(s.strip())
         return pd.Index(cleaned)
+
+    @staticmethod
+    def _clean_text_value(value: object) -> str:
+        """Normalize and clean a single text value for display.
+
+        - Apply Unicode NFKC normalization
+        - Replace replacement character U+FFFD with a readable separator
+        - Strip control characters (category starting with 'C') except common whitespace
+        - Trim surrounding whitespace
+        """
+        if value is None:
+            return ""
+        s = str(value)
+        try:
+            s = unicodedata.normalize("NFKC", s)
+        except Exception:
+            pass
+        # Normalize common dash variants to a simple hyphen and replace replacement-char
+        s = s.replace("\ufffd", " - ")
+        s = s.replace("\u2013", " - ").replace("\u2014", " - ")
+        try:
+            cleaned = "".join(
+                ch for ch in s if (not unicodedata.category(ch).startswith("C")) or ch in ("\t", "\n", "\r")
+            )
+        except Exception:
+            cleaned = s
+        return cleaned.strip()
+
+    def _clean_display_labels(self, frame: pd.DataFrame) -> None:
+        """In-place clean common textual columns used for display (attack labels, predictions, services).
+
+        Operates on columns whose names suggest they are textual labels to avoid touching numeric features.
+        """
+        if frame is None or frame.empty:
+            return
+        text_tokens = ("attack", "label", "prediction", "service", "attack_name", "attack_type", "target")
+        for col in list(frame.columns):
+            try:
+                if not isinstance(col, str):
+                    continue
+                low = col.lower()
+                if any(tok in low for tok in text_tokens):
+                    # Clean any non-numeric column values (including categorical)
+                    if not pd.api.types.is_numeric_dtype(frame[col]):
+                        # Convert to string and clean to avoid skipping categorical dtype
+                        frame[col] = frame[col].astype(str).map(lambda v: self._clean_text_value(v))
+            except Exception:
+                # Be conservative: do not raise on cleaning failures
+                continue
 
     def _validate_domain_columns(
         self,

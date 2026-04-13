@@ -78,22 +78,22 @@ _VIZ_SAMPLE_FULL = 160_000
 
 def escape_html(value: Any) -> str:
     """
-    Convert any value to a safe HTML string by escaping special characters.
+    Перетворює будь-яке значення на безпечний HTML-рядок, екрануючи спецсимволи.
 
-    This is the SINGLE entry point for all untrusted data flowing into
-    unsafe_allow_html=True blocks.
+    Єдина точка входу для всіх ненадійних даних, що потрапляють у блоки
+    unsafe_allow_html=True.
 
-    Characters escaped: & < > " '
-    Unicode emoji characters are NOT escaped (they are safe in HTML context).
+    Екрануються символи: & < > " '
+    Unicode-емодзі НЕ екрануються (вони безпечні в HTML-контексті).
 
-    Перевірка крайового випадку: '<<img src=x onerror=alert("HACKED")>>' →
+    Тест крайового випадку: '<<img src=x onerror=alert("HACKED")>>' →
         '&lt;&lt;img src=x onerror=alert(&quot;HACKED&quot;)&gt;&gt;'
 
     Args:
-        value: Any Python object. Converted to str first.
+        value: будь-який Python-об'єкт. Спочатку перетворюється на str.
 
     Returns:
-        HTML-safe string.
+        HTML-безпечний рядок.
     """
     return html.escape(str(value), quote=True)
 
@@ -168,11 +168,11 @@ DASHBOARD_CSS = """
 
 def _build_severity_chips_html(severity_summary: dict[str, int]) -> str:
     """
-    Build severity summary chip bar HTML.
+    Формує HTML-рядок зведення за рівнем критичності.
 
-    All sev_name values are from a hardcoded dict — safe.
-    Count values are integers — safe.
-    Still escaped defensively.
+    Всі значення sev_name захардкожені — безпечні.
+    Числові значення — цілі числа — безпечні.
+    Все одно екрануються захисно.
     """
     SEV_ORDER = {
         "Критичний": "#DC2626",
@@ -207,19 +207,19 @@ def _build_threat_card_html(
     info: dict,
 ) -> str:
     """
-    Build a single threat detail card HTML with FULL XSS protection.
+    Формує HTML-картку деталей однієї загрози з ПОВНИМ захистом від XSS.
 
-    Security guarantees:
-    - threat_name  : from dataset prediction column → ESCAPED
-    - description  : from threat_catalog DB          → ESCAPED
-    - impact       : from threat_catalog DB          → ESCAPED
-    - action items : from threat_catalog DB          → ESCAPED
-    - sev_label    : from threat_catalog             → ESCAPED
-    - sev_icon     : Unicode emoji                   → ESCAPED
-    - sev (css class suffix) : alphanumeric from catalog → ESCAPED
+    Гарантії безпеки:
+    - threat_name  : з колонки prediction датасету   → ЕКРАНОВАНО
+    - description  : з бази threat_catalog           → ЕКРАНОВАНО
+    - impact       : з бази threat_catalog           → ЕКРАНОВАНО
+    - action items : з бази threat_catalog           → ЕКРАНОВАНО
+    - sev_label    : з threat_catalog                → ЕКРАНОВАНО
+    - sev_icon     : Unicode emoji                   → ЕКРАНОВАНО
+    - sev (css-суфікс класу): буквено-цифровий з catalog → ЕКРАНОВАНО
 
-    Edge Case 1: src_ip = '<img src=x onerror=alert(1)>' as threat_name
-    → becomes '&lt;img src=x onerror=alert(1)&gt;' — harmless text.
+    Тест крайового випадку: src_ip = '<img src=x onerror=alert(1)>' як threat_name
+    → стає '&lt;img src=x onerror=alert(1)&gt;' — нешкідливий текст.
     """
     sev: str = str(info.get("severity", "medium"))
     sev_label: str = get_severity_label(sev)
@@ -282,12 +282,12 @@ def _safe_dataframe(
     key: str | None = None,
 ) -> None:
     """
-    Render a DataFrame in Streamlit with a hard row limit.
+    Відображає DataFrame у Streamlit з жорстким обмеженням рядків.
 
-    Edge Case 3 (0 anomalies): len(df) == 0 → renders empty table with header.
+    Крайовий випадок (0 аномалій): len(df) == 0 → відображає порожню таблицю із заголовком.
 
-    If df has more than `limit` rows, shows the capped version and a caption
-    explaining that the full dataset is available in the export.
+    Якщо df перевищує `limit` рядків — відображає усічену версію та підпис
+    про доступність повного набору через CSV/Excel-експорт.
     """
     if df is None or df.empty:
         st.caption("Немає даних для відображення.")
@@ -325,7 +325,7 @@ def _safe_dataframe(
 
 
 def _style_dataframe(df: pd.DataFrame):
-    """Light-theme styling for dataframes."""
+    """Стилізація таблиці у світлій темі."""
     if df is None or len(df) == 0:
         return df
     try:
@@ -558,7 +558,7 @@ def _ensure_figure_readability(fig):
 
 
 def _render_section_card(title: str) -> None:
-    """Render a static section header card. title is a programmer-controlled constant."""
+    """Відображає статичну картку-заголовок секції. title — захардкожена програмна константа."""
     # title завжди передається як захардкожений рядковий літерал.
     st.markdown(
         f'<div class="section-card"><div class="section-title">{title}</div></div>',
@@ -567,7 +567,7 @@ def _render_section_card(title: str) -> None:
 
 
 def _render_card_header(roman: str, bg: str, color: str, title: str, subtitle: str) -> None:
-    """Render a numbered card header. All args are programmer-controlled constants."""
+    """Відображає нумерований заголовок картки. Усі аргументи — захардкожені програмні константи."""
     st.markdown(
         f"""
         <div class="card">
@@ -595,7 +595,7 @@ def render_comprehensive_dashboard(
     metrics: dict[str, Any],
     services: dict[str, Any],
 ) -> None:
-    """Render the main scan result dashboard."""
+    """Відображає головну панель результатів сканування."""
     del services
 
     viz = Visualizer(dark_mode=False)

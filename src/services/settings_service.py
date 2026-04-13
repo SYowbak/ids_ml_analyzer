@@ -9,8 +9,7 @@ logger = logging.getLogger(__name__)
 
 class SettingsService:
     """
-    Сервіс для збереження налаштувань користувача (API ключі, теми, тощо).
-    Зберігає дані у JSON файлі локально.
+    Сервіс збереження налаштувань користувача у локальному JSON-файлі.
     """
     
     def __init__(self, config_file: str = "user_settings.json"):

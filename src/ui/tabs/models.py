@@ -156,10 +156,10 @@ def render_models_tab(services: dict[str, Any], root_dir: Path) -> None:
                     "dataset_type": "Датасет",
                     "nature": "Природа",
                     "saved_at": "Дата",
-                    "accuracy": "Accuracy",
-                    "precision": "Precision",
-                    "recall": "Recall",
-                    "f1": "F1",
+                    "accuracy": "Точність",
+                    "precision": "Прецизійність",
+                    "recall": "Повнота",
+                    "f1": "F1-оцінка",
                 }
             )
         ),
@@ -177,6 +177,15 @@ def render_models_tab(services: dict[str, Any], root_dir: Path) -> None:
         comparison = filtered[filtered["name"].isin(selected_names)][
             ["name", "algorithm", "dataset_type", "accuracy", "precision", "recall", "f1"]
         ].copy()
+        comparison = comparison.rename(columns={
+            "name": "Модель",
+            "algorithm": "Алгоритм",
+            "dataset_type": "Датасет",
+            "accuracy": "Точність",
+            "precision": "Прецизійність",
+            "recall": "Повнота",
+            "f1": "F1-оцінка",
+        })
         st.markdown("**Порівняння метрик**")
         st.dataframe(with_row_number(comparison), width="stretch", hide_index=True)
 

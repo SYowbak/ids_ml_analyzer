@@ -257,9 +257,9 @@ def render_datasets_tab(services: dict[str, Any], root_dir: Path) -> None:
                     quality_rows.append(
                         {
                             "Файл": relative_path,
-                            "Missing %": round(missing_pct, 2),
-                            "Duplicates": duplicates,
-                            "Class imbalance": round(imbalance_ratio, 2) if imbalance_ratio is not None else "N/A",
+                            "Пропуски %": round(missing_pct, 2),
+                            "Дублікати": duplicates,
+                            "Дисбаланс класів": round(imbalance_ratio, 2) if imbalance_ratio is not None else "Н/Д",
                         }
                     )
 

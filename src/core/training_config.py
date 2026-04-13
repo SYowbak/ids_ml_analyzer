@@ -87,7 +87,7 @@ class TrainingConfig:
         ewc_settings: Налаштування EWC
         allowed_classes: Дозволені класи (для SPECIALIZED mode)
         preserve_attack_detection: Зберегти здатність детектувати атаки
-        algorithm: Алгоритм ML ('Random Forest', 'XGBoost', 'Logistic Regression')
+        algorithm: Алгоритм ML ('Random Forest', 'XGBoost', 'Isolation Forest')
         hyperparameter_tuning: Увімкнути підбір гіперпараметрів
         tune_params: Параметри для підбору
         validation_split: Частка даних для валідації
@@ -110,7 +110,7 @@ class TrainingConfig:
 
     def __post_init__(self) -> None:
         """Валідація та нормалізація."""
-        valid_algorithms = ['Random Forest', 'XGBoost', 'Logistic Regression', 'Isolation Forest']
+        valid_algorithms = ['Random Forest', 'XGBoost', 'Isolation Forest']
         if self.algorithm not in valid_algorithms:
             raise ValueError(
                 f"Invalid algorithm: {self.algorithm}. Must be one of {valid_algorithms}"
@@ -200,12 +200,7 @@ class TrainingConfig:
                 'n_jobs': -1,
                 'random_state': self.random_state,
             },
-            'Logistic Regression': {
-                'C': 1.0,
-                'solver': 'lbfgs',
-                'max_iter': 1000,
-                'random_state': self.random_state,
-            },
+
             'Isolation Forest': {
                 'n_estimators': 100,
                 'contamination': 0.1,

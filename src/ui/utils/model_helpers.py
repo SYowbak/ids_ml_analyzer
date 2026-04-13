@@ -93,8 +93,8 @@ def _normalize_compatible_types(raw_types: Any) -> list[str]:
 @st.cache_data(show_spinner=False)
 def load_model_manifest(model_path: str, mtime: float, size: int) -> dict:
     """
-    Load only lightweight compatibility hints from a model file.
-    mtime/size are included to invalidate cache when file changes.
+    Завантажує лише lightweight-метадані з файлу моделі для перевірки сумісності.
+    mtime/size використовуються для інвалідації кешу при зміні файлу.
     """
     manifest = {
         'algorithm': '',
@@ -260,7 +260,7 @@ def get_manifest_for_model(model_name: str, model_file_map: dict) -> dict:
     stat = model_path.stat()
     manifest = load_model_manifest(str(model_path), stat.st_mtime, stat.st_size)
 
-    # Heuristic fallback for older models/files without metadata.
+    # Евристичний запасний варіант для старих моделей без метаданих.
     lowered_name = model_name.lower()
     if not manifest.get('algorithm'):
         if 'isolation' in lowered_name:
@@ -332,8 +332,6 @@ def resolve_auto_model(file_target: str | Path, model_files: list[Path]) -> tupl
                 score += 40.0
             elif 'xgboost' in algorithm_meta:
                 score += 35.0
-            elif 'logistic' in algorithm_meta:
-                score += 15.0
 
             family_reliable = bool(file_family) and (not file_family_ambiguous) and file_family_confidence >= 0.60
             if family_reliable:

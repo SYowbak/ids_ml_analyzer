@@ -7,6 +7,7 @@ from typing import Any
 import sys
 import time
 import uuid
+import unicodedata
 
 import numpy as np
 import pandas as pd
@@ -972,19 +973,33 @@ def _build_top_table(
     if column not in frame.columns or not _is_informative_series(frame[column]):
         return pd.DataFrame(columns=[value_label, "Кількість"])
 
-    series = frame[column].dropna().astype(str).str.strip()
-    if column == "service":
-        series = series.map(_normalize_service_display)
-    series = series[(series != "") & (series.str.lower() != "н/д") & (series.str.lower() != "nan")]
-    if series.empty:
-        return pd.DataFrame(columns=[value_label, "Кількість"])
-
-    counts = series.value_counts().sort_values(ascending=False)
-    if isinstance(top_n, int) and top_n > 0:
-        counts = counts.head(top_n)
-    table = counts.reset_index()
-    table.columns = [value_label, "Кількість"]
-    return table
+    # Для dst_port/port колонок — обробляємо як числа для коректного сортування
+    if column in {"dst_port", "src_port", "destination_port", "source_port"}:
+        # Спробуємо привести до Int64 (з підтримкою NaN)
+        series = pd.to_numeric(frame[column], errors="coerce").dropna().astype(int)
+        if series.empty:
+            return pd.DataFrame(columns=[value_label, "Кількість"])
+        counts = series.value_counts().sort_values(ascending=False)
+        if isinstance(top_n, int) and top_n > 0:
+            counts = counts.head(top_n)
+        table = counts.reset_index()
+        table.columns = [value_label, "Кількість"]
+        # Для відображення — порти як str, але сортування числове
+        table[value_label] = table[value_label].astype(str)
+        return table
+    else:
+        series = frame[column].dropna().astype(str).str.strip()
+        if column == "service":
+            series = series.map(_normalize_service_display)
+        series = series[(series != "") & (series.str.lower() != "н/д") & (series.str.lower() != "nan")]
+        if series.empty:
+            return pd.DataFrame(columns=[value_label, "Кількість"])
+        counts = series.value_counts().sort_values(ascending=False)
+        if isinstance(top_n, int) and top_n > 0:
+            counts = counts.head(top_n)
+        table = counts.reset_index()
+        table.columns = [value_label, "Кількість"]
+        return table
 
 
 def _top_value_stats(frame: pd.DataFrame, column: str) -> tuple[str, int, float] | None:
@@ -1325,7 +1340,21 @@ def _render_adaptive_report_charts(
 
 
 def _normalize_attack_display_name(label: Any, algorithm: str | None = None) -> str:
-    text = str(label or "").strip()
+    raw = str(label or "")
+    try:
+        raw = unicodedata.normalize("NFKC", raw)
+    except Exception:
+        pass
+    # Replace Unicode replacement char with a readable separator
+    raw = raw.replace("\ufffd", " - ")
+    # Remove control characters except common whitespace
+    try:
+        cleaned = "".join(
+            ch for ch in raw if (not unicodedata.category(ch).startswith("C")) or ch in ("\t", "\n", "\r")
+        )
+    except Exception:
+        cleaned = raw
+    text = cleaned.strip()
     if not text:
         return "Аномалія (тип не визначено)"
     if is_benign_label(text):
@@ -1708,6 +1737,7 @@ def _render_family_recommendation_text(
     risk_score: float,
     algorithm: str,
     action_plan: pd.DataFrame,
+    attack_recommendations: list[str] | None = None,
 ) -> None:
     if alerts_only is None or alerts_only.empty:
         return
@@ -1756,34 +1786,8 @@ def _render_family_recommendation_text(
             "тож локалізація джерела атаки зазвичай дає найшвидший ефект."
         )
 
-    st.markdown(
-        (
-            f"<div style='border-left:4px solid {risk_color}; background-color:{_rgba(risk_color, 0.09)}; "
-            "padding:12px 14px; border-radius:8px; margin-bottom:10px;'>"
-            "<div style='font-weight:700; margin-bottom:6px;'>Що відбувається простою мовою</div>"
-            f"<div><b>Сімейство:</b> {html.escape(family_display)}. "
-            f"<b>Топ-загроза:</b> {html.escape(top_attack)}.</div>"
-            f"<div style='margin-top:4px;'>{html.escape(family_problem)}</div>"
-            f"<div style='margin-top:4px;'>{html.escape(main_focus_text)}</div>"
-            "</div>"
-        ),
-        unsafe_allow_html=True,
-    )
 
-    st.markdown(
-        (
-            f"<div style='border-left:4px solid {risk_color}; background-color:{_rgba(risk_color, 0.13)}; "
-            "padding:12px 14px; border-radius:8px; margin-bottom:10px;'>"
-            "<div style='font-weight:700; margin-bottom:6px;'>Наскільки це погано</div>"
-            f"<div><b>Рівень ризику:</b> {html.escape(risk_label)} ({float(risk_score):.1f}%).</div>"
-            f"<div><b>Аномальні записи:</b> {_format_count(anomalies_count)} із {_format_count(total_records)} "
-            f"({anomaly_share:.1f}%).</div>"
-            f"<div style='margin-top:4px;'>{html.escape(risk_hint)}</div>"
-            "</div>"
-        ),
-        unsafe_allow_html=True,
-    )
-
+    # Єдиний блок рекомендацій
     focus_list_html = ""
     for item in focus_items[:3]:
         focus_list_html += (
@@ -1794,17 +1798,6 @@ def _render_family_recommendation_text(
         )
     if not focus_list_html:
         focus_list_html = "<li>Фокус-індикатори відсутні, орієнтуйтесь на загальний risk score та динаміку в часі.</li>"
-
-    st.markdown(
-        (
-            f"<div style='border-left:4px solid {risk_color}; background-color:{_rgba(risk_color, 0.07)}; "
-            "padding:12px 14px; border-radius:8px; margin-bottom:10px;'>"
-            "<div style='font-weight:700; margin-bottom:6px;'>На чому фокусувати triage у цьому сімействі</div>"
-            f"<ul style='margin:0 0 0 18px;'>{focus_list_html}</ul>"
-            "</div>"
-        ),
-        unsafe_allow_html=True,
-    )
 
     action_items_html = ""
     if isinstance(action_plan, pd.DataFrame) and not action_plan.empty:
@@ -1849,12 +1842,25 @@ def _render_family_recommendation_text(
             "і прибрати різкі піки у Хронології."
         )
 
+    attack_recommendations_html = ""
+    if attack_recommendations:
+        attack_recommendations_html = (
+            "<div style='margin-bottom:8px;'><b>Точкові рекомендації за типами загроз:</b>"
+            f"<ul style='margin:0 0 0 18px;'>{''.join(f'<li>{html.escape(line)}</li>' for line in attack_recommendations)}</ul></div>"
+        )
+
     st.markdown(
         (
-            f"<div style='border-left:4px solid {risk_color}; background-color:{_rgba(risk_color, 0.10)}; "
-            "padding:12px 14px; border-radius:8px; margin-bottom:8px;'>"
-            "<div style='font-weight:700; margin-bottom:6px;'>Що робити зараз</div>"
-            f"<ul style='margin:0 0 0 18px;'>{action_items_html}</ul>"
+            f"<div style='border-left:4px solid {risk_color}; background-color:{_rgba(risk_color, 0.09)}; "
+            "padding:18px 18px; border-radius:10px; margin-bottom:10px;'>"
+            "<div style='font-weight:700; font-size:1.1em; margin-bottom:10px;'>Рекомендації</div>"
+            f"<div style='margin-bottom:8px;'><b>Сімейство:</b> {html.escape(family_display)}. <b>Топ-загроза:</b> {html.escape(top_attack)}.</div>"
+            f"<div style='margin-bottom:8px;'><b>Рівень ризику:</b> {html.escape(risk_label)} ({float(risk_score):.1f}%). <b>Аномальні записи:</b> {_format_count(anomalies_count)} із {_format_count(total_records)} ({anomaly_share:.1f}%).</div>"
+            f"<div style='margin-bottom:8px;'>{html.escape(family_problem)}</div>"
+            f"<div style='margin-bottom:8px;'><b>Найсильніший сигнал:</b> {html.escape(main_focus_text)}</div>"
+            f"<div style='margin-bottom:8px;'><b>Фокус triage:</b><ul style='margin:0 0 0 18px;'>{focus_list_html}</ul></div>"
+            f"<div style='margin-bottom:8px;'><b>Що робити зараз:</b><ul style='margin:0 0 0 18px;'>{action_items_html}</ul></div>"
+            f"{attack_recommendations_html}"
             f"<div style='margin-top:8px; color:#334155;'><b>Як зрозуміти, що стало краще:</b> {html.escape(success_text)}</div>"
             "</div>"
         ),
@@ -2299,6 +2305,16 @@ def _run_scan(
 
     confidence_values = _normalize_confidence(np.asarray(score_values, dtype=float))
     result_frame["attack_type"] = pd.Series(prediction_labels, index=X.index).astype(str)
+    # Clean prediction display values using DataLoader helper if available
+    try:
+        cleaned_attack = [
+            loader._clean_text_value(v) if hasattr(loader, "_clean_text_value") else str(v)
+            for v in result_frame["attack_type"].astype(str).tolist()
+        ]
+        result_frame["attack_type"] = pd.Series(cleaned_attack, index=X.index)
+    except Exception:
+        # fallback: keep original strings
+        result_frame["attack_type"] = result_frame["attack_type"].astype(str)
     result_frame["prediction"] = result_frame["attack_type"]
     result_frame[score_column_name] = pd.Series(score_values, index=X.index)
     result_frame["confidence"] = pd.Series(confidence_values, index=X.index)
@@ -2485,11 +2501,56 @@ def _render_scan_result(result: dict[str, Any]) -> None:
     details_source = alerts_only if not alerts_only.empty else details_df
     details_view = details_source[list(available_display_columns.keys())].rename(columns=available_display_columns)
 
+    # Ensure textual cells are sanitized for display (replace replacement-char, remove controls)
+    def _clean_text_for_ui(val: object) -> str:
+        if val is None:
+            return ""
+        s = str(val)
+        try:
+            s = unicodedata.normalize("NFKC", s)
+        except Exception:
+            pass
+        # Normalize common dash variants to a simple hyphen and replace replacement-char
+        s = s.replace("\ufffd", " - ")
+        s = s.replace("\u2013", " - ").replace("\u2014", " - ")
+        try:
+            cleaned = "".join(
+                ch for ch in s if (not unicodedata.category(ch).startswith("C")) or ch in ("\t", "\n", "\r")
+            )
+        except Exception:
+            cleaned = s
+        return cleaned.strip()
+
+    for col in details_view.columns:
+        try:
+            if details_view[col].dtype == object:
+                details_view[col] = details_view[col].map(lambda v: _clean_text_for_ui(v))
+        except Exception:
+            continue
+
     if alerts_only.empty:
         st.info("Аномалій не виявлено. Нижче показано загальні записи для контролю якості даних.")
 
     st.subheader("Деталі атак", anchor=False)
-    st.dataframe(with_row_number(details_view.head(500)), width="stretch", hide_index=True)
+    details_limited = details_view.head(100)
+    if len(details_limited) >= 100:
+        st.info("Показано лише перші 100 рядків для швидкого відображення. Для повного аналізу використовуйте експорт CSV.")
+    if len(details_limited) <= 200:
+        def _details_row_style(row):
+            is_alert = False
+            if "is_alert" in row:
+                is_alert = bool(row["is_alert"])
+            elif "attack_type" in row:
+                from src.core.domain_schemas import is_benign_label
+                is_alert = not is_benign_label(str(row["attack_type"]))
+            return [
+                "background-color: #ffeaea; color: #b71c1c; font-weight: 600;" if is_alert else ""
+                for _ in row
+            ]
+        styled = with_row_number(details_limited).style.apply(_details_row_style, axis=1)
+        st.dataframe(styled, width="stretch", hide_index=True)
+    else:
+        st.dataframe(with_row_number(details_limited), width="stretch", hide_index=True)
 
     st.subheader("Візуалізація ризику", anchor=False)
     _render_adaptive_report_charts(
@@ -2566,24 +2627,8 @@ def _render_scan_result(result: dict[str, Any]) -> None:
             dataset_type=dataset_type,
         )
 
-        _render_family_recommendation_text(
-            alerts_only=alerts_only,
-            details_df=details_df,
-            dataset_type=dataset_type,
-            risk_score=float(result.get("risk_score", 0.0)),
-            algorithm=str(result.get("algorithm", "")),
-            action_plan=action_plan,
-        )
-
-        with st.expander("Детальний технічний план (таблиця)", expanded=False):
-            if action_plan.empty:
-                st.info("Для цього набору поки недостатньо індикаторів для автоматичного плану дій.")
-            else:
-                st.dataframe(with_row_number(action_plan), width="stretch", hide_index=True)
-
-        st.markdown("**Точкові рекомендації за типами загроз**")
+        attack_recommendations: list[str] = []
         attack_types_sorted = alerts_only["attack_label_raw"].astype(str).value_counts().sort_values(ascending=False)
-        rendered_lines = 0
         for raw_attack_name in attack_types_sorted.index.tolist():
             display_attack_name = _normalize_attack_display_name(raw_attack_name, str(result.get("algorithm", "")))
             if _is_generic_attack_name(display_attack_name):
@@ -2591,18 +2636,33 @@ def _render_scan_result(result: dict[str, Any]) -> None:
             threat = get_threat_info(str(raw_attack_name))
             actions = threat.get("actions") or []
             if actions:
-                st.markdown(f"- {display_attack_name}: {actions[0]}")
-                rendered_lines += 1
+                attack_recommendations.append(f"{display_attack_name}: {actions[0]}")
 
-        if rendered_lines == 0:
+        if not attack_recommendations:
             if dataset_type == "NSL-KDD":
-                st.markdown("- Для NSL-KDD орієнтуйтесь на аномальні комбінації protocol_type/service/flag та пікові класи сервісів із блоку Ключові індикатори.")
-                st.markdown("- Для user-friendly контролю: якщо ризик > 15%, варто обмежити зовнішній доступ до чутливих сервісів до завершення triage.")
+                attack_recommendations.extend([
+                    "Для NSL-KDD орієнтуйтесь на аномальні комбінації protocol_type/service/flag та пікові класи сервісів із блоку Ключові індикатори.",
+                    "Для user-friendly контролю: якщо ризик > 15%, варто обмежити зовнішній доступ до чутливих сервісів до завершення triage.",
+                ])
             elif dataset_type == "UNSW-NB15":
-                st.markdown("- Для UNSW-NB15 орієнтуйтесь на аномальні комбінації proto/service/state та частотні патерни з блоку Ключові індикатори.")
-                st.markdown("- Якщо ризик > 15%, пріоритезуйте перевірку сервісів із найбільшим внеском у аномалії та обмежте доступ до них до завершення triage.")
+                attack_recommendations.extend([
+                    "Для UNSW-NB15 орієнтуйтесь на аномальні комбінації proto/service/state та частотні патерни з блоку Ключові індикатори.",
+                    "Якщо ризик > 15%, пріоритезуйте перевірку сервісів із найбільшим внеском у аномалії та обмежте доступ до них до завершення triage.",
+                ])
             else:
-                st.markdown("- Для цього набору немає надійної деталізації типів атак; пріоритезуйте дії за IP/портами та часовими піками з блоків Ключові індикатори і Хронологія.")
+                attack_recommendations.append(
+                    "Для цього набору немає надійної деталізації типів атак; пріоритезуйте дії за IP/портами та часовими піками з блоків Ключові індикатори і Хронологія."
+                )
+
+        _render_family_recommendation_text(
+            alerts_only=alerts_only,
+            details_df=details_df,
+            dataset_type=dataset_type,
+            risk_score=float(result.get("risk_score", 0.0)),
+            algorithm=str(result.get("algorithm", "")),
+            action_plan=action_plan,
+            attack_recommendations=attack_recommendations,
+        )
 
     st.subheader("Експорт звіту", anchor=False)
     report_stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -2651,7 +2711,26 @@ def _render_scan_result(result: dict[str, Any]) -> None:
     with st.expander("Приклад результатів", expanded=False):
         preview = result.get("result_preview")
         if isinstance(preview, pd.DataFrame):
-            st.dataframe(with_row_number(preview), width="stretch", hide_index=True)
+            preview_limited = preview.head(100)
+            if len(preview_limited) >= 100:
+                st.info("Показано лише перші 100 рядків для швидкого відображення. Для повного аналізу використовуйте експорт CSV.")
+            # Додаємо стилізацію лише для малих таблиць
+            if len(preview_limited) <= 200:
+                def _preview_row_style(row):
+                    is_alert = False
+                    if "is_alert" in row:
+                        is_alert = bool(row["is_alert"])
+                    elif "attack_type" in row:
+                        from src.core.domain_schemas import is_benign_label
+                        is_alert = not is_benign_label(str(row["attack_type"]))
+                    return [
+                        "background-color: #ffeaea; color: #b71c1c; font-weight: 600;" if is_alert else ""
+                        for _ in row
+                    ]
+                styled = with_row_number(preview_limited).style.apply(_preview_row_style, axis=1)
+                st.dataframe(styled, width="stretch", hide_index=True)
+            else:
+                st.dataframe(with_row_number(preview_limited), width="stretch", hide_index=True)
 
 
 if __name__ == "__main__":
