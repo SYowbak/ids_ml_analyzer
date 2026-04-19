@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Datasets (too large for git)
+datasets/*
+!datasets/TEST_DATA/
+
+# Trained models (binary, large)
+models/*
+!models/.gitkeep
+**/*.joblib
+**/*.ubj
+**/*.pkl
+reports/
+
+# Database
+database/*
+*.db
+*.db-shm
+*.db-wal
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Streamlit
+.streamlit/
+
+# pytest cache
+.pytest_cache/
+
+# Temporary
+*.tmp
+*.bak
+reports/*.log
+reports/logs/*.log
+
+# Tuned params (local state)
+tuned_params.txt
+user_settings.json
