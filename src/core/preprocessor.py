@@ -1,38 +1,3 @@
-"""
-IDS ML Analyzer — Preprocessor (v2)
-
-Production-grade конвеєр попередньої обробки ознак з:
-  - Строгою перевіркою доменної схеми (точний збіг ознак)
-  - Надійною очисткою числових даних (inf/NaN → імп'ютація медіаною)
-  - Опціональним масштабуванням (RobustScaler / QuantileTransformer)
-  - Обрізанням викидів (outlier clipping) на основі процентилів
-  - Категоріальним кодуванням з обробкою невідомих класів
-
-Архітектура::
-
-    Вхідний DataFrame
-        │
-        ├─ normalize_frame_columns()       канонічні назви колонок
-        ├─ _validate_schema()              строга перевірка ознак
-        ├─ _encode_categoricals()          LabelEncoder для кожної колонки
-        ├─ _sanitize_numerics()            inf→NaN, NaN→median (з навч. даних)
-        ├─ _clip_outliers()                [P1, P99] межі з навч. даних
-        └─ _apply_scaling()                RobustScaler (якщо увімкнено)
-
-Політика масштабування (Scaling Policy):
-    - ``enable_scaling=False`` (за замовчуванням): без масштабування, підходить
-      для інваріантних до масштабу моделей (Random Forest, XGBoost).
-    - ``enable_scaling=True``: застосовує RobustScaler (медіана + IQR),
-      необхідно для Isolation Forest (чутливий до відстаней).
-    - Тип скейлера налаштовується через параметр ``scaler_type``.
-
-Зворотна сумісність:
-    Моделі, збережені без стану скейлера (до v2), працюватимуть — ``transform()``
-    перевіряє наявність ``hasattr(self, 'scaler_')`` і пропускає масштабування, якщо він відсутній.
-
-Оформлення у стилі Google docstrings.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -124,13 +89,8 @@ class OrderedTargetEncoder:
         return np.asarray([self.classes_[index] for index in encoded], dtype=object)
 
 
-# ---------------------------------------------------------------------------
-# Scaler type alias
-# ---------------------------------------------------------------------------
-
 ScalerType = Literal["robust", "quantile"]
 
-# Відсоткові межі (percentiles) за замовчуванням для обрізання викидів.
 _CLIP_LOWER_PERCENTILE = 1.0
 _CLIP_UPPER_PERCENTILE = 99.0
 
@@ -167,7 +127,7 @@ class Preprocessor:
         enable_scaling: bool = False,
         scaler_type: ScalerType = "robust",
     ) -> None:
-        del feature_adapter_strategy  # Deprecated, ignored.
+        del feature_adapter_strategy
 
         self.dataset_type = dataset_type
         self.enable_scaling = enable_scaling
@@ -183,16 +143,11 @@ class Preprocessor:
         self.target_encoder: OrderedTargetEncoder = OrderedTargetEncoder()
         self.label_encoders: dict[str, LabelEncoder] = {}
 
-        # Fitted state — populated during fit().
         self._is_fitted: bool = False
         self.has_target_encoder: bool = False
-        self.scaler_: Optional[Any] = None  # RobustScaler or QuantileTransformer
+        self.scaler_: Optional[Any] = None
         self.medians_: Optional[dict[str, float]] = None
         self.clip_bounds_: Optional[dict[str, tuple[float, float]]] = None
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     def fit(
         self,
@@ -290,10 +245,6 @@ class Preprocessor:
             raise RuntimeError("Preprocessor ще не навчений.")
         return self._prepare_features(df, fit=False, target_col=None)
 
-    # ------------------------------------------------------------------
-    # Schema configuration
-    # ------------------------------------------------------------------
-
     def _configure_schema(self, dataset_type: str) -> None:
         """Завантажує схему ознак з реєстру доменів.
 
@@ -305,10 +256,6 @@ class Preprocessor:
         self.feature_columns = list(schema.feature_columns)
         self.categorical_columns = list(schema.categorical_columns)
         self.feature_names_in_ = list(schema.feature_columns)
-
-    # ------------------------------------------------------------------
-    # Feature preparation pipeline
-    # ------------------------------------------------------------------
 
     def _prepare_features(
         self,
@@ -378,25 +325,21 @@ class Preprocessor:
 
         X = frame.loc[:, self.feature_columns].copy()
 
-        # Крок 3: Кодування категоріальних змінних.
         for column in self.feature_columns:
             if column in self.categorical_columns:
                 X[column] = self._encode_categorical(X[column], column, fit=fit)
             else:
                 X[column] = pd.to_numeric(X[column], errors="coerce").astype(float)
 
-        # Крок 4: Очищення числових змінних — спершу замінюємо inf на NaN.
         numeric_cols = [
             c for c in self.feature_columns if c not in self.categorical_columns
         ]
         X[numeric_cols] = X[numeric_cols].replace([np.inf, -np.inf], np.nan)
 
-        # Крок 4b: Імп'ютація медіаною.
         if fit:
             self.medians_ = {}
             for col in numeric_cols:
                 median_val = float(X[col].median())
-                # Резервний варіант: якщо всі значення NaN, використовуємо 0.0.
                 if np.isnan(median_val):
                     median_val = 0.0
                 self.medians_[col] = median_val
@@ -410,16 +353,13 @@ class Preprocessor:
                 fill_val = self.medians_.get(col, 0.0)
                 X[col] = X[col].fillna(fill_val)
         else:
-            # Зворотна сумісність: старий препроцесор без медіан.
             X[numeric_cols] = X[numeric_cols].fillna(0.0)
 
-        # Крок 5: Обрізання викидів до [P1, P99] з навчальних даних.
         if fit:
             self.clip_bounds_ = {}
             for col in numeric_cols:
                 lower = float(np.nanpercentile(X[col].values, _CLIP_LOWER_PERCENTILE))
                 upper = float(np.nanpercentile(X[col].values, _CLIP_UPPER_PERCENTILE))
-                # Запобіжник: якщо lower == upper, розширюємо на малий епсилон.
                 if lower == upper:
                     lower = lower - 1.0
                     upper = upper + 1.0
@@ -431,7 +371,6 @@ class Preprocessor:
                 if bounds is not None:
                     X[col] = X[col].clip(lower=bounds[0], upper=bounds[1])
 
-        # Крок 6: Застосування скейлера (якщо увімкнено).
         if fit and self.enable_scaling:
             self.scaler_ = self._create_scaler()
             self.scaler_.fit(X[numeric_cols])
@@ -453,10 +392,6 @@ class Preprocessor:
             )
 
         return X
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
 
     def _allowed_non_feature_columns(self) -> set[str]:
         """Повертає назви колонок, які дозволені, але не використовуються як ознаки.
@@ -521,12 +456,7 @@ class Preprocessor:
                 output_distribution="normal",
                 random_state=42,
             )
-        # За замовчуванням: robust
         return RobustScaler()
-
-    # ------------------------------------------------------------------
-    # Target encoding API
-    # ------------------------------------------------------------------
 
     def encode_target(self, target: pd.Series) -> pd.Series:
         """Кодує цільові мітки за допомогою навченого target_encoder.

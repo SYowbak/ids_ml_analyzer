@@ -1304,7 +1304,11 @@ def _render_adaptive_report_charts(
             title="Розподіл впевненості моделі",
             labels={"confidence": "Впевненість", "count": "Кількість"},
         )
-        confidence_figure.update_layout(margin=dict(l=10, r=10, t=50, b=10), height=360)
+        confidence_figure.update_layout(
+            yaxis_title="Кількість",
+            margin=dict(l=10, r=10, t=50, b=10),
+            height=360
+        )
         st.plotly_chart(confidence_figure, width="stretch")
 
     st.caption(
@@ -1394,9 +1398,7 @@ def _normalize_attack_display_name(label: Any, algorithm: str | None = None) -> 
         raw = unicodedata.normalize("NFKC", raw)
     except Exception:
         pass
-    # Replace Unicode replacement char with a readable separator
     raw = raw.replace("\ufffd", " - ")
-    # Remove control characters except common whitespace
     try:
         cleaned = "".join(
             ch for ch in raw if (not unicodedata.category(ch).startswith("C")) or ch in ("\t", "\n", "\r")

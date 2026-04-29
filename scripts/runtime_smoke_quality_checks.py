@@ -11,6 +11,8 @@ import numpy as np
 import pandas as pd
 
 
+
+# === Корінь проєкту ===
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -22,20 +24,28 @@ from src.ui.tabs.training import _run_training
 from src.ui.tabs.scanning import _resolve_recommended_threshold, _run_scan
 
 
+
+# === Глобальні константи ===
 STRICT_E2E = str(os.getenv("IDS_STRICT_E2E", "0")).strip().lower() in {"1", "true", "yes", "on"}
 MODELS_DIR = ROOT_DIR / "models"
 TEST_DATA_DIR = ROOT_DIR / "datasets" / "TEST_DATA"
 
 
+
+# === Виняток для пропуску перевірки ===
 class SkipCheck(RuntimeError):
     pass
 
 
+
+# === Перевірка умови з повідомленням ===
 def _check(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
 
 
+
+# === Перевірка наявності файлу ===
 def _require_file(path: Path, *, strict: bool, reason: str) -> Path:
     if path.exists():
         return path
@@ -45,10 +55,14 @@ def _require_file(path: Path, *, strict: bool, reason: str) -> Path:
     raise SkipCheck(text)
 
 
+
+# === Перетворення масиву у DataFrame ===
 def _to_frame(values: np.ndarray) -> pd.DataFrame:
     return pd.DataFrame(values, columns=["f1", "f2", "f3", "f4"])
 
 
+
+# === Пошук останньої моделі за префіксом ===
 def _latest_model_name(prefix: str) -> str:
     candidates = sorted(MODELS_DIR.glob(f"{prefix}*.joblib"))
     if not candidates:
@@ -56,11 +70,15 @@ def _latest_model_name(prefix: str) -> str:
     return candidates[-1].name
 
 
+
+# === Побудова мапи маніфестів моделей ===
 def _manifest_map(models_dir: Path) -> dict[str, dict]:
     engine = ModelEngine(models_dir=str(models_dir))
     return {item["name"]: item for item in engine.list_models(include_unsupported=False)}
 
 
+
+# === Сканування з автоматичним порогом ===
 def _scan_with_auto_threshold(
     *,
     loader: DataLoader,
@@ -84,6 +102,8 @@ def _scan_with_auto_threshold(
     )
 
 
+
+# === Вибір першого наявного файлу з переліку ===
 def _pick_first_existing(candidates: list[Path], *, strict: bool, reason: str) -> Path:
     for candidate in candidates:
         if candidate.exists():
@@ -94,6 +114,8 @@ def _pick_first_existing(candidates: list[Path], *, strict: bool, reason: str) -
     raise SkipCheck(f"{text} ({reason})")
 
 
+    
+# === Перевірка життєвого циклу тренування NSL-KDD ===
 def run_training_lifecycle_check(tmp_models_dir: Path) -> None:
     loader = DataLoader()
     train_csv = _require_file(
@@ -161,6 +183,8 @@ def run_training_lifecycle_check(tmp_models_dir: Path) -> None:
     _check("risk_score" in scan_result, "Lifecycle scan missing risk_score")
 
 
+    
+# === Перевірка калібрування Isolation Forest ===
 def run_if_calibration_checks(tmp_models_dir: Path) -> None:
     rng = np.random.RandomState(42)
     normal = _to_frame(rng.normal(loc=0.0, scale=1.0, size=(220, 4)))
@@ -209,6 +233,8 @@ def run_if_calibration_checks(tmp_models_dir: Path) -> None:
     _check(int(info.get("support_benign", 0)) == 120, "IF support_benign mismatch")
 
 
+    
+# === Перевірка політики порогів ===
 def run_threshold_policy_checks() -> None:
     manifest = {
         "name": "cic_ids_random_forest_test.joblib",
@@ -248,6 +274,8 @@ def run_threshold_policy_checks() -> None:
     _check(str(details.get("policy_id", "")).endswith("legacy.v0"), "Legacy policy id mismatch")
 
 
+    
+# === Перевірка реального PCAP на моделях ===
 def run_real_pcap_checks() -> None:
     loader = DataLoader()
     manifests = _manifest_map(MODELS_DIR)
@@ -331,6 +359,8 @@ def run_real_pcap_checks() -> None:
             raise AssertionError("ARP-only PCAP must be blocked in strict mode")
 
 
+    
+# === Точка входу ===
 def main() -> int:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     tmp_models_dir = ROOT_DIR / "reports" / "verification" / "runtime_gate_models" / f"run_{timestamp}"

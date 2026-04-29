@@ -28,7 +28,9 @@ from src.ui.tabs.training import render_training_tab
 
 
 def _configure_runtime_logging(root_dir: Path) -> None:
-    """Configure process-level logging once for Streamlit runtime diagnostics."""
+    """
+    Налаштування логування для Streamlit (одноразово на процес).
+    """
     if os.getenv("IDS_LOGGER_CONFIGURED") == "1":
         return
 
@@ -72,7 +74,9 @@ cleanup_user_uploads(ROOT_DIR / "datasets" / "User_Uploads")
 
 
 def _hide_heading_anchor_icons() -> None:
-    """Hide Streamlit heading anchor/link icons across the app."""
+    """
+    Приховати іконки-якорі заголовків Streamlit по всьому застосунку.
+    """
     st.markdown(
         """
         <style>
@@ -99,6 +103,9 @@ def _hide_heading_anchor_icons() -> None:
 
 @st.cache_resource
 def init_services() -> dict[str, object]:
+    """
+    Ініціалізація сервісів (кешується для сесії).
+    """
     return {
         "db": DatabaseService(),
         "settings": SettingsService(),

@@ -1,21 +1,23 @@
+
 """
-IDS ML Analyzer — Threat Catalog
+IDS ML Analyzer — Каталог загроз
 
-Каталог загроз: опис, severity, рекомендації для всіх типів атак
-з CIC-IDS2017, CIC-IDS2018, NSL-KDD, UNSW-NB15 датасетів.
+Каталог загроз: опис, рівень небезпеки (severity), рекомендації для всіх типів атак
+з датасетів CIC-IDS2017, CIC-IDS2018, NSL-KDD, UNSW-NB15.
 
-Використовується для:
-- Декодування prediction → людино-читабельний опис
-- Визначення severity рівня
-- Генерації рекомендацій
-- UI кольорів та іконок
+Використання:
+- Декодування prediction у читабельний опис
+- Визначення рівня небезпеки
+- Генерація рекомендацій
+- Вибір кольорів та іконок для UI
 """
 
 from __future__ import annotations
 from typing import Optional
 
+
 # ═══════════════════════════════════════════════════════════════
-# Severity levels
+# Рівні небезпеки (Severity levels)
 # ═══════════════════════════════════════════════════════════════
 
 SEVERITY_LEVELS = {
@@ -27,8 +29,9 @@ SEVERITY_LEVELS = {
 }
 
 
+
 # ═══════════════════════════════════════════════════════════════
-# Threat Catalog — всі відомі типи атак
+# Каталог загроз — всі відомі типи атак
 # ═══════════════════════════════════════════════════════════════
 
 THREAT_CATALOG: dict[str, dict] = {
@@ -502,7 +505,9 @@ THREAT_CATALOG: dict[str, dict] = {
 # ═══════════════════════════════════════════════════════════════
 
 def _resolve(key: str) -> dict:
-    """Resolve alias chains (max 3 depth to prevent loops)."""
+    """
+    Розв'язання ланцюжків аліасів (максимум 3 рівня для запобігання циклам).
+    """
     entry = THREAT_CATALOG.get(key)
     for _ in range(3):
         if entry is None or 'alias_of' not in entry:
@@ -515,9 +520,9 @@ def get_threat_info(prediction_label: str) -> dict:
     """
     Отримати інформацію про загрозу за prediction label.
 
-    Returns dict with keys:
+    Повертає dict з ключами:
         name_uk, severity, description, impact, actions
-    Or a fallback dict for unknown threats.
+    Або fallback-словник для невідомих загроз.
     """
     label = str(prediction_label).strip()
     label_lower = label.lower()
@@ -549,29 +554,37 @@ def get_threat_info(prediction_label: str) -> dict:
 
 
 def get_severity(prediction_label: str) -> str:
-    """Повертає severity level для prediction label."""
+    """
+    Повертає рівень небезпеки (severity) для prediction label.
+    """
     info = get_threat_info(prediction_label)
     return info.get('severity', 'medium')
 
 
 def get_severity_color(severity: str) -> str:
-    """Повертає HEX колір для severity рівня."""
+    """
+    Повертає HEX-колір для рівня небезпеки.
+    """
     return SEVERITY_LEVELS.get(severity, SEVERITY_LEVELS['medium'])['color']
 
 
 def get_severity_label(severity: str) -> str:
-    """Повертає український label для severity."""
+    """
+    Повертає українську назву рівня небезпеки.
+    """
     return SEVERITY_LEVELS.get(severity, SEVERITY_LEVELS['medium'])['label']
 
 
 def get_severity_icon(severity: str) -> str:
-    """Повертає emoji-іконку для severity."""
+    """
+    Повертає emoji-іконку для рівня небезпеки.
+    """
     return SEVERITY_LEVELS.get(severity, SEVERITY_LEVELS['medium'])['icon']
 
 
 def classify_if_anomaly_score(score: float) -> dict:
     """
-    Класифікувати anomaly score від Isolation Forest у severity.
+    Класифікує anomaly score від Isolation Forest у рівень небезпеки.
 
     Логіка (decision_function: score < 0 = аномалія):
       score < -0.4 → critical (дуже сильна аномалія)
@@ -605,14 +618,13 @@ def classify_if_anomaly_score(score: float) -> dict:
             'description': 'Незначне відхилення. Може бути нормальною варіацією трафіку.',
         }
 
-
 def enrich_predictions(predictions: list, prediction_labels: list,
                        anomaly_scores: Optional[list] = None,
                        is_isolation_forest: bool = False) -> list[dict]:
     """
     Збагачує predictions деталями з каталогу загроз.
 
-    Returns list of dicts, one per prediction:
+    Повертає список dict, по одному на кожен prediction:
         {
             'label': str,          # Оригінальний label
             'name_uk': str,        # Українська назва

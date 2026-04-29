@@ -24,7 +24,7 @@ try:
 
     XGBOOST_AVAILABLE = True
     xgb_set_config(verbosity=0)
-except ImportError:  # pragma: no cover
+except ImportError:
     XGBClassifier = None
     xgb_set_config = None
     XGBOOST_AVAILABLE = False

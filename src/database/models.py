@@ -87,7 +87,7 @@ class DetectedAnomaly(Base):
     
     # Мережева інформація
     timestamp = Column(DateTime, nullable=True)
-    source_ip = Column(String(45), nullable=True)  # Сумісно з IPv6
+    source_ip = Column(String(45), nullable=True)
     destination_ip = Column(String(45), nullable=True)
     source_port = Column(Integer, nullable=True)
     destination_port = Column(Integer, nullable=True)

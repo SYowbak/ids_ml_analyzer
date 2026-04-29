@@ -16,7 +16,6 @@ def _to_float_or_none(value: Any) -> float | None:
         return float(value)
     return None
 
-
 def build_threshold_provenance(
     *,
     dataset_type: str,
@@ -35,8 +34,6 @@ def build_threshold_provenance(
 
     if dataset_type == "CIC-IDS":
         if algorithm == "Random Forest":
-            # Keep a minimal floor for legacy stability, but honor model calibration
-            # when it recommends a stricter threshold for PCAP detection.
             thresholds_by_input_type["pcap"] = clamp_threshold(max(base_threshold, 0.20))
             notes_by_input_type["pcap"] = "cic_pcap_calibrated_random_forest_floor"
             thresholds_by_input_type["csv"] = clamp_threshold(max(base_threshold, 0.30))
@@ -56,7 +53,7 @@ def build_threshold_provenance(
                 thresholds_by_input_type["csv"] = clamp_threshold(min(base_threshold, 0.02))
                 notes_by_input_type["csv"] = "cic_csv_floor_rare_attack_coverage"
     elif dataset_type == "NSL-KDD":
-        # NSL auto-threshold guardrail: keep balanced scan sensitivity to avoid FP spikes.
+        # NSL: баланс чутливості для уникнення FP-сплесків.
         thresholds_by_input_type["csv"] = 0.30
         notes_by_input_type["csv"] = "nsl_csv_balanced_guardrail_030"
     elif dataset_type == "UNSW-NB15":
@@ -78,7 +75,6 @@ def build_threshold_provenance(
         "notes_by_input_type": {key: str(value) for key, value in notes_by_input_type.items()},
         "selection_policy": selection_policy,
     }
-
 
 def _resolve_legacy_threshold(manifest: dict[str, Any], inspection: Any) -> tuple[float, str, dict[str, Any]]:
     metadata = manifest.get("metadata") or {}
@@ -221,7 +217,6 @@ def _resolve_legacy_threshold(manifest: dict[str, Any], inspection: Any) -> tupl
         },
     )
 
-
 def resolve_threshold_for_scan(
     manifest: dict[str, Any],
     inspection: Any,
@@ -252,8 +247,6 @@ def resolve_threshold_for_scan(
         if isinstance(notes, dict):
             note = str(notes.get(selected_rule) or notes.get(input_type) or "")
 
-        # Runtime compatibility hotfix for older manifests that persisted a static
-        # RF PCAP threshold (0.20), ignoring calibration stored in base_threshold.
         if (
             input_type == "pcap"
             and dataset_type == "CIC-IDS"
